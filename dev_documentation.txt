@@ -1,0 +1,584 @@
+================================================================================
+DEV DOCUMENTATION — PAPERCLIP PROJECT
+================================================================================
+
+[2026-03-09 18:49 PST] — Initial Setup & Environment Configuration
+--------------------------------------------------------------------------------
+
+## Overview
+
+Cloned and fully set up the Paperclip project from:
+  https://github.com/krishsharma1008/Company.git
+(fork of paperclipai/paperclip — open-source AI agent orchestration platform)
+
+Workspace root: /Users/krishsharma/Desktop/Paperclip
+
+## System Requirements (Verified)
+
+  - Node.js:  v22.14.0  (requirement: 20+)   ✓
+  - pnpm:     9.15.4    (requirement: 9.15+)  ✓
+  - OS:       macOS darwin 24.6.0             ✓
+
+## Steps Performed
+
+1. CLONE
+   Command: git clone https://github.com/krishsharma1008/Company.git .
+   Result:  706 commits cloned successfully. Latest commit: d20341c
+            (Merge PR #413 — Windows command compat fix)
+
+2. DEPENDENCY INSTALL
+   Command: pnpm install --no-frozen-lockfile
+   Reason:  Lockfile was slightly out of sync with package.json (cross-env
+            dependency added in manifests but not yet in lockfile). This is
+            expected — per doc/DEVELOPING.md, GitHub Actions CI owns the
+            lockfile; PRs should not commit pnpm-lock.yaml.
+   Result:  1,000 packages installed across 13 workspace projects.
+   Warnings (pre-existing, non-blocking):
+     - better-call@1.1.8 wants zod@^4.0.0 (found 3.25.76)
+     - better-auth@1.4.18 wants drizzle-orm@>=0.41.0 (found 0.38.4)
+     - 3 deprecated subdependencies (@esbuild-kit/*, intersection-observer)
+
+3. DEV SERVER STARTED
+   Command: pnpm dev (backgrounded)
+   Result:  Server running at http://127.0.0.1:3100
+   Mode:    local_trusted / embedded-postgres / vite-dev-middleware
+   DB:      Embedded PostgreSQL auto-created at:
+            ~/.paperclip/instances/default/db (port 54329)
+   Migrations: 26 migrations applied automatically on first run.
+
+4. ONBOARDING / AGENT JWT SETUP
+   Command: pnpm paperclipai onboard --yes
+   Result:  All quickstart defaults accepted.
+   Created:
+     - PAPERCLIP_AGENT_JWT_SECRET in
+       ~/.paperclip/instances/default/.env
+     - Local secrets key file at
+       ~/.paperclip/instances/default/secrets/master.key
+   Config saved to:
+     ~/.paperclip/instances/default/config.json
+   Doctor checks: 8 passed, 1 warning (port 3100 already in use — expected
+   since primary dev server was already occupying it; paperclipai run
+   auto-selected port 3101 for the second instance).
+   Browser auto-opened at: http://127.0.0.1:3101
+
+## Running Servers
+
+  Primary dev server (pnpm dev, watch mode):
+    API:  http://127.0.0.1:3100/api
+    UI:   http://127.0.0.1:3100
+    Health check: http://127.0.0.1:3100/api/health → {"status":"ok"}
+
+  Secondary server (started by paperclipai run during onboarding):
+    API:  http://127.0.0.1:3101/api
+    UI:   http://127.0.0.1:3101
+
+## Data Persistence (Local Dev)
+
+  Database:  ~/.paperclip/instances/default/db
+  Storage:   ~/.paperclip/instances/default/data/storage
+  Backups:   ~/.paperclip/instances/default/data/backups (every 60m, 30d retention)
+  Logs:      ~/.paperclip/instances/default/logs
+  Config:    ~/.paperclip/instances/default/config.json
+  Secrets:   ~/.paperclip/instances/default/secrets/master.key
+
+## Useful Dev Commands
+
+  pnpm dev              # Full dev (API + UI, watch mode)
+  pnpm dev:once         # Full dev without file watching
+  pnpm dev:server       # Server only
+  pnpm build            # Build all packages
+  pnpm typecheck        # TypeScript type checking
+  pnpm test:run         # Run test suite
+  pnpm db:generate      # Generate DB migration
+  pnpm db:migrate       # Apply pending DB migrations
+
+  Health check:
+    curl http://localhost:3100/api/health
+    curl http://localhost:3100/api/companies
+
+  Reset local dev database (wipes all data):
+    rm -rf ~/.paperclip/instances/default/db && pnpm dev
+
+## Project Structure
+
+  /server       — Node.js API server (TypeScript, Express-style)
+  /ui           — React frontend (Vite + TailwindCSS)
+  /packages     — Shared packages and agent adapter packages
+  /cli          — paperclipai CLI tool
+  /skills       — Runtime skill injection documents for agents
+  /tests        — End-to-end Playwright tests
+  /scripts      — Dev runner, smoke test scripts
+  /doc          — Developer guides (DEVELOPING.md, CLI.md, DOCKER.md, etc.)
+
+## Notes
+
+  - No external PostgreSQL required for local dev; embedded Postgres is
+    managed automatically by the server process.
+  - No .env file needed in the project root for local dev; the server
+    reads from ~/.paperclip/instances/default/.env for secrets.
+  - LLM provider (e.g. OPENAI_API_KEY / ANTHROPIC_API_KEY) is optional
+    at setup time; configure via: pnpm paperclipai configure --section llm
+
+================================================================================
+
+[2026-03-15 — Sun] — Package Rename: paperclipai → combyne
+--------------------------------------------------------------------------------
+
+## Summary
+
+Renamed all package identifiers across the monorepo from `paperclipai` /
+`@paperclipai/*` to `combyne` / `@combyne/*`.
+
+## Files Changed (14 total)
+
+1.  `/package.json` (root)
+    - `"name": "paperclip"` → `"name": "combyne"`
+    - `"paperclipai"` script key → `"combyne"`
+    - `PAPERCLIP_MIGRATION_PROMPT` → `COMBYNE_MIGRATION_PROMPT`
+    - All `@paperclipai/*` filter references → `@combyne/*`
+
+2.  `/cli/package.json`
+    - `"name": "paperclipai"` → `"name": "combyne"`
+    - `"paperclipai"` bin key → `"combyne"`
+    - `"paperclip"` keyword → `"combyne"`
+    - 10 `@paperclipai/*` dependency refs → `@combyne/*`
+
+3.  `/server/package.json`
+    - `"name": "@paperclipai/server"` → `"name": "@combyne/server"`
+    - `PAPERCLIP_MIGRATION_PROMPT` → `COMBYNE_MIGRATION_PROMPT`
+    - 10 `@paperclipai/*` dependency refs → `@combyne/*`
+
+4.  `/ui/package.json`
+    - `"name": "@paperclipai/ui"` → `"name": "@combyne/ui"`
+    - 9 `@paperclipai/*` dependency refs → `@combyne/*`
+
+5.  `/packages/db/package.json`
+    - `"name": "@paperclipai/db"` → `"name": "@combyne/db"`
+    - `@paperclipai/shared` dep → `@combyne/shared`
+
+6.  `/packages/shared/package.json`
+    - `"name": "@paperclipai/shared"` → `"name": "@combyne/shared"`
+
+7.  `/packages/adapter-utils/package.json`
+    - `"name": "@paperclipai/adapter-utils"` → `"name": "@combyne/adapter-utils"`
+
+8.  `/packages/adapters/claude-local/package.json`
+    - → `@combyne/adapter-claude-local` + deps
+
+9.  `/packages/adapters/codex-local/package.json`
+    - → `@combyne/adapter-codex-local` + deps
+
+10. `/packages/adapters/cursor-local/package.json`
+    - → `@combyne/adapter-cursor-local` + deps
+
+11. `/packages/adapters/opencode-local/package.json`
+    - → `@combyne/adapter-opencode-local` + deps
+
+12. `/packages/adapters/pi-local/package.json`
+    - → `@combyne/adapter-pi-local` + deps
+
+13. `/packages/adapters/openclaw-gateway/package.json`
+    - → `@combyne/adapter-openclaw-gateway` + deps
+
+14. `/.changeset/config.json`
+    - `@paperclipai/*` → `@combyne/*`
+    - `"paperclipai"` → `"combyne"`
+    - `@paperclipai/ui` ignore → `@combyne/ui`
+
+## Scope
+
+Package.json name/bin/keyword/dep fields and changeset config only.
+No source code (.ts/.tsx), documentation, or repository URL changes were made.
+
+================================================================================
+
+================================================================================
+UPDATE — 2026-03-15 (Sunday)
+================================================================================
+
+## Bulk Rename: PAPERCLIP_ → COMBYNE_ in server/src/ TypeScript files
+
+Replaced all `PAPERCLIP_` environment variable prefixes with `COMBYNE_` across
+all TypeScript files under `server/src/`, excluding `server/src/config.ts` and
+`server/src/paths.ts` (which already had the rename with backward-compat
+fallback logic).
+
+### Environment Variable Prefix Renames (PAPERCLIP_ → COMBYNE_)
+
+Files updated with occurrence counts:
+
+| File | Occurrences |
+|------|-------------|
+| server/src/index.ts | 16 |
+| server/src/startup-banner.ts | 3 |
+| server/src/middleware/logger.ts | 1 |
+| server/src/secrets/local-encrypted-provider.ts | 3 |
+| server/src/auth/better-auth.ts | 2 |
+| server/src/routes/assets.ts | 1 |
+| server/src/routes/issues.ts | 1 |
+| server/src/routes/approvals.ts | 1 |
+| server/src/routes/secrets.ts | 1 |
+| server/src/routes/agents.ts | 1 |
+| server/src/routes/access.ts | 9 |
+| server/src/agent-auth-jwt.ts | 4 |
+| server/src/home-paths.ts | 3 |
+| server/src/services/heartbeat.ts | 1 |
+| server/src/services/company-portability.ts | 1 |
+| server/src/__tests__/adapter-models.test.ts | 2 |
+| server/src/__tests__/agent-auth-jwt.test.ts | 4 |
+| server/src/__tests__/cursor-local-adapter.test.ts | 2 |
+| server/src/__tests__/cursor-local-execute.test.ts | 11 |
+| server/src/__tests__/cursor-local-adapter-environment.test.ts | 3 |
+| server/src/__tests__/invite-onboarding-text.test.ts | 1 |
+| server/src/__tests__/redaction.test.ts | 2 |
+| server/src/__tests__/openclaw-gateway-adapter.test.ts | 2 |
+| server/src/__tests__/paperclip-env.test.ts | 31 |
+
+### Function Name Renames
+
+| Old Name | New Name | Files |
+|----------|----------|-------|
+| resolvePaperclipConfigPath | resolveCombyneConfigPath | startup-banner.ts, config-file.ts |
+| resolvePaperclipEnvPath | resolveCombyneEnvPath | startup-banner.ts |
+| resolvePaperclipHomeDir | resolveCombyneHomeDir | home-paths.ts |
+| resolvePaperclipInstanceId | resolveCombyneInstanceId | home-paths.ts |
+| resolvePaperclipInstanceRoot | resolveCombyneInstanceRoot | home-paths.ts, run-log-store.ts |
+| buildPaperclipEnv | buildCombyneEnv | adapters/utils.ts, adapters/process/execute.ts, __tests__/paperclip-env.test.ts |
+
+### Variable/Constant Name Renames
+
+| Old Name | New Name | Files |
+|----------|----------|-------|
+| paperclipEnvKeys | combyneEnvKeys | __tests__/cursor-local-execute.test.ts |
+| _paperclipWakeContext | _combyneWakeContext | services/heartbeat.ts |
+| /__paperclip_repo_only__ | /__combyne_repo_only__ | services/heartbeat.ts, services/projects.ts |
+| paperclipWorkspace(s) | combyneWorkspace(s) | services/heartbeat.ts |
+| paperclipUpgradeContext | combyneUpgradeContext | realtime/live-events-ws.ts |
+| __paperclip_missing_opencode_command__ | __combyne_missing_opencode_command__ | __tests__/adapter-models.test.ts |
+
+### Excluded Files (already done)
+
+- server/src/config.ts — contains backward-compat fallback reading COMBYNE_ with PAPERCLIP_ fallback
+- server/src/paths.ts — already renamed
+
+### Not Changed (requires coordinated cross-package work)
+
+- `paperclipApiUrl` field name in access.ts — this is an API contract field used by external
+  agents/clients; renaming requires coordinated changes in @combyne/shared types and all clients.
+- `paperclipConfigSchema` / `PaperclipConfig` imports in config-file.ts — defined in @combyne/shared
+  which has not yet been renamed.
+- String literals containing "paperclip" (temp dir prefixes, JWT audience defaults, file paths,
+  skill names, HTTP headers) — not env var prefixes or variable names.
+
+================================================================================
+
+[2026-03-15 — Sun, Evening] — Bulk Rebrand: PAPERCLIP_ → COMBYNE_ in Infra/CI/Config Files
+--------------------------------------------------------------------------------
+
+## Summary
+
+Performed a bulk find-and-replace of the `PAPERCLIP_` environment variable
+prefix to `COMBYNE_` and lowercase/title-case `paperclip`/`Paperclip` brand
+references to `combyne`/`Combyne` across all shell scripts, Docker files,
+CI workflows, and the `.env.example` file. npm package references
+(`@paperclipai/*`, `paperclipai@...`, `PAPERCLIPAI_VERSION`) were left
+unchanged as they reference the npm package name, not the brand.
+
+## Files Changed (11 total)
+
+### Shell Scripts
+
+1. `scripts/smoke/openclaw-sse-standalone.sh`
+   - 61 × `PAPERCLIP_` → `COMBYNE_` (env vars + metadata keys)
+   - `paperclip-smoke` → `combyne-smoke` (user identifier)
+   - `paperclip_session_key` → `combyne_session_key`
+   - `paperclip:run:` → `combyne:run:` (session key prefix, 2 occurrences)
+   - `Paperclip` → `Combyne` (heartbeat description)
+
+2. `scripts/smoke/openclaw-gateway-e2e.sh`
+   - 22 × `PAPERCLIP_` → `COMBYNE_` (env vars + error messages)
+   - `openclaw-paperclip-smoke` → `openclaw-combyne-smoke` (config dir)
+   - `paperclip-claimed-api-key` → `combyne-claimed-api-key` (4 file refs)
+   - `/skills/paperclip` → `/skills/combyne` (2 API paths)
+   - `paperclipApiUrl` → `combyneApiUrl` (3 jq/JSON refs)
+   - `sessionKey: "paperclip"` → `sessionKey: "combyne"` (adapter config)
+   - `paperclip health` → `combyne health` (log message)
+   - 4 × `Paperclip` → `Combyne` (descriptions, error messages)
+
+3. `scripts/smoke/openclaw-join.sh`
+   - 11 × `PAPERCLIP_` → `COMBYNE_` (env vars)
+   - `paperclip-openclaw-smoke` → `combyne-openclaw-smoke` (image + container)
+   - `.body.paperclip.` → `.body.combyne.` (JSON path in jq)
+   - 2 × `Paperclip` → `Combyne` (descriptions)
+
+4. `scripts/docker-onboard-smoke.sh`
+   - 10 × `PAPERCLIP_` → `COMBYNE_` (env vars)
+   - `paperclip-onboard-smoke` → `combyne-onboard-smoke` (image name)
+   - `/paperclip` → `/combyne` (container mount path)
+
+5. `scripts/dev-runner.mjs`
+   - 4 × `PAPERCLIP_` → `COMBYNE_` (env var keys)
+   - 2 × `[paperclip]` → `[combyne]` (log prefix)
+
+### Docker Files
+
+6. `docker-compose.yml`
+   - 4 × `PAPERCLIP_` → `COMBYNE_` (env var keys)
+   - Postgres: user/password/db `paperclip` → `combyne` (6 occurrences)
+   - `DATABASE_URL` credential/db name updated
+   - Volume: `paperclip-data` → `combyne-data`
+   - Mount: `/paperclip` → `/combyne`
+
+7. `docker-compose.quickstart.yml`
+   - 7 × `PAPERCLIP_` → `COMBYNE_` (env vars + port/data refs)
+   - Service name: `paperclip` → `combyne`
+   - Data dir: `docker-paperclip` → `docker-combyne`
+   - Mount: `/paperclip` → `/combyne`
+
+8. `Dockerfile`
+   - 5 × `PAPERCLIP_` → `COMBYNE_` (env vars)
+   - 6 × `/paperclip` → `/combyne` (paths, volumes)
+
+9. `Dockerfile.onboard-smoke`
+   - 4 × `PAPERCLIP_` → `COMBYNE_` (env vars)
+   - User/group: `paperclip` → `combyne` (groupadd, useradd, chown, USER)
+   - Home: `/home/paperclip` → `/home/combyne`
+   - Data: `/paperclip` → `/combyne`
+
+### CI Workflows
+
+10. `.github/workflows/e2e.yml`
+    - 1 × `PAPERCLIP_E2E_SKIP_LLM` → `COMBYNE_E2E_SKIP_LLM`
+
+### Config
+
+11. `.env.example`
+    - `DATABASE_URL=postgres://paperclip:paperclip@localhost:5432/paperclip`
+      → `postgres://combyne:combyne@localhost:5432/combyne`
+
+## Unchanged (Intentional)
+
+- npm package scope `@paperclipai/*` in Dockerfile and dev-runner.mjs
+  (these are package registry identifiers, not brand strings)
+- `PAPERCLIPAI_VERSION` ARG in Dockerfile.onboard-smoke and
+  docker-onboard-smoke.sh (npm package version reference)
+- `paperclipai@${PAPERCLIPAI_VERSION}` npx command (npm package name)
+
+================================================================================
+
+================================================================================
+Date: 2026-03-15 (Sunday)
+Task: Bulk rebrand "paperclip" → "combyne" / "Paperclip" → "Combyne" in server/src
+================================================================================
+
+## Summary
+
+Replaced all brand references "paperclip" → "combyne" and "Paperclip" → "Combyne"
+across 29+ TypeScript files in `server/src/`. This is part of the broader Paperclip →
+Combyne rebrand effort.
+
+## Files Modified
+
+### Routes & Middleware
+1. `server/src/routes/access.ts`
+   - `paperclipApiUrl` → `combyneApiUrl` (21 occurrences, including raw/parsed/legacy variants)
+   - `openclaw_gateway_paperclip_api_url` → `openclaw_gateway_combyne_api_url` (3)
+   - `local@paperclip.local` → `local@combyne.local` (1)
+   - `paperclip-claimed-api-key.json` → `combyne-claimed-api-key.json` (3)
+   - `pnpm paperclipai` → `pnpm combyneai` (3)
+   - All user-facing onboarding text: "Paperclip" → "Combyne" (10+)
+   - Skill names/paths: `paperclip` → `combyne`, `paperclip-create-agent` → `combyne-create-agent`
+   - Install path: `~/.openclaw/skills/paperclip/SKILL.md` → `~/.openclaw/skills/combyne/SKILL.md`
+
+2. `server/src/routes/llms.ts`
+   - `"# Paperclip Agent Configuration Index"` → `"# Combyne Agent Configuration Index"`
+   - `"# Paperclip Agent Icon Names"` → `"# Combyne Agent Icon Names"`
+
+3. `server/src/middleware/auth.ts`
+   - `x-paperclip-run-id` → `x-combyne-run-id`
+
+4. `server/src/middleware/private-hostname-guard.ts`
+   - `"Paperclip instance"` → `"Combyne instance"`
+   - `pnpm paperclipai allowed-hostname` → `pnpm combyneai allowed-hostname`
+
+### Core Server
+5. `server/src/app.ts`
+   - Session ID prefix: `paperclip:` → `combyne:`
+   - Log prefix: `[paperclip]` → `[combyne]`
+
+6. `server/src/index.ts`
+   - `local@paperclip.local` → `local@combyne.local`
+   - DB user/password: `paperclip` → `combyne`
+   - Connection string: `paperclip:paperclip@127.0.0.1` → `combyne:combyne@127.0.0.1`
+   - DB name: `/paperclip` → `/combyne`
+   - `filenamePrefix: "paperclip"` → `"combyne"`
+   - `"Paperclip server failed to start"` → `"Combyne server failed to start"`
+
+7. `server/src/config-file.ts`
+   - `paperclipConfigSchema` → `combyneConfigSchema`
+   - `PaperclipConfig` → `CombyneConfig`
+
+8. `server/src/startup-banner.ts`
+   - `pnpm paperclipai onboard` → `pnpm combyneai onboard`
+
+9. `server/src/home-paths.ts`
+   - `.paperclip` → `.combyne`
+
+10. `server/src/paths.ts`
+    - `.paperclip` directory → `.combyne`
+
+### Auth
+11. `server/src/agent-auth-jwt.ts`
+    - Default JWT issuer: `"paperclip"` → `"combyne"`
+    - Default JWT audience: `"paperclip-api"` → `"combyne-api"`
+
+12. `server/src/auth/better-auth.ts`
+    - `paperclip-dev-secret` → `combyne-dev-secret`
+
+### Services
+13. `server/src/services/company-portability.ts`
+    - `paperclip.manifest.json` → `combyne.manifest.json`
+    - Default sessionKey: `"paperclip"` → `"combyne"`
+
+14. `server/src/services/heartbeat.ts`
+    - Log prefix: `[paperclip]` → `[combyne]`
+
+15. `server/src/services/hire-hook.ts`
+    - `"task in Paperclip"` → `"task in Combyne"`
+
+### Adapters
+16. `server/src/adapters/http/test.ts`
+    - `"Paperclip server host"` → `"Combyne server host"`
+
+### Test Files
+17. `server/src/__tests__/agent-auth-jwt.test.ts`
+    - JWT defaults: `iss: "paperclip"` → `"combyne"`, `aud: "paperclip-api"` → `"combyne-api"`
+
+18. `server/src/__tests__/invite-accept-replay.test.ts`
+    - `paperclipApiUrl` → `combyneApiUrl` (3)
+    - `https://paperclip.example.com` → `https://combyne.example.com` (2)
+
+19. `server/src/__tests__/invite-onboarding-text.test.ts`
+    - All assertions: "Paperclip" → "Combyne", `paperclipApiUrl` → `combyneApiUrl`,
+      `paperclip-claimed-api-key.json` → `combyne-claimed-api-key.json`
+
+20. `server/src/__tests__/private-hostname-guard.test.ts`
+    - `pnpm paperclipai` → `pnpm combyneai` (2)
+
+21. `server/src/__tests__/openclaw-gateway-adapter.test.ts`
+    - `paperclip:issue:issue-123` → `combyne:issue:issue-123`
+
+22. `server/src/__tests__/opencode-local-adapter-environment.test.ts`
+    - tmpdir prefixes: `paperclip-opencode-*` → `combyne-opencode-*` (4)
+
+23. `server/src/__tests__/claude-local-adapter-environment.test.ts`
+    - tmpdir prefix: `paperclip-claude-local-cwd-` → `combyne-claude-local-cwd-`
+
+24. `server/src/__tests__/codex-local-adapter-environment.test.ts`
+    - tmpdir prefixes: `paperclip-codex-local-*` → `combyne-codex-local-*` (2)
+
+25. `server/src/__tests__/codex-local-adapter.test.ts`
+    - `"Preparing to use paperclip skill"` → `"Preparing to use combyne skill"` (2)
+
+26. `server/src/__tests__/cursor-local-adapter-environment.test.ts`
+    - tmpdir prefixes: `paperclip-cursor-local-*` → `combyne-cursor-local-*` (3)
+
+27. `server/src/__tests__/cursor-local-skill-injection.test.ts`
+    - tmpdir prefixes, skill names, log messages: `paperclip` → `combyne` (10+)
+
+28. `server/src/__tests__/cursor-local-execute.test.ts`
+    - tmpdir prefixes: `paperclip-cursor-execute-*` → `combyne-cursor-execute-*` (2)
+    - Test description, prompt data, runtime note assertions (7)
+
+29. `server/src/__tests__/storage-local-provider.test.ts`
+    - tmpdir prefix: `paperclip-storage-` → `combyne-storage-` (3)
+
+## Intentionally Preserved (Backward Compatibility)
+
+- `PAPERCLIP_CONFIG` and `PAPERCLIP_<suffix>` env var fallbacks in `config.ts` and `paths.ts`
+- Legacy export aliases `resolvePaperclipConfigPath` and `resolvePaperclipEnvPath` in `paths.ts`
+
+## Verification
+
+Final case-insensitive grep of `server/src/**/*.ts` confirms zero unexpected
+"paperclip" references remain. Only the intentionally preserved backward-compatibility
+fallbacks in `config.ts` (2 hits) and `paths.ts` (4 hits) remain.
+
+================================================================================
+
+## 2026-03-15 01:07 IST — Bulk Rebrand Continuation: Additional Files Discovered & Fixed
+
+### Context
+Continuing the Paperclip → Combyne rebrand. The initial pass covered the explicitly listed
+files, but a comprehensive grep sweep uncovered many additional files containing brand
+references that were missed (import consumers, config defaults, UI storage keys, etc.).
+
+### Additional CLI Files Fixed (Round 2)
+
+1. `cli/src/client/http.ts` — `PaperclipApiClient` → `CombyneApiClient` (1)
+2. `cli/src/__tests__/http.test.ts` — `PaperclipApiClient` → `CombyneApiClient` (5), `x-paperclip-run-id` → `x-combyne-run-id` (1)
+3. `cli/src/commands/doctor.ts` — `PaperclipConfig` → `CombyneConfig` (2), `loadPaperclipEnvFile` → `loadCombyneEnvFile` (2), `printPaperclipCliBanner` → `printCombyneCliBanner` (2), string literals (3)
+4. `cli/src/commands/configure.ts` — `PaperclipConfig` → `CombyneConfig` (3), `resolvePaperclipInstanceId` → `resolveCombyneInstanceId` (2), `printPaperclipCliBanner` → `printCombyneCliBanner` (2), `paperclipai onboard` → `combyneai onboard` (1), string literals (2)
+5. `cli/src/checks/port-check.ts` — `PaperclipConfig` → `CombyneConfig` (2)
+6. `cli/src/checks/log-check.ts` — `PaperclipConfig` → `CombyneConfig` (2)
+7. `cli/src/checks/llm-check.ts` — `PaperclipConfig` → `CombyneConfig` (2), `paperclipai configure` → `combyneai configure` (2)
+8. `cli/src/__tests__/allowed-hostname.test.ts` — `PaperclipConfig` → `CombyneConfig` (3), tmpdir/path replacements (7)
+9. `cli/src/checks/storage-check.ts` — `PaperclipConfig` → `CombyneConfig` (2), `paperclipai configure` → `combyneai configure` (1)
+10. `cli/src/checks/config-check.ts` — `paperclipai onboard` → `combyneai onboard` (2), `paperclipai configure` → `combyneai configure` (1)
+11. `cli/src/commands/client/company.ts` — `paperclip.manifest.json` → `combyne.manifest.json` (2)
+12. `cli/src/commands/allowed-hostname.ts` — `paperclip onboard` → `combyne onboard` (1)
+13. `cli/src/__tests__/context.test.ts` — `paperclip-cli-context-` → `combyne-cli-context-` (1)
+14. `cli/src/prompts/database.ts` — `resolvePaperclipInstanceId` → `resolveCombyneInstanceId` (2), placeholder (1)
+15. `cli/src/prompts/logging.ts` — `resolvePaperclipInstanceId` → `resolveCombyneInstanceId` (2)
+16. `cli/src/prompts/storage.ts` — `resolvePaperclipInstanceId` → `resolveCombyneInstanceId` (2), `"paperclip"` → `"combyne"` (3), `paperclip/` → `combyne/` (1)
+17. `cli/src/prompts/server.ts` — `paperclip.example.com` → `combyne.example.com` (1)
+18. `cli/src/index.ts` — `.name("paperclipai")` → `.name("combyneai")`, description/option text (5)
+19. `cli/src/commands/client/context.ts` — `Paperclip data directory root` → `Combyne data directory root` (4)
+20. `cli/src/commands/env.ts` — `PaperclipConfig` → `CombyneConfig` (3), `resolveCombyneInstanceId` (3), string literals (4)
+
+### Additional Packages Files Fixed (Round 2)
+
+1. `packages/shared/src/config-schema.ts` — `.paperclip` → `.combyne` (10), `"paperclip"` → `"combyne"` (3), schema/type renames (3)
+2. `packages/shared/src/index.ts` — `paperclipConfigSchema` → `combyneConfigSchema`, `PaperclipConfig` → `CombyneConfig`
+3. `packages/shared/src/validators/access.ts` — `paperclipApiUrl` → `combyneApiUrl` (1)
+4. `packages/db/src/backup-lib.ts` — `"paperclip"` → `"combyne"` (1), `Paperclip database backup` → `Combyne database backup` (1)
+5. `packages/db/src/seed.ts` — `Paperclip Demo Co` → `Combyne Demo Co` (1)
+6. `packages/adapters/*/src/index.ts` — doc strings: Paperclip → Combyne across all adapters
+7. `packages/adapters/openclaw-gateway/src/server/test.ts` — probe/hostname strings (2)
+8. `packages/adapters/cursor-local/src/server/execute.ts` — `paperclipKeys` → `combyneKeys` (3)
+
+### Additional UI Files Fixed (Round 2)
+
+1. `ui/src/lib/recent-assignees.ts` — storage key (1)
+2. `ui/src/lib/project-order.ts` — event name + storage prefix (2)
+3. `ui/src/hooks/useCompanyPageMemory.ts` — storage key (1)
+4. `ui/src/context/PanelContext.tsx` — storage key (1)
+5. `ui/src/context/CompanyContext.tsx` — storage key (1)
+6. `ui/src/pages/ProjectDetail.tsx`, `Issues.tsx`, `Inbox.tsx`, `IssueDetail.tsx` — storage/view keys (4)
+7. `ui/src/components/NewProjectDialog.tsx`, `ProjectProperties.tsx` — sentinel value (2)
+8. `ui/src/components/NewIssueDialog.tsx` — draft key (1)
+9. `ui/src/adapters/openclaw-gateway/config-fields.tsx` — `paperclipApiUrl` → `combyneApiUrl` (5)
+
+### Tests/E2E Fixed (Round 2)
+
+1. `tests/e2e/playwright.config.ts` — `paperclipai` → `combyneai` (3)
+
+### Server Files Fixed (by subagent)
+
+29+ server/src TypeScript files processed including routes, services, tests, middleware,
+auth, config, and startup modules. All `paperclip` brand references replaced with `combyne`.
+Skill names and paths also renamed (`paperclip` → `combyne`, `paperclip-create-agent` → `combyne-create-agent`).
+
+### Intentionally NOT Changed
+
+- `Paperclip` from `lucide-react` in UI files — paperclip/attachment icon, not a brand reference
+- `"Paperclip"` as company name in `cli/src/__tests__/company-delete.test.ts` — test fixture data
+- `PAPERCLIP_` env var fallbacks in `server/src/config.ts` and `server/src/paths.ts` — backward compat
+- Legacy export aliases in `server/src/paths.ts` — backward compat
+
+### Final Verification
+
+Comprehensive case-insensitive grep across all directories confirms zero unexpected brand
+references remain. Only intentional backward-compat fallbacks and lucide icon imports survive.
+
+================================================================================

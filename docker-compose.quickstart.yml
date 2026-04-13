@@ -1,0 +1,18 @@
+services:
+  combyne:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${COMBYNE_PORT:-3100}:3100"
+    environment:
+      HOST: "0.0.0.0"
+      COMBYNE_HOME: "/combyne"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      COMBYNE_DEPLOYMENT_MODE: "authenticated"
+      COMBYNE_DEPLOYMENT_EXPOSURE: "private"
+      COMBYNE_PUBLIC_URL: "${COMBYNE_PUBLIC_URL:-http://localhost:3100}"
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+    volumes:
+      - "${COMBYNE_DATA_DIR:-./data/docker-combyne}:/combyne"

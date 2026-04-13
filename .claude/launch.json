@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "combyne",
+      "runtimeExecutable": "/usr/local/bin/node",
+      "runtimeArgs": ["scripts/dev-runner.mjs", "watch"],
+      "env": {
+        "PATH": "/usr/local/bin:/Users/krishsharma/Library/pnpm:/usr/bin:/bin"
+      },
+      "port": 3104
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "name": "combyne",
+  "version": "0.2.7",
+  "description": "Combyne CLI — orchestrate AI agent teams to run a business",
+  "type": "module",
+  "bin": {
+    "combyne": "./dist/index.js"
+  },
+  "keywords": [
+    "combyne",
+    "ai",
+    "agents",
+    "orchestration",
+    "cli"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/krishsharma1008/Combyne.ai.git",
+    "directory": "cli"
+  },
+  "homepage": "https://github.com/krishsharma1008/Combyne.ai",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "node --input-type=module -e \"import esbuild from 'esbuild'; import config from './esbuild.config.mjs'; await esbuild.build(config);\" && chmod +x dist/index.js",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.10.0",
+    "@combyne/adapter-browser-use": "workspace:*",
+    "@combyne/adapter-claude-local": "workspace:*",
+    "@combyne/adapter-codex-local": "workspace:*",
+    "@combyne/adapter-cursor-local": "workspace:*",
+    "@combyne/adapter-opencode-local": "workspace:*",
+    "@combyne/adapter-pi-local": "workspace:*",
+    "@combyne/adapter-openclaw-gateway": "workspace:*",
+    "@combyne/adapter-utils": "workspace:*",
+    "@combyne/db": "workspace:*",
+    "@combyne/server": "workspace:*",
+    "@combyne/shared": "workspace:*",
+    "drizzle-orm": "0.38.4",
+    "dotenv": "^17.0.1",
+    "commander": "^13.1.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.12.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

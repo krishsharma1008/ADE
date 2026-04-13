@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <style>
+    .bg { fill: #0B0B0F; }
+    .accent { fill: #F5A623; }
+    @media (prefers-color-scheme: light) {
+      .bg { fill: #0B0B0F; }
+      .accent { fill: #F5A623; }
+    }
+  </style>
+  <rect class="bg" width="32" height="32" rx="6"/>
+  <path class="accent" d="M21 11.5C21 8.46 18.76 6 16 6C13.24 6 11 8.46 11 11.5V20.5C11 23.54 13.24 26 16 26C18.76 26 21 23.54 21 20.5" stroke="#F5A623" stroke-width="3" stroke-linecap="round" fill="none"/>
+</svg>

@@ -1,0 +1,49 @@
+{
+  "name": "combyne",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev-runner.mjs watch",
+    "dev:watch": "cross-env COMBYNE_MIGRATION_PROMPT=never node scripts/dev-runner.mjs watch",
+    "dev:once": "node scripts/dev-runner.mjs dev",
+    "dev:server": "pnpm --filter @combyne/server dev",
+    "dev:ui": "pnpm --filter @combyne/ui dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "db:generate": "pnpm --filter @combyne/db generate",
+    "db:migrate": "pnpm --filter @combyne/db migrate",
+    "secrets:migrate-inline-env": "tsx scripts/migrate-inline-env-secrets.ts",
+    "db:backup": "./scripts/backup-db.sh",
+    "combyne": "node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts",
+    "build:npm": "./scripts/build-npm.sh",
+    "release": "./scripts/release.sh",
+    "release:preflight": "./scripts/release-preflight.sh",
+    "release:github": "./scripts/create-github-release.sh",
+    "release:rollback": "./scripts/rollback-latest.sh",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "check:tokens": "node scripts/check-forbidden-tokens.mjs",
+    "docs:dev": "cd docs && npx mintlify dev",
+    "smoke:openclaw-join": "./scripts/smoke/openclaw-join.sh",
+    "smoke:openclaw-docker-ui": "./scripts/smoke/openclaw-docker-ui.sh",
+    "smoke:openclaw-sse-standalone": "./scripts/smoke/openclaw-sse-standalone.sh",
+    "test:e2e": "npx playwright test --config tests/e2e/playwright.config.ts",
+    "test:e2e:headed": "npx playwright test --config tests/e2e/playwright.config.ts --headed",
+    "test:smoke": "npx playwright test --config tests/e2e/playwright.config.ts --grep @smoke",
+    "test:regression": "npx playwright test --config tests/e2e/playwright.config.ts --grep @regression"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.30.0",
+    "cross-env": "^10.1.0",
+    "@playwright/test": "^1.58.2",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.4"
+}

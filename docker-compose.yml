@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: combyne
+      POSTGRES_PASSWORD: combyne
+      POSTGRES_DB: combyne
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U combyne -d combyne"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  server:
+    build: .
+    ports:
+      - "3100:3100"
+    environment:
+      DATABASE_URL: postgres://combyne:combyne@db:5432/combyne
+      PORT: "3100"
+      SERVE_UI: "true"
+      COMBYNE_DEPLOYMENT_MODE: "authenticated"
+      COMBYNE_DEPLOYMENT_EXPOSURE: "private"
+      COMBYNE_PUBLIC_URL: "${COMBYNE_PUBLIC_URL:-http://localhost:3100}"
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+    volumes:
+      - combyne-data:/combyne
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  combyne-data:
