@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="doc/assets/header.png" alt="ADE — Agent Development Environment" width="720" />
-</p>
-
-<p align="center">
   <a href="#quick-start"><strong>Quick Start</strong></a> &middot;
   <a href="#usage-examples"><strong>Examples</strong></a> &middot;
   <a href="#agent-adapters"><strong>Adapters</strong></a> &middot;
