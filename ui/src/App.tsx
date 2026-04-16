@@ -148,6 +148,7 @@ function boardRoutes() {
       <Route path="routines/:routineId" element={<RoutineDetail />} />
       <Route path="skills" element={<CompanySkills />} />
       <Route path="skills/:skillId" element={<CompanySkills />} />
+      <Route path="skills/:skillId/*" element={<CompanySkills />} />
       <Route path="plugins" element={<PluginManager />} />
       <Route path="plugins/:pluginId" element={<PluginPage />} />
       <Route path="plugins/:pluginId/settings" element={<PluginSettings />} />
