@@ -96,7 +96,11 @@ export async function startServer(): Promise<StartedServer> {
   }
   
   async function promptApplyMigrations(migrations: string[]): Promise<boolean> {
-    if (process.env.COMBYNE_MIGRATION_PROMPT === "never") return false;
+    // "never" means never prompt — auto-apply silently (safe for dev watch mode
+    // where stdin is not available). Previously this returned false which caused
+    // pending migrations to be silently skipped, breaking fresh clones that pull
+    // schema updates with new columns.
+    if (process.env.COMBYNE_MIGRATION_PROMPT === "never") return true;
     if (process.env.COMBYNE_MIGRATION_AUTO_APPLY === "true") return true;
     if (!stdin.isTTY || !stdout.isTTY) return true;
   
