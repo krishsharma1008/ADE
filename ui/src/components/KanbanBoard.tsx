@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useStableRef } from "@/lib/useStableRef";
 import { Link } from "@/lib/router";
 import {
   DndContext,
@@ -62,6 +63,7 @@ function KanbanColumn({
   liveIssueIds?: Set<string>;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: status });
+  const stableRef = useStableRef(setNodeRef);
 
   return (
     <div className="flex flex-col min-w-[260px] w-[260px] shrink-0">
@@ -75,7 +77,7 @@ function KanbanColumn({
         </span>
       </div>
       <div
-        ref={setNodeRef}
+        ref={stableRef}
         className={`flex-1 min-h-[120px] rounded-md p-1 space-y-1 transition-colors ${
           isOver ? "bg-accent/40" : "bg-muted/20"
         }`}
@@ -119,6 +121,7 @@ function KanbanCard({
     transition,
     isDragging,
   } = useSortable({ id: issue.id, data: { issue } });
+  const stableRef = useStableRef(setNodeRef);
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -132,7 +135,7 @@ function KanbanCard({
 
   return (
     <div
-      ref={setNodeRef}
+      ref={stableRef}
       style={style}
       {...attributes}
       {...listeners}

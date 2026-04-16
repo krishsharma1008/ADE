@@ -186,6 +186,12 @@ export async function createApp(
       server: {
         middlewareMode: true,
         allowedHosts: privateHostnameGateEnabled ? Array.from(privateHostnameAllowSet) : undefined,
+        hmr: {
+          // Run Vite HMR on its own WebSocket server so it does not
+          // intercept HTTP upgrade requests on the main server (needed
+          // by live-events-ws and terminal-ws).
+          port: 24678,
+        },
       },
     });
 

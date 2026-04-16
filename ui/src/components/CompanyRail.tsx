@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/tooltip";
 import type { Company } from "@combyne/shared";
 import { CompanyPatternIcon } from "./CompanyPatternIcon";
+import { useStableRef } from "@/lib/useStableRef";
 
 const ORDER_STORAGE_KEY = "combyne.companyOrder";
 
@@ -87,6 +88,7 @@ function SortableCompanyItem({
     transition,
     isDragging,
   } = useSortable({ id: company.id });
+  const stableRef = useStableRef(setNodeRef);
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -96,7 +98,7 @@ function SortableCompanyItem({
   };
 
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners} className="overflow-visible">
+    <div ref={stableRef} style={style} {...attributes} {...listeners} className="overflow-visible">
       <Tooltip delayDuration={300}>
         <TooltipTrigger asChild>
           <a

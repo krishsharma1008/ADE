@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
+import { useStableRef } from "@/lib/useStableRef";
 import { NavLink, useLocation } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronRight, Plus } from "lucide-react";
@@ -46,12 +47,13 @@ function SortableProjectItem({
     transition,
     isDragging,
   } = useSortable({ id: project.id });
+  const stableRef = useStableRef(setNodeRef);
 
   const routeRef = projectRouteRef(project);
 
   return (
     <div
-      ref={setNodeRef}
+      ref={stableRef}
       style={{
         transform: CSS.Transform.toString(transform),
         transition,
