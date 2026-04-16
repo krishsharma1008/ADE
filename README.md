@@ -30,10 +30,47 @@ Think of it as a company operating system — org charts, governance, budgets, a
 
 ### Prerequisites
 
+**Required:**
+
 | Requirement | Version | Install |
 |-------------|---------|---------|
 | **Node.js** | 20+ | [nodejs.org](https://nodejs.org) or `brew install node` |
 | **pnpm** | 9+ | `npm install -g pnpm` |
+
+**Optional — at least one agent adapter CLI to run agents:**
+
+| Adapter CLI | Install |
+|-------------|---------|
+| **Claude Code** (`claude`) | `npm install -g @anthropic-ai/claude-code` |
+| **Codex** (`codex`) | `npm install -g @openai/codex` |
+| **Cursor Agent** (`cursor-agent`) | [cursor.com/install](https://www.cursor.com/install) |
+| **Gemini CLI** (`gemini`) | `npm install -g @google/gemini-cli` |
+| **OpenCode** (`opencode`) | `curl -fsSL https://opencode.ai/install \| bash` |
+| **Pi** (`pi`) | [docs.pi.ai](https://docs.pi.ai) |
+
+> You don't need to install all of them — pick the adapter(s) you plan to use. The onboarding wizard auto-detects what's installed and picks a default for you. Agents with missing CLIs are greyed out with install instructions.
+
+### Platform support
+
+| OS | Status | Notes |
+|----|--------|-------|
+| **macOS** (Intel, Apple Silicon) | ✅ Fully supported | Embedded PostgreSQL works out of the box |
+| **Linux glibc** (x64, ARM64) | ✅ Fully supported | Debian/Ubuntu/RHEL/Fedora — embedded PostgreSQL works out of the box |
+| **Linux musl** (Alpine) | ⚠️ Requires external Postgres | `embedded-postgres` ships glibc binaries only — set `DATABASE_URL` (see below) |
+| **Windows** (native) | ⚠️ Requires external Postgres | Use WSL2 for the full experience, or point `DATABASE_URL` at an external Postgres |
+
+If you're on Windows or Alpine, run an external Postgres and point the server at it:
+
+```bash
+# Example: docker postgres alongside ADE
+docker run -d --name ade-pg \
+  -e POSTGRES_USER=combyne -e POSTGRES_PASSWORD=combyne -e POSTGRES_DB=combyne \
+  -p 54329:5432 postgres:16
+
+# Tell ADE to use it instead of the embedded cluster
+export DATABASE_URL="postgres://combyne:combyne@127.0.0.1:54329/combyne"
+pnpm dev
+```
 
 ### 1. Clone and install
 
@@ -186,6 +223,11 @@ ADE works out of the box with zero configuration. All settings below are **optio
 | `COMBYNE_DB_BACKUP_INTERVAL_MINUTES` | `60` | Backup frequency |
 | `COMBYNE_DB_BACKUP_RETENTION_DAYS` | `30` | How long to keep backups |
 | `COMBYNE_SECRETS_STRICT_MODE` | `false` | Require secret references for API keys/tokens |
+| `BETTER_AUTH_SECRET` | *(auto-generated at `~/.combyne/secrets/`)* | Session signing key. Set explicitly for Docker / multi-instance deployments so sessions survive container restarts. Generate with `openssl rand -hex 32`. |
+| `COMBYNE_MEMORY_MIN_ENTRIES` | `3` | Min transcript entries before a run gets summarized into `agent_memory` |
+| `COMBYNE_RESET_SESSION_ON_ASSIGN` | `false` | Set to `true` to reset the adapter session on every issue reassignment (rollback lever for shared-context handoff) |
+
+See [`.env.example`](.env.example) for the full env-var surface, grouped by section.
 
 ### Database Modes
 
@@ -365,7 +407,24 @@ pnpm build        # Full build
 
 ## Docker
 
-### Quick Start
+### One-command quickstart (recommended)
+
+```bash
+# Generate a stable auth secret (store it somewhere — you'll need it on every restart)
+export BETTER_AUTH_SECRET=$(openssl rand -hex 32)
+
+docker compose -f docker-compose.quickstart.yml up --build
+```
+
+Then open **http://localhost:3100** and follow the onboarding wizard.
+
+The quickstart compose file:
+- Builds the `ade` image from the local `Dockerfile`
+- Persists data in the `ade_data` named volume (`~/.combyne` inside the container)
+- Binds to `:3100` on the host
+- Runs the embedded PostgreSQL inside the container — no separate DB service required
+
+### Manual docker run
 
 ```bash
 docker build -t ade .
@@ -373,14 +432,9 @@ docker run --name ade \
   -p 3100:3100 \
   -e HOST=0.0.0.0 \
   -e COMBYNE_HOME=/ade \
+  -e BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
   -v "$(pwd)/data/docker-ade:/ade" \
   ade
-```
-
-### Docker Compose
-
-```bash
-docker compose -f docker-compose.quickstart.yml up --build
 ```
 
 Pass API keys for your agent providers:
@@ -470,18 +524,19 @@ pnpm dev
 
 ### Agent adapter not found
 
-Make sure the agent CLI is installed and in your PATH:
+Make sure the agent CLI is installed and in your PATH. The server's `/api/health` response includes an `adapters` object showing which ones it could resolve:
 
 ```bash
-# Claude Code
-claude --version
+curl -s http://localhost:3100/api/health | jq .adapters
+```
 
-# Codex
-codex --version
+If a CLI is missing, install it (see [Prerequisites](#prerequisites) for the full list) or run:
 
-# Run diagnostics
+```bash
 pnpm combyne doctor --repair
 ```
+
+`combyne doctor` checks every adapter binary one by one and prints a per-adapter pass/warn line with the install command.
 
 ### Stale PostgreSQL lock file
 

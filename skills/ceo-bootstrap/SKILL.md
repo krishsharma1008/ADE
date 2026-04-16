@@ -76,6 +76,19 @@ fine; the endpoint transitions the issue to `awaiting_user` the first time. Use
 this to ask anything you genuinely need to know before delegating — target
 deadline, style preferences, scope boundaries.
 
+**Every turn after the first works the same way.** If the user's answer leaves
+anything ambiguous, or new questions come up as you proceed, call `/ask-user`
+again for each new question **before ending your turn**. Do not just write
+questions into a plain comment or into your run summary — those will not flip
+the issue to `awaiting_user`, so the UI will not show the user a structured
+prompt and your question may be missed. The rule:
+
+> If I have a question I need answered before I can proceed → call `/ask-user`.
+> Any other text belongs in a normal comment or the run summary.
+
+You can call `/ask-user` multiple times in a single turn to register several
+questions; the issue only needs to flip to `awaiting_user` once.
+
 ## Step 5 — Stop
 
 Do not delegate sub-issues yet. The next wake will happen when the user

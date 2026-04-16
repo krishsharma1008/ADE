@@ -273,6 +273,15 @@ export async function ensureCommandResolvable(command: string, cwd: string, env:
   throw new Error(`Command not found in PATH: "${command}"`);
 }
 
+export async function findCommandOnPath(
+  command: string,
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<string | null> {
+  const cwd = opts.cwd ?? process.cwd();
+  const env = ensurePathInEnv(opts.env ?? process.env);
+  return resolveCommandPath(command, cwd, env);
+}
+
 export async function runChildProcess(
   runId: string,
   command: string,

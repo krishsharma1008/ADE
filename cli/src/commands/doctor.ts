@@ -3,6 +3,7 @@ import pc from "picocolors";
 import type { CombyneConfig } from "../config/schema.js";
 import { readConfig, resolveConfigPath } from "../config/store.js";
 import {
+  adapterCliCheck,
   agentJwtSecretCheck,
   configCheck,
   databaseCheck,
@@ -11,6 +12,7 @@ import {
   logCheck,
   portCheck,
   secretsCheck,
+  sharedContextCheck,
   storageCheck,
   type CheckResult,
 } from "../checks/index.js";
@@ -89,18 +91,28 @@ export async function doctor(opts: {
   printResult(dbResult);
   await maybeRepair(dbResult, opts);
 
-  // 7. LLM check
+  // 7. Shared-context tables (transcripts / memory / handoffs)
+  const sharedContextResult = await sharedContextCheck(config);
+  results.push(sharedContextResult);
+  printResult(sharedContextResult);
+
+  // 8. Adapter CLI binaries on PATH
+  const adapterCliResult = await adapterCliCheck();
+  results.push(adapterCliResult);
+  printResult(adapterCliResult);
+
+  // 9. LLM check
   const llmResult = await llmCheck(config);
   results.push(llmResult);
   printResult(llmResult);
 
-  // 8. Log directory check
+  // 10. Log directory check
   const logResult = logCheck(config, configPath);
   results.push(logResult);
   printResult(logResult);
   await maybeRepair(logResult, opts);
 
-  // 9. Port check
+  // 11. Port check
   const portResult = await portCheck(config);
   results.push(portResult);
   printResult(portResult);

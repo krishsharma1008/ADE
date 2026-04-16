@@ -5,6 +5,15 @@ export type HealthDatabaseInfo = {
   database: string;
 };
 
+export type AdapterProbeInfo = {
+  available: boolean;
+  binary: string;
+  resolvedPath: string | null;
+  installHint: string;
+  docsUrl: string | null;
+  requiresCli: boolean;
+};
+
 export type HealthStatus = {
   status: "ok";
   deploymentMode?: "local_trusted" | "authenticated";
@@ -14,6 +23,7 @@ export type HealthStatus = {
   licenseEnabled?: boolean;
   licenseStatus?: string;
   database?: HealthDatabaseInfo | null;
+  adapters?: Record<string, AdapterProbeInfo> | null;
   features?: {
     companyDeletionEnabled?: boolean;
   };

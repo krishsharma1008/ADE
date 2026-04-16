@@ -80,6 +80,8 @@ export function OnboardingWizard() {
     retry: false,
   });
   const dbInfo = healthQuery.data?.database ?? null;
+  const adapterAvailability = healthQuery.data?.adapters ?? null;
+  const adapterAutoSelectedRef = useRef(false);
   const dbConnectionString = useMemo(() => {
     if (!dbInfo || dbInfo.mode !== "embedded-postgres" || dbInfo.port == null) {
       return null;
@@ -179,6 +181,43 @@ export function OnboardingWizard() {
   useEffect(() => {
     if (step === 3) autoResizeTextarea();
   }, [step, taskDescription, autoResizeTextarea]);
+
+  // Auto-select the first *installed* adapter CLI as soon as health
+  // lands. Falls back to leaving the user on claude_local (the default)
+  // if none are installed — they'll see an install-CLI block further down.
+  useEffect(() => {
+    if (!onboardingOpen || !adapterAvailability) return;
+    if (adapterAutoSelectedRef.current) return;
+    const priority: AdapterType[] = [
+      "claude_local",
+      "codex_local",
+      "cursor",
+      "opencode_local",
+      "pi_local",
+    ];
+    const firstAvailable = priority.find((type) => adapterAvailability[type]?.available);
+    if (firstAvailable && firstAvailable !== adapterType) {
+      setAdapterType(firstAvailable);
+      if (firstAvailable === "codex_local" && !model) {
+        setModel(DEFAULT_CODEX_LOCAL_MODEL);
+      } else if (firstAvailable === "cursor" && !model) {
+        setModel(DEFAULT_CURSOR_LOCAL_MODEL);
+      }
+    }
+    adapterAutoSelectedRef.current = true;
+  }, [onboardingOpen, adapterAvailability, adapterType, model]);
+
+  const noCliAdaptersInstalled = useMemo(() => {
+    if (!adapterAvailability) return false;
+    const cliTypes: AdapterType[] = [
+      "claude_local",
+      "codex_local",
+      "cursor",
+      "opencode_local",
+      "pi_local",
+    ];
+    return cliTypes.every((t) => adapterAvailability[t]?.available === false);
+  }, [adapterAvailability]);
 
   const {
     data: adapterModels,
@@ -740,6 +779,21 @@ export function OnboardingWizard() {
                     <label className="text-xs text-muted-foreground mb-2 block">
                       Adapter type
                     </label>
+                    {noCliAdaptersInstalled && (
+                      <div className="mb-2 rounded-md border border-amber-300/60 bg-amber-50/50 dark:bg-amber-500/10 px-2.5 py-2 text-[11px] leading-relaxed space-y-1.5">
+                        <p className="font-medium text-amber-900 dark:text-amber-200">
+                          No agent CLI detected on your PATH
+                        </p>
+                        <p className="text-amber-900/90 dark:text-amber-200/90">
+                          Install at least one adapter CLI, then reopen this wizard:
+                        </p>
+                        <ul className="space-y-0.5 font-mono text-[10px]">
+                          <li>• npm install -g @anthropic-ai/claude-code</li>
+                          <li>• npm install -g @openai/codex</li>
+                          <li>• curl https://cursor.com/install -fsS | bash</li>
+                        </ul>
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 gap-2">
                       {[
                         {
@@ -782,17 +836,29 @@ export function OnboardingWizard() {
                           icon: MousePointer2,
                           desc: "Local Cursor agent"
                         }
-                      ].map((opt) => (
+                      ].map((opt) => {
+                        const probe = adapterAvailability?.[opt.value] ?? null;
+                        const isMissingCli =
+                          probe !== null &&
+                          probe.requiresCli &&
+                          probe.available === false;
+                        return (
                         <button
                           key={opt.value}
                           disabled={!!opt.comingSoon}
+                          title={
+                            isMissingCli
+                              ? `Install ${probe!.binary}: ${probe!.installHint}`
+                              : undefined
+                          }
                           className={cn(
                             "flex flex-col items-center gap-1.5 rounded-md border p-3 text-xs transition-colors relative",
                             opt.comingSoon
                               ? "border-border opacity-40 cursor-not-allowed"
                               : adapterType === opt.value
                                 ? "border-foreground bg-accent"
-                                : "border-border hover:bg-accent/50"
+                                : "border-border hover:bg-accent/50",
+                            isMissingCli && adapterType !== opt.value && "opacity-60"
                           )}
                           onClick={() => {
                             if (opt.comingSoon) return;
@@ -812,9 +878,14 @@ export function OnboardingWizard() {
                             setModel("");
                           }}
                         >
-                          {opt.recommended && (
+                          {opt.recommended && !isMissingCli && (
                             <span className="absolute -top-1.5 right-1.5 bg-green-500 text-white text-[9px] font-semibold px-1.5 py-0.5 rounded-full leading-none">
                               Recommended
+                            </span>
+                          )}
+                          {isMissingCli && (
+                            <span className="absolute -top-1.5 right-1.5 bg-amber-500 text-white text-[9px] font-semibold px-1.5 py-0.5 rounded-full leading-none">
+                              Not installed
                             </span>
                           )}
                           <opt.icon className="h-4 w-4" />
@@ -826,7 +897,8 @@ export function OnboardingWizard() {
                               : opt.desc}
                           </span>
                         </button>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
 

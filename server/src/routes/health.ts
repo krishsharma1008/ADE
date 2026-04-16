@@ -3,6 +3,7 @@ import type { Db } from "@combyne/db";
 import { count, sql } from "drizzle-orm";
 import { companies, instanceUserRoles } from "@combyne/db";
 import type { DeploymentExposure, DeploymentMode } from "@combyne/shared";
+import { probeAdapterAvailability } from "../services/adapter-availability.js";
 
 export interface HealthDatabaseInfo {
   mode: "embedded-postgres" | "external-postgres";
@@ -65,6 +66,13 @@ export function healthRoutes(
       }
     }
 
+    let adapters: Awaited<ReturnType<typeof probeAdapterAvailability>> | null = null;
+    try {
+      adapters = await probeAdapterAvailability();
+    } catch {
+      adapters = null;
+    }
+
     res.json({
       status: "ok",
       deploymentMode: opts.deploymentMode,
@@ -74,6 +82,7 @@ export function healthRoutes(
       licenseEnabled: opts.licenseEnabled ?? false,
       licenseStatus,
       database: opts.database ?? null,
+      adapters,
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },

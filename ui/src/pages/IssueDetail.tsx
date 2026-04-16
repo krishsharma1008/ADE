@@ -521,15 +521,15 @@ export function IssueDetail() {
     [comments],
   );
 
-  const extractedQuestions = useMemo<string[]>(() => {
-    if (!linkedRuns || linkedRuns.length === 0) return [];
+  const latestRunText = useMemo<string>(() => {
+    if (!linkedRuns || linkedRuns.length === 0) return "";
     const sorted = [...linkedRuns].sort((a, b) => {
       const aTs = new Date(a.finishedAt ?? a.createdAt ?? 0).getTime();
       const bTs = new Date(b.finishedAt ?? b.createdAt ?? 0).getTime();
       return bTs - aTs;
     });
     const latest = sorted[0];
-    if (!latest) return [];
+    if (!latest) return "";
     const result = asRecord(latest.resultJson);
     const texts: string[] = [];
     const pushString = (v: unknown) => {
@@ -542,6 +542,7 @@ export function IssueDetail() {
       pushString(result.message);
       pushString(result.output);
       pushString(result.response);
+      pushString(result.summary);
       const blocks = result.contentBlocks ?? result.content_blocks;
       if (Array.isArray(blocks)) {
         for (const b of blocks) {
@@ -550,30 +551,42 @@ export function IssueDetail() {
         }
       }
     }
-    const haystack = texts.join("\n\n");
+    return texts.join("\n\n");
+  }, [linkedRuns]);
+
+  const extractedQuestions = useMemo<string[]>(() => {
+    const haystack = latestRunText;
     if (!haystack) return [];
     const qs: string[] = [];
     const seen = new Set<string>();
-    const re = /^[\s\-*]*(?:\d+[.)]|[a-zA-Z][.)])\s+(.{6,}\?)\s*$/gm;
+    const push = (raw: string) => {
+      const t = raw
+        .trim()
+        .replace(/^[-*•\s]+/, "")
+        .replace(/^\*\*/, "")
+        .replace(/\*\*$/, "")
+        .replace(/\*\*/g, "")
+        .trim();
+      if (t.length < 8) return;
+      if (!t.endsWith("?")) return;
+      if (seen.has(t)) return;
+      seen.add(t);
+      qs.push(t);
+    };
+    // 1. Numbered / lettered list items ending with "?" — highest signal.
+    const listRe = /^[\s\-*]*(?:\d+[.)]|[a-zA-Z][.)])\s+(.{6,}\?)\s*$/gm;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(haystack))) {
-      const line = m[1].trim().replace(/\*\*/g, "");
-      if (!seen.has(line)) {
-        seen.add(line);
-        qs.push(line);
-      }
-    }
+    while ((m = listRe.exec(haystack))) push(m[1]);
+    // 2. Any sentence ending in "?" anywhere in the prose.
+    //    Splits on sentence boundaries (. ! ? + whitespace) or newlines.
+    const sentenceRe = /([^.!?\n]{8,400}\?)/g;
+    while ((m = sentenceRe.exec(haystack))) push(m[1]);
+    // 3. Bare-line fallback: whole line ends with "?".
     if (qs.length === 0) {
-      for (const line of haystack.split(/\n+/)) {
-        const t = line.trim().replace(/^[-*•]\s*/, "").replace(/\*\*/g, "");
-        if (t.length > 10 && t.endsWith("?") && !seen.has(t)) {
-          seen.add(t);
-          qs.push(t);
-        }
-      }
+      for (const line of haystack.split(/\n+/)) push(line);
     }
     return qs.slice(0, 20);
-  }, [linkedRuns]);
+  }, [latestRunText]);
 
   const continueTerminal = useMutation({
     mutationFn: () => {
@@ -801,6 +814,7 @@ export function IssueDetail() {
             issueStatus={issue.status}
             pending={addComment.isPending}
             extractedQuestions={extractedQuestions}
+            latestRunText={latestRunText}
             onSubmit={async (body) => {
               const closedStatuses = ["done", "cancelled"];
               await addComment.mutateAsync({
@@ -1252,19 +1266,24 @@ function ReplyAndWakeCard({
   issueStatus,
   pending,
   extractedQuestions,
+  latestRunText,
   onSubmit,
 }: {
   issueStatus: string;
   pending: boolean;
   extractedQuestions: string[];
+  latestRunText?: string;
   onSubmit: (body: string) => Promise<void>;
 }) {
   const [freeText, setFreeText] = useState("");
   const [answers, setAnswers] = useState<Record<number, string>>({});
+  const [showFullRunText, setShowFullRunText] = useState(false);
   const hasQuestions = extractedQuestions.length > 0;
   const isAwaiting = issueStatus === "awaiting_user";
   const title = isAwaiting
-    ? "Agent is waiting for your response"
+    ? hasQuestions
+      ? `Agent is waiting — ${extractedQuestions.length} question${extractedQuestions.length === 1 ? "" : "s"} for you`
+      : "Agent is waiting for your response"
     : hasQuestions
       ? `Agent asked ${extractedQuestions.length} clarifying question${extractedQuestions.length === 1 ? "" : "s"}`
       : "Agent finished — reply to continue the conversation";
@@ -1272,8 +1291,15 @@ function ReplyAndWakeCard({
     ? "Answer each question inline (or add free-form notes below). Submitting re-opens the issue and wakes the agent with your reply."
     : isAwaiting
       ? "Type your answer. Submitting resumes the agent."
-      : "If the agent asked clarifying questions, answer them here. Submitting re-opens the issue and wakes the agent with your reply.";
+      : "Read the agent's latest update below, then reply. Submitting re-opens the issue and wakes the agent with your reply.";
   const buttonLabel = isAwaiting ? "Send answer" : "Reply & wake agent";
+  const runTextPreview = (latestRunText ?? "").trim();
+  const shouldShowLatestText = !hasQuestions && runTextPreview.length > 0;
+  const SNIPPET_CHARS = 480;
+  const runTextIsLong = runTextPreview.length > SNIPPET_CHARS;
+  const runTextSnippet = runTextIsLong
+    ? runTextPreview.slice(0, SNIPPET_CHARS).trimEnd() + "…"
+    : runTextPreview;
 
   const buildBody = () => {
     const parts: string[] = [];
@@ -1303,6 +1329,25 @@ function ReplyAndWakeCard({
         {title}
       </div>
       <div className="text-xs text-amber-800/80 dark:text-amber-200/80">{hint}</div>
+      {shouldShowLatestText && (
+        <div className="rounded border border-amber-500/30 bg-background/70 px-3 py-2">
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Agent's latest message
+          </div>
+          <div className="whitespace-pre-wrap text-sm text-foreground">
+            {showFullRunText || !runTextIsLong ? runTextPreview : runTextSnippet}
+          </div>
+          {runTextIsLong && (
+            <button
+              type="button"
+              onClick={() => setShowFullRunText((v) => !v)}
+              className="mt-1 text-[11px] font-medium text-amber-700 hover:underline dark:text-amber-300"
+            >
+              {showFullRunText ? "Show less" : "Show full message"}
+            </button>
+          )}
+        </div>
+      )}
       {hasQuestions && (
         <div className="flex flex-col gap-2">
           {extractedQuestions.map((q, i) => (
