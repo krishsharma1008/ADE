@@ -14,8 +14,97 @@ description: >
 ## Workflow
 
 ```
-Task → Find Services → Check Patterns → Write Code → Test
+Task → Find Services → Check Patterns → Write Code → Test → Pre-Push Check → Push
 ```
+
+> **⚠️ Never `git push` without running the Pre-Push Check (Step 8).**
+> Build failures in CI waste reviewer time and block merges. If the local build fails, fix it — do not push and hope.
+
+---
+
+## Pre-Push Check (MANDATORY before every push)
+
+Run these **in order**, from the repo root, and only push when all pass. If any step fails, fix the root cause — do not push with `--no-verify`, do not comment-out tests, do not suppress compile errors.
+
+### 1. Format
+| Build Tool | Command |
+|------------|---------|
+| Gradle | `./gradlew spotlessApply` |
+| Maven  | `mvn spotless:apply` |
+
+Commit any formatting changes separately so the diff stays readable.
+
+### 2. Full compile — all source sets
+A green `build` on your laptop is not enough; CI compiles **every** source set (main, test, and any loader-specific sets like `fabric`, `forge`, `neoforge`, integration tests). Run:
+
+```bash
+# Gradle — compiles every source set in every subproject
+./gradlew clean compileJava compileTestJava check --no-daemon
+
+# If the repo has loader/variant source sets (e.g. Fabric/Forge, or Spring profiles
+# producing separate source sets), compile them explicitly:
+./gradlew compileJavaFabric compileJavaForge compileIntegrationTestJava 2>/dev/null || true
+./gradlew tasks --all | grep -i '^compile' # discover compile tasks for this repo
+
+# Maven
+mvn -B clean verify -DskipITs=false
+```
+
+**Common failures and how to fix them (do not just silence the error):**
+- `cannot find symbol` / `package X does not exist` → you imported from the wrong module or left an unmapped import. For multi-module or multi-loader projects, confirm the class exists in the source set you're compiling. A `net.minecraftforge.*` import inside a Fabric source set (or vice-versa) is always a bug.
+- `unmappedMethodAccess` / `unmappedFieldAccess` → you called a method name from another mapping set. Re-resolve against the current source set's mappings.
+- Generated sources missing → run the generator task first (`./gradlew generateSources` or equivalent) and do not commit references to generated classes without committing the generator config.
+- Lombok errors → confirm `lombok` is on the `annotationProcessor` configuration for every source set that uses it.
+
+### 3. Tests
+```bash
+./gradlew test           # unit
+./gradlew integrationTest 2>/dev/null || true
+mvn test                 # Maven
+```
+No skipped tests, no `@Disabled` added to make red tests green. If a test is legitimately broken by your change, update the test to assert the new behavior and explain why in the commit message.
+
+### 4. Static checks / linters the repo ships with
+```bash
+./gradlew spotlessCheck checkstyleMain pmdMain spotbugsMain 2>/dev/null || true
+mvn spotless:check checkstyle:check 2>/dev/null || true
+```
+Only skip a check with a repo-approved suppression file, never with `-x`.
+
+### 5. Secrets & config
+- `git diff --staged` — scan for tokens, keys, `.env` values, `bootstrap.yml` hard-coded creds.
+- No `System.out.println` / stray `println` / `e.printStackTrace()` — use `log.info/warn/error` with structured BWLogger fields (`userId`, `transactionId`, `requestId`).
+- No commented-out code blocks. Delete them.
+
+### 6. Migration sanity (if Flyway/Liquibase changed)
+- Filename matches `V{YYYYMMDD}{seq}__description.sql`, monotonic with existing migrations.
+- Idempotent where possible (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`).
+- `./gradlew flywayInfo` / `mvn flyway:info` runs clean against a fresh DB.
+
+### 7. Coding-practice self-review
+Before pushing, re-read your diff and confirm:
+- **Every new public method** has Javadoc or is obviously self-explanatory from name + types.
+- **No swallowed exceptions** (`catch (Exception e) {}` without at minimum a log + rethrow/wrap).
+- **No `Optional.get()` without `isPresent()` / `orElseThrow()`**.
+- **No `@Autowired` on fields** in new code — use constructor injection (Lombok `@RequiredArgsConstructor`).
+- **All external calls** wrapped with `@CircuitBreaker` + `@Retry` where appropriate.
+- **Auth**: every new controller method validates the JWT actor (or is explicitly `/public/**`).
+- **Error handling**: throws `BusinessException`/`ResourceNotFoundException` with a code from the standard set, not a raw `RuntimeException`.
+- **Kafka events**: include `eventId`, `eventType`, `timestamp`, and are backward-compatible (only additive schema changes).
+- **DB access**: goes through a repository, never raw JDBC in a controller/service.
+- **Tests**: new behavior has at least one unit test; bug fixes have a regression test that fails before the fix.
+
+### 8. Only now: push
+```bash
+git status          # clean except for intended files
+git log --oneline origin/$(git branch --show-current)..HEAD  # sanity-check commits
+git push
+```
+
+If CI is still red after all of the above passes locally, the first thing to check is that CI is compiling the same source sets as your local run — not that CI is "flaky".
+
+---
+
 
 ### Step 1: Understand the Task
 

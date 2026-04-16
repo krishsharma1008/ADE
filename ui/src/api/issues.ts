@@ -78,6 +78,10 @@ export const issuesApi = {
       labelIds?: string[];
     },
   ) => api.post<{ issue: Issue }>(`/issues/${id}/delegate`, data),
+  answerQuestion: (
+    id: string,
+    data: { questionCommentId: string; answer: string },
+  ) => api.post<{ issue: Issue; answerComment: IssueComment }>(`/issues/${id}/answer-question`, data),
   listApprovals: (id: string) => api.get<Approval[]>(`/issues/${id}/approvals`),
   linkApproval: (id: string, approvalId: string) =>
     api.post<Approval[]>(`/issues/${id}/approvals`, { approvalId }),

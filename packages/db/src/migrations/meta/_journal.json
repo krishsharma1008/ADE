@@ -225,6 +225,13 @@
       "when": 1776369744500,
       "tag": "0031_issues_awaiting_user",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1776369744700,
+      "tag": "0032_issue_comment_kind",
+      "breakpoints": true
     }
   ]
 }

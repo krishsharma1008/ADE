@@ -156,6 +156,10 @@ export interface IssueComment {
   authorAgentId: string | null;
   authorUserId: string | null;
   body: string;
+  kind?: string;
+  choices?: string[] | null;
+  answeredAt?: Date | null;
+  answeredCommentId?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }

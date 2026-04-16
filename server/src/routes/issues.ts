@@ -691,6 +691,13 @@ export function issueRoutes(db: Db, storage: StorageService) {
   router.post("/issues/:id/ask-user", async (req, res) => {
     const id = req.params.id as string;
     const question = typeof req.body?.question === "string" ? req.body.question.trim() : "";
+    const rawChoices = req.body?.choices;
+    const choices = Array.isArray(rawChoices)
+      ? rawChoices
+          .map((c) => (typeof c === "string" ? c.trim() : ""))
+          .filter((c) => c.length > 0)
+          .slice(0, 8)
+      : null;
     if (!question) {
       res.status(400).json({ error: "question is required" });
       return;
@@ -710,6 +717,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
     const comment = await svc.addComment(id, question, {
       agentId: actor.agentId,
+      kind: "question",
+      choices: choices && choices.length > 0 ? choices : null,
     });
     const updated = await svc.update(id, { status: "awaiting_user" });
 
@@ -729,6 +738,75 @@ export function issueRoutes(db: Db, storage: StorageService) {
     });
 
     res.status(201).json({ comment, issue: updated ?? issue });
+  });
+
+  router.post("/issues/:id/answer-question", async (req, res) => {
+    const id = req.params.id as string;
+    const questionCommentId =
+      typeof req.body?.questionCommentId === "string" ? req.body.questionCommentId : "";
+    const answer = typeof req.body?.answer === "string" ? req.body.answer.trim() : "";
+    if (!questionCommentId || !answer) {
+      res.status(400).json({ error: "questionCommentId and answer are required" });
+      return;
+    }
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const actor = getActorInfo(req);
+
+    const answerComment = await svc.addComment(id, answer, {
+      agentId: actor.actorType === "agent" ? actor.agentId ?? undefined : undefined,
+      userId: actor.actorType === "user" ? actor.actorId ?? undefined : undefined,
+      kind: "answer",
+    });
+
+    try {
+      await svc.markQuestionAnswered(questionCommentId, answerComment.id);
+    } catch (err) {
+      logger.warn({ err, questionCommentId }, "failed to mark question answered");
+    }
+
+    const remaining = await svc.countOpenQuestions(id);
+    let updated = issue;
+    if (remaining === 0 && issue.status === "awaiting_user") {
+      updated = (await svc.update(id, { status: "in_progress" })) ?? issue;
+      if (issue.assigneeAgentId) {
+        try {
+          await heartbeat.wakeup(issue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "user_responded",
+            payload: { issueId: id, questionCommentId, answerCommentId: answerComment.id },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: { issueId: id, source: "issue.answer_question" },
+          });
+        } catch (err) {
+          logger.warn({ err, issueId: id }, "failed to wake agent after question answered");
+        }
+      }
+    }
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.question_answered",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        questionCommentId,
+        answerCommentId: answerComment.id,
+        remainingOpenQuestions: remaining,
+      },
+    });
+
+    res.status(201).json({ comment: answerComment, issue: updated, remainingOpenQuestions: remaining });
   });
 
   router.post("/issues/:id/delegate", async (req, res) => {

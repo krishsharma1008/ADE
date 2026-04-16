@@ -1,5 +1,6 @@
 /// <reference path="./types/express.d.ts" />
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -32,6 +33,33 @@ import { syncPersonas } from "./services/personas.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
+import { resolveCombyneInstanceRoot } from "./home-paths.js";
+
+function ensureLocalAgentJwtSecret(): void {
+  if (process.env.COMBYNE_AGENT_JWT_SECRET?.trim()) return;
+  const secretPath = resolve(resolveCombyneInstanceRoot(), "secrets", "agent-jwt.key");
+  let secret: string | null = null;
+  if (existsSync(secretPath)) {
+    try {
+      const content = readFileSync(secretPath, "utf8").trim();
+      if (content.length >= 32) secret = content;
+    } catch {
+      secret = null;
+    }
+  }
+  if (!secret) {
+    secret = randomBytes(48).toString("base64url");
+    try {
+      mkdirSync(resolve(resolveCombyneInstanceRoot(), "secrets"), { recursive: true });
+      writeFileSync(secretPath, secret, { encoding: "utf8" });
+      try { chmodSync(secretPath, 0o600); } catch {}
+      logger.info({ secretPath }, "Generated local agent JWT secret for first run");
+    } catch (err) {
+      logger.warn({ err, secretPath }, "Failed to persist generated agent JWT secret; using in-memory value");
+    }
+  }
+  process.env.COMBYNE_AGENT_JWT_SECRET = secret;
+}
 
 type BetterAuthSessionUser = {
   id: string;
@@ -432,6 +460,7 @@ export async function startServer(): Promise<StartedServer> {
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
   if (config.deploymentMode === "local_trusted") {
+    ensureLocalAgentJwtSecret();
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
   if (config.deploymentMode === "authenticated") {

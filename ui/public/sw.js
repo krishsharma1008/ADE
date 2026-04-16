@@ -1,4 +1,4 @@
-const CACHE_NAME = "combyne-v2";
+const CACHE_NAME = "combyne-v3";
 
 self.addEventListener("install", () => {
   self.skipWaiting();
@@ -15,28 +15,44 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const { request } = event;
-  const url = new URL(request.url);
 
-  // Skip non-GET requests and API calls
-  if (request.method !== "GET" || url.pathname.startsWith("/api")) {
+  if (request.method !== "GET") return;
+
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch {
     return;
   }
 
-  // Network-first for everything — cache is only an offline fallback
+  if (url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith("/api")) return;
+  if (url.pathname.startsWith("/companies")) return;
+  if (url.pathname.startsWith("/issues")) return;
+  if (url.protocol !== "http:" && url.protocol !== "https:") return;
+
   event.respondWith(
-    fetch(request)
-      .then((response) => {
-        if (response.ok && url.origin === self.location.origin) {
+    (async () => {
+      try {
+        const response = await fetch(request);
+        if (response && response.ok && response.type === "basic") {
           const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, clone)).catch(() => {});
         }
         return response;
-      })
-      .catch(() => {
+      } catch {
+        const cached = await caches.match(request);
+        if (cached) return cached;
         if (request.mode === "navigate") {
-          return caches.match("/") || new Response("Offline", { status: 503 });
+          const root = await caches.match("/");
+          if (root) return root;
+          return new Response("Offline", {
+            status: 503,
+            headers: { "Content-Type": "text/plain" },
+          });
         }
-        return caches.match(request);
-      })
+        return new Response("", { status: 504 });
+      }
+    })(),
   );
 });

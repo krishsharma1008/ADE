@@ -11,6 +11,12 @@ description: >
 
 # BukuWarung Knowledge Base
 
+> **Before every `git push` on a BUKU repo**, run the Pre-Push Check in
+> `buku-code-development/SKILL.md` → "Pre-Push Check (MANDATORY before every push)".
+> At minimum: `spotlessApply`, `clean compileJava compileTestJava check`, every
+> loader/variant `compileJava*` task, and the repo's test + static-check tasks.
+> Fix root causes; never push with `--no-verify` or by disabling failing checks.
+
 ## Select Your Workflow
 
 | Task | Skill | When to Use |

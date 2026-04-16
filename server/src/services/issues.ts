@@ -1058,7 +1058,11 @@ export function issueService(db: Db) {
         .where(eq(issueComments.id, commentId))
         .then((rows) => rows[0] ?? null),
 
-    addComment: async (issueId: string, body: string, actor: { agentId?: string; userId?: string }) => {
+    addComment: async (
+      issueId: string,
+      body: string,
+      actor: { agentId?: string; userId?: string; kind?: string; choices?: string[] | null },
+    ) => {
       const issue = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -1075,6 +1079,8 @@ export function issueService(db: Db) {
           authorAgentId: actor.agentId ?? null,
           authorUserId: actor.userId ?? null,
           body,
+          kind: actor.kind ?? "comment",
+          choices: actor.choices ?? null,
         })
         .returning();
 
@@ -1085,6 +1091,28 @@ export function issueService(db: Db) {
         .where(eq(issues.id, issueId));
 
       return comment;
+    },
+
+    markQuestionAnswered: async (questionCommentId: string, answerCommentId: string) => {
+      const now = new Date();
+      await db
+        .update(issueComments)
+        .set({ answeredAt: now, answeredCommentId: answerCommentId, updatedAt: now })
+        .where(and(eq(issueComments.id, questionCommentId), isNull(issueComments.answeredAt)));
+    },
+
+    countOpenQuestions: async (issueId: string) => {
+      const [row] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, issueId),
+            eq(issueComments.kind, "question"),
+            isNull(issueComments.answeredAt),
+          ),
+        );
+      return row?.count ?? 0;
     },
 
     createAttachment: async (input: {

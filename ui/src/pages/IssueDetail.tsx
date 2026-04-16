@@ -66,6 +66,7 @@ const ACTION_LABELS: Record<string, string> = {
   "issue.checked_out": "checked out the issue",
   "issue.released": "released the issue",
   "issue.comment_added": "added a comment",
+  "issue.question_answered": "answered a question",
   "issue.attachment_added": "added an attachment",
   "issue.attachment_removed": "removed an attachment",
   "issue.deleted": "deleted the issue",
@@ -503,6 +504,77 @@ export function IssueDetail() {
     [linkedApprovals],
   );
 
+  const answerQuestion = useMutation({
+    mutationFn: ({ questionCommentId, answer }: { questionCommentId: string; answer: string }) =>
+      issuesApi.answerQuestion(issueId!, { questionCommentId, answer }),
+    onSuccess: () => {
+      invalidateIssue();
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
+    },
+  });
+
+  const openQuestions = useMemo(
+    () =>
+      (comments ?? []).filter(
+        (c) => c.kind === "question" && !c.answeredAt,
+      ),
+    [comments],
+  );
+
+  const extractedQuestions = useMemo<string[]>(() => {
+    if (!linkedRuns || linkedRuns.length === 0) return [];
+    const sorted = [...linkedRuns].sort((a, b) => {
+      const aTs = new Date(a.finishedAt ?? a.createdAt ?? 0).getTime();
+      const bTs = new Date(b.finishedAt ?? b.createdAt ?? 0).getTime();
+      return bTs - aTs;
+    });
+    const latest = sorted[0];
+    if (!latest) return [];
+    const result = asRecord(latest.resultJson);
+    const texts: string[] = [];
+    const pushString = (v: unknown) => {
+      if (typeof v === "string" && v.trim()) texts.push(v);
+    };
+    if (result) {
+      pushString(result.result);
+      pushString(result.text);
+      pushString(result.content);
+      pushString(result.message);
+      pushString(result.output);
+      pushString(result.response);
+      const blocks = result.contentBlocks ?? result.content_blocks;
+      if (Array.isArray(blocks)) {
+        for (const b of blocks) {
+          const rec = asRecord(b);
+          if (rec) pushString(rec.text ?? rec.content);
+        }
+      }
+    }
+    const haystack = texts.join("\n\n");
+    if (!haystack) return [];
+    const qs: string[] = [];
+    const seen = new Set<string>();
+    const re = /^[\s\-*]*(?:\d+[.)]|[a-zA-Z][.)])\s+(.{6,}\?)\s*$/gm;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(haystack))) {
+      const line = m[1].trim().replace(/\*\*/g, "");
+      if (!seen.has(line)) {
+        seen.add(line);
+        qs.push(line);
+      }
+    }
+    if (qs.length === 0) {
+      for (const line of haystack.split(/\n+/)) {
+        const t = line.trim().replace(/^[-*•]\s*/, "").replace(/\*\*/g, "");
+        if (t.length > 10 && t.endsWith("?") && !seen.has(t)) {
+          seen.add(t);
+          qs.push(t);
+        }
+      }
+    }
+    return qs.slice(0, 20);
+  }, [linkedRuns]);
+
   const continueTerminal = useMutation({
     mutationFn: () => {
       if (!issue?.companyId || !issue?.assigneeAgentId || !issue?.id) {
@@ -670,7 +742,28 @@ export function IssueDetail() {
         </div>
       )}
 
-      {issue.status === "awaiting_user" && (
+      {openQuestions.length > 0 && (
+        <div className="flex flex-col gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-sm text-amber-800 dark:text-amber-200">
+          <div className="flex items-center gap-2 font-medium">
+            <HelpCircle className="h-4 w-4 shrink-0" />
+            {openQuestions.length === 1
+              ? "Agent has a question for you"
+              : `Agent has ${openQuestions.length} questions for you`}
+          </div>
+          {openQuestions.map((q) => (
+            <QuestionAnswerCard
+              key={q.id}
+              question={q}
+              pending={answerQuestion.isPending && answerQuestion.variables?.questionCommentId === q.id}
+              onAnswer={(answer) =>
+                answerQuestion.mutate({ questionCommentId: q.id, answer })
+              }
+            />
+          ))}
+        </div>
+      )}
+
+      {issue.status === "awaiting_user" && openQuestions.length === 0 && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
           <HelpCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <div className="flex-1">
@@ -700,6 +793,23 @@ export function IssueDetail() {
           )}
         </div>
       )}
+      {issue.assigneeAgentId &&
+        issue.originKind !== "terminal_session" &&
+        openQuestions.length === 0 &&
+        !hasLiveRuns && (
+          <ReplyAndWakeCard
+            issueStatus={issue.status}
+            pending={addComment.isPending}
+            extractedQuestions={extractedQuestions}
+            onSubmit={async (body) => {
+              const closedStatuses = ["done", "cancelled"];
+              await addComment.mutateAsync({
+                body,
+                reopen: closedStatuses.includes(issue.status),
+              });
+            }}
+          />
+        )}
       {issue.originKind === "terminal_session" &&
         issue.assigneeAgentId &&
         issue.status !== "awaiting_user" &&
@@ -1134,6 +1244,166 @@ export function IssueDetail() {
         </SheetContent>
       </Sheet>
       <ScrollToBottom />
+    </div>
+  );
+}
+
+function ReplyAndWakeCard({
+  issueStatus,
+  pending,
+  extractedQuestions,
+  onSubmit,
+}: {
+  issueStatus: string;
+  pending: boolean;
+  extractedQuestions: string[];
+  onSubmit: (body: string) => Promise<void>;
+}) {
+  const [freeText, setFreeText] = useState("");
+  const [answers, setAnswers] = useState<Record<number, string>>({});
+  const hasQuestions = extractedQuestions.length > 0;
+  const isAwaiting = issueStatus === "awaiting_user";
+  const title = isAwaiting
+    ? "Agent is waiting for your response"
+    : hasQuestions
+      ? `Agent asked ${extractedQuestions.length} clarifying question${extractedQuestions.length === 1 ? "" : "s"}`
+      : "Agent finished — reply to continue the conversation";
+  const hint = hasQuestions
+    ? "Answer each question inline (or add free-form notes below). Submitting re-opens the issue and wakes the agent with your reply."
+    : isAwaiting
+      ? "Type your answer. Submitting resumes the agent."
+      : "If the agent asked clarifying questions, answer them here. Submitting re-opens the issue and wakes the agent with your reply.";
+  const buttonLabel = isAwaiting ? "Send answer" : "Reply & wake agent";
+
+  const buildBody = () => {
+    const parts: string[] = [];
+    for (let i = 0; i < extractedQuestions.length; i++) {
+      const a = (answers[i] ?? "").trim();
+      if (a) {
+        parts.push(`**${i + 1}. ${extractedQuestions[i]}**\n${a}`);
+      }
+    }
+    const free = freeText.trim();
+    if (free) parts.push(free);
+    return parts.join("\n\n");
+  };
+
+  const body = buildBody();
+  const submit = async () => {
+    if (!body || pending) return;
+    await onSubmit(body);
+    setFreeText("");
+    setAnswers({});
+  };
+
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-sm">
+      <div className="flex items-center gap-2 font-medium text-amber-800 dark:text-amber-200">
+        <MessageSquare className="h-4 w-4 shrink-0" />
+        {title}
+      </div>
+      <div className="text-xs text-amber-800/80 dark:text-amber-200/80">{hint}</div>
+      {hasQuestions && (
+        <div className="flex flex-col gap-2">
+          {extractedQuestions.map((q, i) => (
+            <div
+              key={i}
+              className="rounded border border-amber-500/30 bg-background/60 px-3 py-2"
+            >
+              <div className="text-sm font-medium text-foreground">
+                <span className="mr-1.5 text-amber-700 dark:text-amber-300">{i + 1}.</span>
+                {q}
+              </div>
+              <textarea
+                value={answers[i] ?? ""}
+                onChange={(e) => setAnswers((prev) => ({ ...prev, [i]: e.target.value }))}
+                placeholder="Your answer…"
+                rows={2}
+                className="mt-1.5 w-full rounded border border-border bg-background px-2 py-1 text-sm text-foreground"
+                disabled={pending}
+                onKeyDown={(e) => {
+                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                    e.preventDefault();
+                    void submit();
+                  }
+                }}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+      <textarea
+        value={freeText}
+        onChange={(e) => setFreeText(e.target.value)}
+        placeholder={hasQuestions ? "Extra notes or clarifications (optional)…" : "Type your reply to the agent…"}
+        rows={hasQuestions ? 2 : 3}
+        className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+        disabled={pending}
+        onKeyDown={(e) => {
+          if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+            e.preventDefault();
+            void submit();
+          }
+        }}
+      />
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] text-muted-foreground">⌘/Ctrl+Enter to send</span>
+        <Button size="sm" disabled={pending || !body} onClick={() => void submit()}>
+          {pending ? "Sending…" : buttonLabel}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function QuestionAnswerCard({
+  question,
+  pending,
+  onAnswer,
+}: {
+  question: import("@combyne/shared").IssueComment;
+  pending: boolean;
+  onAnswer: (answer: string) => void;
+}) {
+  const [text, setText] = useState("");
+  const choices = Array.isArray(question.choices) ? question.choices : [];
+  const trimmed = text.trim();
+  return (
+    <div className="rounded border border-amber-500/30 bg-background/60 px-3 py-2 text-foreground">
+      <div className="whitespace-pre-wrap text-sm">{question.body}</div>
+      {choices.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {choices.map((choice) => (
+            <Button
+              key={choice}
+              size="sm"
+              variant="outline"
+              disabled={pending}
+              onClick={() => onAnswer(choice)}
+            >
+              {choice}
+            </Button>
+          ))}
+        </div>
+      )}
+      <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Type your answer…"
+          rows={2}
+          className="flex-1 rounded border border-border bg-background px-2 py-1 text-sm"
+          disabled={pending}
+        />
+        <Button
+          size="sm"
+          onClick={() => trimmed && onAnswer(trimmed)}
+          disabled={pending || !trimmed}
+          className="shrink-0"
+        >
+          {pending ? "Sending…" : "Send answer"}
+        </Button>
+      </div>
     </div>
   );
 }
