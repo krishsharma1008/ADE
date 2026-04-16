@@ -119,6 +119,7 @@ export const ISSUE_STATUSES = [
   "todo",
   "in_progress",
   "in_review",
+  "awaiting_user",
   "done",
   "blocked",
   "cancelled",
@@ -130,6 +131,7 @@ export const INBOX_MINE_ISSUE_STATUSES = [
   "todo",
   "in_progress",
   "in_review",
+  "awaiting_user",
   "blocked",
   "done",
 ] as const;
@@ -138,7 +140,7 @@ export const INBOX_MINE_ISSUE_STATUS_FILTER = INBOX_MINE_ISSUE_STATUSES.join(","
 export const ISSUE_PRIORITIES = ["critical", "high", "medium", "low"] as const;
 export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
 
-export const ISSUE_ORIGIN_KINDS = ["manual", "routine_execution"] as const;
+export const ISSUE_ORIGIN_KINDS = ["manual", "routine_execution", "terminal_session"] as const;
 export type IssueOriginKind = (typeof ISSUE_ORIGIN_KINDS)[number];
 
 export const GOAL_LEVELS = ["company", "team", "agent", "task"] as const;

@@ -30,6 +30,16 @@ export const terminalApi = {
       body,
     ),
 
+  continueSession: (
+    companyId: string,
+    agentId: string,
+    body: { issueId: string; cols?: number; rows?: number },
+  ) =>
+    api.post<{ session: TerminalSessionInfo; resumed: boolean }>(
+      `/companies/${companyId}/agents/${agentId}/terminal/continue`,
+      body,
+    ),
+
   closeSession: (companyId: string, agentId: string) =>
     fetch(`/api/companies/${companyId}/agents/${agentId}/terminal/session`, {
       method: "DELETE",

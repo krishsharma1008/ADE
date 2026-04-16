@@ -13,6 +13,7 @@ import { useCompany } from "../context/CompanyContext";
 import { useDialog } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
+import { buildEventsWsUrl } from "../lib/wsUrl";
 import { AgentConfigForm } from "../components/AgentConfigForm";
 import { adapterLabels, roleLabels } from "../components/agent-config-primitives";
 import { getUIAdapter, buildTranscript } from "../adapters";
@@ -2063,8 +2064,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
 
     const connect = () => {
       if (closed) return;
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const url = `${protocol}://${window.location.host}/api/companies/${encodeURIComponent(run.companyId)}/events/ws`;
+      const url = buildEventsWsUrl(run.companyId);
       socket = new WebSocket(url);
 
       socket.onopen = () => {

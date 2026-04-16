@@ -1,9 +1,19 @@
+export type HealthDatabaseInfo = {
+  mode: "embedded-postgres" | "external-postgres";
+  host: string;
+  port: number | null;
+  database: string;
+};
+
 export type HealthStatus = {
   status: "ok";
   deploymentMode?: "local_trusted" | "authenticated";
   deploymentExposure?: "private" | "public";
   authReady?: boolean;
-  bootstrapStatus?: "ready" | "bootstrap_pending";
+  bootstrapStatus?: "ready" | "bootstrap_pending" | "needs_onboarding";
+  licenseEnabled?: boolean;
+  licenseStatus?: string;
+  database?: HealthDatabaseInfo | null;
   features?: {
     companyDeletionEnabled?: boolean;
   };

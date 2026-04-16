@@ -36,6 +36,11 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  const id = (req as { id?: string | number }).id;
+  if (id !== undefined && !res.getHeader("X-Request-Id")) {
+    res.setHeader("X-Request-Id", String(id));
+  }
+
   if (err instanceof HttpError) {
     if (err.status >= 500) {
       attachErrorContext(

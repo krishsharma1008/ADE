@@ -331,9 +331,13 @@ export async function startServer(): Promise<StartedServer> {
     } else {
       const detectedPort = await detectPort(configuredPort);
       if (detectedPort !== configuredPort) {
-        logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
+        throw new Error(
+          `Embedded PostgreSQL port ${configuredPort} is already in use by another process. ` +
+            `Either stop that process or override the port with COMBYNE_EMBEDDED_POSTGRES_PORT ` +
+            `(e.g. COMBYNE_EMBEDDED_POSTGRES_PORT=${detectedPort} pnpm dev).`,
+        );
       }
-      port = detectedPort;
+      port = configuredPort;
       logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
       embeddedPostgres = new EmbeddedPostgres({
         databaseDir: dataDir,
@@ -386,6 +390,10 @@ export async function startServer(): Promise<StartedServer> {
   
     db = createDb(embeddedConnectionString);
     logger.info("Embedded PostgreSQL ready");
+    logger.info(
+      `Postgres ready at ${embeddedConnectionString} ` +
+        `(pgAdmin: host=127.0.0.1 port=${port} user=combyne password=combyne database=combyne)`,
+    );
     activeDatabaseConnectionString = embeddedConnectionString;
     startupDbInfo = { mode: "embedded-postgres", dataDir, port };
   }
@@ -558,6 +566,33 @@ export async function startServer(): Promise<StartedServer> {
 
   const uiMode = config.uiDevMiddleware ? "vite-dev" : config.serveUi ? "static" : "none";
   const storageService = createStorageServiceFromConfig(config);
+  const healthDatabaseInfo = (() => {
+    if (startupDbInfo.mode === "embedded-postgres") {
+      return {
+        mode: "embedded-postgres" as const,
+        host: "127.0.0.1",
+        port: startupDbInfo.port,
+        database: "combyne",
+      };
+    }
+    try {
+      const parsed = new URL(startupDbInfo.connectionString);
+      return {
+        mode: "external-postgres" as const,
+        host: parsed.hostname,
+        port: parsed.port ? Number(parsed.port) : null,
+        database: parsed.pathname.replace(/^\//, "") || "postgres",
+      };
+    } catch {
+      return {
+        mode: "external-postgres" as const,
+        host: "unknown",
+        port: null,
+        database: "unknown",
+      };
+    }
+  })();
+
   const app = await createApp(db as any, {
     uiMode,
     storageService,
@@ -570,6 +605,7 @@ export async function startServer(): Promise<StartedServer> {
     betterAuthHandler,
     resolveSession,
     licenseConfig,
+    database: healthDatabaseInfo,
   });
   app.use("/api/personas", createPersonasRouter({
     supabaseUrl: config.licenseSupabaseUrl,

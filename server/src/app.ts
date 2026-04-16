@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { Db } from "@combyne/db";
 import type { DeploymentExposure, DeploymentMode } from "@combyne/shared";
 import type { StorageService } from "./storage/types.js";
-import { httpLogger, errorHandler } from "./middleware/index.js";
+import { httpLogger, errorHandler, requestIdHeader } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
@@ -54,12 +54,19 @@ export async function createApp(
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
     licenseConfig?: LicenseConfig;
+    database?: {
+      mode: "embedded-postgres" | "external-postgres";
+      host: string;
+      port: number | null;
+      database: string;
+    };
   },
 ) {
   const app = express();
 
   app.use(express.json());
   app.use(httpLogger);
+  app.use(requestIdHeader());
   const privateHostnameGateEnabled =
     opts.deploymentMode === "authenticated" && opts.deploymentExposure === "private";
   const privateHostnameAllowSet = resolvePrivateHostnameAllowSet({
@@ -122,6 +129,7 @@ export async function createApp(
       authReady: opts.authReady,
       companyDeletionEnabled: opts.companyDeletionEnabled,
       licenseEnabled: !!opts.licenseConfig,
+      database: opts.database,
     }),
   );
   api.use("/companies", companyRoutes(db));

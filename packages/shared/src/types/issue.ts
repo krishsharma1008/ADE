@@ -130,6 +130,7 @@ export interface Issue {
   startedAt: Date | null;
   completedAt: Date | null;
   cancelledAt: Date | null;
+  awaitingUserSince?: Date | null;
   hiddenAt: Date | null;
   labelIds?: string[];
   labels?: IssueLabel[];

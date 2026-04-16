@@ -1,8 +1,15 @@
 import { Router } from "express";
 import type { Db } from "@combyne/db";
 import { count, sql } from "drizzle-orm";
-import { instanceUserRoles } from "@combyne/db";
+import { companies, instanceUserRoles } from "@combyne/db";
 import type { DeploymentExposure, DeploymentMode } from "@combyne/shared";
+
+export interface HealthDatabaseInfo {
+  mode: "embedded-postgres" | "external-postgres";
+  host: string;
+  port: number | null;
+  database: string;
+}
 
 export function healthRoutes(
   db?: Db,
@@ -12,6 +19,7 @@ export function healthRoutes(
     authReady: boolean;
     companyDeletionEnabled: boolean;
     licenseEnabled?: boolean;
+    database?: HealthDatabaseInfo;
   } = {
     deploymentMode: "local_trusted",
     deploymentExposure: "private",
@@ -28,7 +36,7 @@ export function healthRoutes(
       return;
     }
 
-    let bootstrapStatus: "ready" | "bootstrap_pending" = "ready";
+    let bootstrapStatus: "ready" | "bootstrap_pending" | "needs_onboarding" = "ready";
     if (opts.deploymentMode === "authenticated") {
       const roleCount = await db
         .select({ count: count() })
@@ -36,6 +44,15 @@ export function healthRoutes(
         .where(sql`${instanceUserRoles.role} = 'instance_admin'`)
         .then((rows) => Number(rows[0]?.count ?? 0));
       bootstrapStatus = roleCount > 0 ? "ready" : "bootstrap_pending";
+    }
+    if (bootstrapStatus === "ready") {
+      const companyCount = await db
+        .select({ count: count() })
+        .from(companies)
+        .then((rows) => Number(rows[0]?.count ?? 0));
+      if (companyCount === 0) {
+        bootstrapStatus = "needs_onboarding";
+      }
     }
 
     let licenseStatus: string = "not_required";
@@ -56,6 +73,7 @@ export function healthRoutes(
       bootstrapStatus,
       licenseEnabled: opts.licenseEnabled ?? false,
       licenseStatus,
+      database: opts.database ?? null,
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },

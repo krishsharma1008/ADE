@@ -26,6 +26,7 @@ import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
+import { createHandoff } from "../services/agent-handoff.js";
 
 const MAX_ATTACHMENT_BYTES = Number(process.env.COMBYNE_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
@@ -687,6 +688,137 @@ export function issueRoutes(db: Db, storage: StorageService) {
     res.json(issue);
   });
 
+  router.post("/issues/:id/ask-user", async (req, res) => {
+    const id = req.params.id as string;
+    const question = typeof req.body?.question === "string" ? req.body.question.trim() : "";
+    if (!question) {
+      res.status(400).json({ error: "question is required" });
+      return;
+    }
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    const actor = getActorInfo(req);
+    if (actor.actorType !== "agent" || !actor.agentId) {
+      res.status(403).json({ error: "Only agents may ask the user via this endpoint" });
+      return;
+    }
+
+    const comment = await svc.addComment(id, question, {
+      agentId: actor.agentId,
+    });
+    const updated = await svc.update(id, { status: "awaiting_user" });
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.ask_user",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        commentId: comment.id,
+        bodySnippet: question.slice(0, 200),
+      },
+    });
+
+    res.status(201).json({ comment, issue: updated ?? issue });
+  });
+
+  router.post("/issues/:id/delegate", async (req, res) => {
+    const parentId = req.params.id as string;
+    const toAgentId = typeof req.body?.toAgentId === "string" ? req.body.toAgentId : "";
+    const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+    const description =
+      typeof req.body?.description === "string" ? req.body.description.trim() : "";
+    const priority =
+      typeof req.body?.priority === "string" ? (req.body.priority as string) : "medium";
+    const labelIds = Array.isArray(req.body?.labelIds)
+      ? (req.body.labelIds as unknown[]).filter((v): v is string => typeof v === "string")
+      : undefined;
+
+    if (!toAgentId || !title) {
+      res.status(400).json({ error: "toAgentId and title are required" });
+      return;
+    }
+
+    const parent = await svc.getById(parentId);
+    if (!parent) {
+      res.status(404).json({ error: "Parent issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, parent.companyId);
+
+    const actor = getActorInfo(req);
+    const fromAgentId =
+      actor.actorType === "agent" ? actor.agentId ?? parent.assigneeAgentId : parent.assigneeAgentId;
+
+    const created = await svc.create(parent.companyId, {
+      title,
+      description: description || null,
+      status: "in_progress",
+      priority,
+      parentId: parent.id,
+      assigneeAgentId: toAgentId,
+      createdByAgentId: actor.actorType === "agent" ? actor.agentId ?? null : null,
+      labelIds,
+    } as Parameters<typeof svc.create>[1]);
+
+    if (!created) {
+      res.status(500).json({ error: "Failed to create sub-issue" });
+      return;
+    }
+
+    void createHandoff(db, {
+      companyId: parent.companyId,
+      issueId: created.id,
+      fromAgentId: fromAgentId ?? null,
+      toAgentId,
+    });
+
+    try {
+      await heartbeat.wakeup(toAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: created.id, mutation: "delegate", parentIssueId: parent.id },
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+        contextSnapshot: {
+          issueId: created.id,
+          parentIssueId: parent.id,
+          source: "issue.delegate",
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: created.id, toAgentId }, "failed to wake delegated agent");
+    }
+
+    await logActivity(db, {
+      companyId: parent.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.delegated",
+      entityType: "issue",
+      entityId: created.id,
+      details: {
+        parentIssueId: parent.id,
+        toAgentId,
+        fromAgentId: fromAgentId ?? null,
+      },
+    });
+
+    res.status(201).json({ issue: created });
+  });
+
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {
     const id = req.params.id as string;
     const issue = await svc.getById(id);
@@ -827,6 +959,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
     let interruptedRunId: string | null = null;
     let currentIssue = issue;
 
+    const isAwaitingUser = issue.status === "awaiting_user";
+    let resumedFromAwaitingUser = false;
+
     if (reopenRequested && isClosed) {
       const reopenedIssue = await svc.update(id, { status: "todo" });
       if (!reopenedIssue) {
@@ -902,6 +1037,14 @@ export function issueRoutes(db: Db, storage: StorageService) {
       }
     }
 
+    if (isAwaitingUser && actor.actorType === "user") {
+      const resumed = await svc.update(id, { status: "in_progress" });
+      if (resumed) {
+        currentIssue = resumed;
+        resumedFromAwaitingUser = true;
+      }
+    }
+
     const comment = await svc.addComment(id, req.body.body, {
       agentId: actor.agentId ?? undefined,
       userId: actor.actorType === "user" ? actor.actorId : undefined,
@@ -933,7 +1076,28 @@ export function issueRoutes(db: Db, storage: StorageService) {
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
       const skipWake = selfComment || isClosed;
-      if (assigneeId && (reopened || !skipWake)) {
+      if (assigneeId && resumedFromAwaitingUser) {
+        wakeups.set(assigneeId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "user_responded",
+          payload: {
+            issueId: currentIssue.id,
+            commentId: comment.id,
+            mutation: "awaiting_user_response",
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: currentIssue.id,
+            taskId: currentIssue.id,
+            commentId: comment.id,
+            source: "issue.comment.awaiting_user_response",
+            wakeReason: "user_responded",
+          },
+        });
+      }
+      if (assigneeId && !wakeups.has(assigneeId) && (reopened || !skipWake)) {
         if (reopened) {
           wakeups.set(assigneeId, {
             source: "automation",

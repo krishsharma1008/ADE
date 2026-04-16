@@ -68,6 +68,16 @@ export const issuesApi = {
     return api.postForm<IssueAttachment>(`/companies/${companyId}/issues/${issueId}/attachments`, form);
   },
   deleteAttachment: (id: string) => api.delete<{ ok: true }>(`/attachments/${id}`),
+  delegate: (
+    id: string,
+    data: {
+      toAgentId: string;
+      title: string;
+      description?: string;
+      priority?: string;
+      labelIds?: string[];
+    },
+  ) => api.post<{ issue: Issue }>(`/issues/${id}/delegate`, data),
   listApprovals: (id: string) => api.get<Approval[]>(`/issues/${id}/approvals`),
   linkApproval: (id: string, approvalId: string) =>
     api.post<Approval[]>(`/issues/${id}/approvals`, { approvalId }),

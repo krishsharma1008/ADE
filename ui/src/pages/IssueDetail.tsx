@@ -5,6 +5,8 @@ import { issuesApi } from "../api/issues";
 import { activityApi } from "../api/activity";
 import { heartbeatsApi } from "../api/heartbeats";
 import { agentsApi } from "../api/agents";
+import { approvalsApi } from "../api/approvals";
+import { terminalApi } from "../api/terminal";
 import { authApi } from "../api/auth";
 import { projectsApi } from "../api/projects";
 import { useCompany } from "../context/CompanyContext";
@@ -33,17 +35,22 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Activity as ActivityIcon,
+  Check,
   ChevronDown,
   ChevronRight,
   ClipboardList,
   EyeOff,
   Hexagon,
+  HelpCircle,
+  PlayCircle,
   ListTree,
   MessageSquare,
   MoreHorizontal,
   Paperclip,
   SlidersHorizontal,
   Trash2,
+  UserPlus,
+  X as XIcon,
 } from "lucide-react";
 import type { ActivityEvent } from "@combyne/shared";
 import type { Agent, IssueAttachment } from "@combyne/shared";
@@ -467,6 +474,53 @@ export function IssueDetail() {
     },
   });
 
+  const approveHire = useMutation({
+    mutationFn: (approvalId: string) => approvalsApi.approve(approvalId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.approvals(issueId!) });
+      if (selectedCompanyId) {
+        queryClient.invalidateQueries({ queryKey: ["company", selectedCompanyId, "approvals"] });
+        queryClient.invalidateQueries({ queryKey: ["company", selectedCompanyId, "agents"] });
+      }
+    },
+  });
+
+  const rejectHire = useMutation({
+    mutationFn: (approvalId: string) => approvalsApi.reject(approvalId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.approvals(issueId!) });
+      if (selectedCompanyId) {
+        queryClient.invalidateQueries({ queryKey: ["company", selectedCompanyId, "approvals"] });
+      }
+    },
+  });
+
+  const pendingHires = useMemo(
+    () =>
+      (linkedApprovals ?? []).filter(
+        (a) => a.type === "hire_agent" && a.status === "pending",
+      ),
+    [linkedApprovals],
+  );
+
+  const continueTerminal = useMutation({
+    mutationFn: () => {
+      if (!issue?.companyId || !issue?.assigneeAgentId || !issue?.id) {
+        throw new Error("Issue missing company/agent — cannot resume");
+      }
+      return terminalApi.continueSession(issue.companyId, issue.assigneeAgentId, {
+        issueId: issue.id,
+      });
+    },
+    onSuccess: ({ session }) => {
+      if (issue?.assigneeAgentId) {
+        navigate(`/agents/${issue.assigneeAgentId}?tab=terminal&session=${session.id}`);
+      } else {
+        invalidateIssue();
+      }
+    },
+  });
+
   useEffect(() => {
     const titleLabel = issue?.title ?? issueId ?? "Issue";
     setBreadcrumbs([
@@ -542,6 +596,144 @@ export function IssueDetail() {
         <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           <EyeOff className="h-4 w-4 shrink-0" />
           This issue is hidden
+        </div>
+      )}
+
+      {pendingHires.length > 0 && (
+        <div className="rounded-md border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-sm text-sky-700 dark:text-sky-300">
+          <div className="flex items-center gap-2 font-medium">
+            <UserPlus className="h-4 w-4 shrink-0" />
+            Proposed hires ({pendingHires.length}) awaiting your decision
+          </div>
+          <div className="mt-2 flex flex-col gap-2">
+            {pendingHires.map((approval) => {
+              const payload = (approval.payload ?? {}) as Record<string, unknown>;
+              const role = typeof payload.role === "string" ? payload.role : "agent";
+              const title = typeof payload.title === "string" ? payload.title : null;
+              const adapterType =
+                typeof payload.adapterType === "string" ? payload.adapterType : null;
+              const reason = typeof payload.reason === "string" ? payload.reason : null;
+              const busy =
+                (approveHire.isPending && approveHire.variables === approval.id) ||
+                (rejectHire.isPending && rejectHire.variables === approval.id);
+              return (
+                <div
+                  key={approval.id}
+                  className="flex flex-col gap-2 rounded border border-sky-500/30 bg-background/60 px-3 py-2 sm:flex-row sm:items-center sm:justify-between"
+                >
+                  <div className="min-w-0 text-xs">
+                    <div className="flex flex-wrap items-center gap-2 font-medium text-foreground">
+                      <span className="capitalize">{role.replace(/_/g, " ")}</span>
+                      {title && <span className="text-muted-foreground">· {title}</span>}
+                      {adapterType && (
+                        <span className="font-mono text-muted-foreground">
+                          · {adapterType}
+                        </span>
+                      )}
+                    </div>
+                    {reason && (
+                      <div className="mt-0.5 text-muted-foreground line-clamp-2">{reason}</div>
+                    )}
+                    <Link
+                      to={`/approvals/${approval.id}`}
+                      className="mt-0.5 inline-block font-mono text-[11px] text-muted-foreground hover:text-foreground"
+                    >
+                      {approval.id.slice(0, 8)} · view details
+                    </Link>
+                  </div>
+                  <div className="flex shrink-0 gap-2">
+                    <Button
+                      size="sm"
+                      variant="default"
+                      disabled={busy}
+                      onClick={() => approveHire.mutate(approval.id)}
+                      className="gap-1"
+                    >
+                      <Check className="h-4 w-4" />
+                      Hire
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() => rejectHire.mutate(approval.id)}
+                      className="gap-1"
+                    >
+                      <XIcon className="h-4 w-4" />
+                      Reject
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {issue.status === "awaiting_user" && (
+        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
+          <HelpCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div className="flex-1">
+            <div className="font-medium">
+              {issue.originKind === "terminal_session"
+                ? "Terminal session idled out"
+                : "Agent is waiting for your response"}
+            </div>
+            <div className="text-xs opacity-80">
+              {issue.originKind === "terminal_session"
+                ? "Click Continue to reopen the terminal with the prior session's context."
+                : "Reply below to resume the agent. The issue will automatically return to in-progress."}
+              {issue.awaitingUserSince ? ` Waiting since ${new Date(issue.awaitingUserSince).toLocaleString()}.` : ""}
+            </div>
+          </div>
+          {issue.originKind === "terminal_session" && issue.assigneeAgentId && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={continueTerminal.isPending}
+              onClick={() => continueTerminal.mutate()}
+              className="shrink-0 gap-1"
+            >
+              <PlayCircle className="h-4 w-4" />
+              {continueTerminal.isPending ? "Resuming..." : "Continue"}
+            </Button>
+          )}
+        </div>
+      )}
+      {issue.originKind === "terminal_session" &&
+        issue.assigneeAgentId &&
+        issue.status !== "awaiting_user" &&
+        issue.status !== "done" && (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            <span>This issue is backed by a live terminal session.</span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                const sessionId = issue.originId ?? "";
+                const qs = sessionId ? `?tab=terminal&session=${encodeURIComponent(sessionId)}` : "?tab=terminal";
+                navigate(`/agents/${issue.assigneeAgentId}${qs}`);
+              }}
+              className="shrink-0 gap-1"
+            >
+              <PlayCircle className="h-4 w-4" />
+              Open terminal
+            </Button>
+          </div>
+        )}
+      {issue.status === "done" && issue.originKind === "terminal_session" && issue.assigneeAgentId && (
+        <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          <span>Terminal session closed. You can resume it if it's still reachable.</span>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={continueTerminal.isPending}
+            onClick={() => continueTerminal.mutate()}
+            className="shrink-0 gap-1"
+          >
+            <PlayCircle className="h-4 w-4" />
+            {continueTerminal.isPending ? "Resuming..." : "Continue"}
+          </Button>
         </div>
       )}
 

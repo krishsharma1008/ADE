@@ -5,6 +5,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@/components/ui/button";
 import { terminalApi, type TerminalMode } from "../api/terminal";
+import { buildTerminalWsUrl } from "../lib/wsUrl";
 import { Loader2, Power, RotateCcw, TerminalSquare } from "lucide-react";
 
 interface Props {
@@ -70,8 +71,7 @@ export function AgentTerminalTab({ companyId, agentId, adapterType }: Props) {
       setStatus("connecting");
       disconnect();
 
-      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-      const url = `${scheme}://${window.location.host}/api/companies/${companyId}/agents/${agentId}/terminal/ws`;
+      const url = buildTerminalWsUrl(companyId, agentId);
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;

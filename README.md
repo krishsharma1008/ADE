@@ -179,6 +179,7 @@ ADE works out of the box with zero configuration. All settings below are **optio
 | `DATABASE_URL` | *(embedded PostgreSQL)* | Use an external PostgreSQL instead of embedded |
 | `HOST` | `127.0.0.1` | Server bind address |
 | `PORT` | `3100` | Server port |
+| `COMBYNE_EMBEDDED_POSTGRES_PORT` | `54329` | **Pinned** port for the embedded PostgreSQL cluster. The server fails fast with a clear error if this port is held by another process. |
 | `COMBYNE_HOME` | `~/.combyne` | Data directory root |
 | `COMBYNE_INSTANCE_ID` | `default` | Instance identifier (for multi-instance setups) |
 | `COMBYNE_DB_BACKUP_ENABLED` | `true` | Enable automatic database backups |
@@ -190,10 +191,52 @@ ADE works out of the box with zero configuration. All settings below are **optio
 
 | Mode | When | Setup |
 |------|------|-------|
-| **Embedded PostgreSQL** | Local dev (default) | Leave `DATABASE_URL` unset — fully automatic |
+| **Embedded PostgreSQL** | Local dev (default) | Leave `DATABASE_URL` unset — fully automatic. Cluster binds to **`127.0.0.1:54329`** (pin is fail-fast; override with `COMBYNE_EMBEDDED_POSTGRES_PORT`). |
 | **External PostgreSQL** | Production / teams | Set `DATABASE_URL=postgres://user:pass@host:5432/dbname` |
 
 Data is stored at `~/.combyne/instances/default/db` in embedded mode.
+The on-disk cluster is persistent — stopping the server leaves the data
+in place, and the next boot reattaches to it.
+
+On startup the server prints one line with the full connection string,
+e.g.:
+
+```text
+Postgres ready at postgres://combyne:combyne@127.0.0.1:54329/combyne (pgAdmin: host=127.0.0.1 port=54329 user=combyne password=combyne database=combyne)
+```
+
+### Connect with pgAdmin (or any psql-compatible client)
+
+While `pnpm dev` is running, point pgAdmin / DBeaver / `psql` at the
+embedded cluster:
+
+| Field    | Value        |
+|----------|--------------|
+| Host     | `127.0.0.1`  |
+| Port     | `54329`      |
+| Database | `combyne`    |
+| User     | `combyne`    |
+| Password | `combyne`    |
+
+One-shot verification from another terminal:
+
+```bash
+psql "postgres://combyne:combyne@127.0.0.1:54329/combyne" -c '\dt'
+```
+
+The onboarding wizard (first-run UI) also surfaces this connection
+string inline so you can copy it into pgAdmin without leaving the app.
+
+### Port conflicts
+
+If port `54329` is already bound (e.g. a system Postgres is running),
+the dev server will **fail fast** rather than silently relocating to a
+random port — this keeps pgAdmin bookmarks stable. Either stop the
+other process or choose a different port:
+
+```bash
+COMBYNE_EMBEDDED_POSTGRES_PORT=54330 pnpm dev
+```
 
 ### Reset Local Database
 

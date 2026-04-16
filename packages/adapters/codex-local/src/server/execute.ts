@@ -282,7 +282,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   });
-  const prompt = `${instructionsPrefix}${renderedPrompt}`;
+  const preambleSegments: string[] = [];
+  const bootstrap = parseObject(context.combyneBootstrapAnalysis);
+  const bootstrapPreamble = asString(bootstrap.preamble, "").trim();
+  if (bootstrapPreamble.length > 0) preambleSegments.push(bootstrapPreamble);
+  const handoff = parseObject(context.combyneHandoffBrief);
+  const handoffBrief = asString(handoff.brief, "").trim();
+  if (handoffBrief.length > 0) {
+    preambleSegments.push(`# Handoff brief from prior agent\n\n${handoffBrief}`);
+  }
+  const memory = parseObject(context.combyneMemoryPreamble);
+  const memoryBody = asString(memory.body, "").trim();
+  if (memoryBody.length > 0) {
+    preambleSegments.push(`# Recent memory\n\n${memoryBody}`);
+  }
+  const combinedPrefix =
+    preambleSegments.length > 0 ? `${preambleSegments.join("\n\n---\n\n")}\n\n---\n\n` : "";
+  const prompt = `${combinedPrefix}${instructionsPrefix}${renderedPrompt}`;
 
   const buildArgs = (resumeSessionId: string | null) => {
     const args = ["exec", "--json"];

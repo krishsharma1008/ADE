@@ -212,6 +212,7 @@ function asBoolField(value: unknown): boolean {
 async function buildCliLaunch(
   adapterType: string,
   adapterConfig: Record<string, unknown>,
+  opts?: { resumeClaudeSessionId?: string | null },
 ): Promise<{ command: string; args: string[]; extraEnv: Record<string, string>; notes: string[] } | null> {
   const notes: string[] = [];
   const extraEnv: Record<string, string> = {};
@@ -222,6 +223,11 @@ async function buildCliLaunch(
     const model = asStringField(adapterConfig.model);
     const effort = asStringField(adapterConfig.effort);
     const chrome = asBoolField(adapterConfig.chrome);
+    const resume = opts?.resumeClaudeSessionId ?? null;
+    if (resume) {
+      args.push("--resume", resume);
+      notes.push(`--resume ${resume} (continuing prior Claude session)`);
+    }
     // Always skip permissions in the interactive terminal so the user isn't
     // interrupted by approval prompts for every tool call — they're driving
     // their own REPL, not a headless heartbeat run.
@@ -341,6 +347,8 @@ export async function createTerminalSession(
     cols: number;
     rows: number;
     openedBy?: string | null;
+    reuseIssueId?: string | null;
+    resumeClaudeSessionId?: string | null;
   },
 ): Promise<TerminalSession> {
   const agent = await resolveAgentRow(db, opts.companyId, opts.agentId);
@@ -355,7 +363,9 @@ export async function createTerminalSession(
   const launchNotes: string[] = [];
   if (opts.mode === "cli") {
     const adapterConfig = (agent.adapterConfig ?? {}) as Record<string, unknown>;
-    const cli = await buildCliLaunch(agent.adapterType, adapterConfig);
+    const cli = await buildCliLaunch(agent.adapterType, adapterConfig, {
+      resumeClaudeSessionId: opts.resumeClaudeSessionId ?? null,
+    });
     if (!cli) {
       // Unknown adapter — fall back to shell with a banner line.
       command = resolveShell();
@@ -420,9 +430,28 @@ export async function createTerminalSession(
   // Create a ticketing "session Issue" so the terminal shows up in the same
   // Issues list heartbeat runs use, and so each prompt turn can be appended as
   // a comment for audit. Non-fatal if it fails — the PTY still runs.
+  // On Continue, `reuseIssueId` points at the existing session issue so we
+  // keep a single audit trail across resumes.
   void (async () => {
     try {
       const svc = issueService(db);
+      if (opts.reuseIssueId) {
+        session.sessionIssueId = opts.reuseIssueId;
+        const resumeNote = opts.resumeClaudeSessionId
+          ? ` (resumed via \`claude --resume ${opts.resumeClaudeSessionId}\`)`
+          : "";
+        await svc.addComment(
+          opts.reuseIssueId,
+          `Terminal session continued${resumeNote} at ${startedAt}. New PTY session id \`${id}\`.`,
+          { userId: opts.openedBy ?? undefined },
+        );
+        await svc.update(opts.reuseIssueId, { status: "in_progress" });
+        logger.info(
+          { sessionId: id, issueId: opts.reuseIssueId, agentId: agent.id },
+          "terminal: session continued against existing issue",
+        );
+        return;
+      }
       const niceDate = new Date(startedAt).toLocaleString();
       const issue = await svc.create(agent.companyId, {
         title: `Interactive terminal — ${session.agentName} — ${niceDate}`,
@@ -437,6 +466,8 @@ export async function createTerminalSession(
         status: "in_progress",
         assigneeAgentId: agent.id,
         createdByUserId: opts.openedBy ?? null,
+        originKind: "terminal_session",
+        originId: id,
       });
       session.sessionIssueId = issue?.id ?? null;
       logger.info(
@@ -682,18 +713,21 @@ export async function closeSession(db: Db, session: TerminalSession, reason = "c
     logger.warn({ err, sessionId: session.id }, "failed to mark session closed");
   }
 
-  // Close the ticketing side: leave a final comment and move the issue to done
-  // so the session shows up as completed in the normal issues list.
+  // Close the ticketing side. If the session was idle-reaped, leave the issue
+  // in `awaiting_user` so the UI can surface a Continue button that resumes
+  // the PTY (and, for Claude, the model session via `claude --resume`).
   if (session.sessionIssueId) {
     const issueId = session.sessionIssueId;
+    const idleClosed = reason === "idle";
     try {
       const svc = issueService(db);
-      await svc.addComment(
-        issueId,
-        `Terminal session closed (reason: \`${reason}\`) at ${new Date().toISOString()}.`,
-        { userId: session.openedByUserId ?? undefined },
-      );
-      await svc.update(issueId, { status: "done" });
+      const message = idleClosed
+        ? `Terminal session idle-closed at ${new Date().toISOString()}. Click **Continue** to resume this session.`
+        : `Terminal session closed (reason: \`${reason}\`) at ${new Date().toISOString()}.`;
+      await svc.addComment(issueId, message, {
+        userId: session.openedByUserId ?? undefined,
+      });
+      await svc.update(issueId, { status: idleClosed ? "awaiting_user" : "done" });
     } catch (err) {
       logger.warn(
         { err, sessionId: session.id, issueId },
@@ -737,5 +771,59 @@ export function startTerminalSessionReaper(db: Db) {
 export function listSessions(): TerminalSessionInfo[] {
   return Array.from(sessionsById.values()).map(toSessionInfo);
 }
+
+// Resume a previously-closed terminal session. Looks up the originating session
+// id from the issue's origin fields, spawns a fresh PTY, and — for claude_local
+// — passes `--resume <sessionId>` so the model context is preserved. For other
+// adapters we start a fresh REPL (the agent-memory + handoff subsystems carry
+// context across).
+export async function continueTerminalSession(
+  db: Db,
+  opts: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    mode?: TerminalMode;
+    cols?: number;
+    rows?: number;
+    openedBy?: string | null;
+  },
+): Promise<TerminalSession> {
+  const { issues: issuesTable } = await import("@combyne/db");
+  const issue = await db
+    .select()
+    .from(issuesTable)
+    .where(and(eq(issuesTable.id, opts.issueId), eq(issuesTable.companyId, opts.companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!issue) throw new Error("issue not found");
+  if (issue.originKind !== "terminal_session" || !issue.originId) {
+    throw new Error("issue is not a terminal-session issue");
+  }
+
+  // If a live session already exists for this agent, surface it rather than
+  // spawning a second one; the writer will re-attach via the normal ws flow.
+  const existing = getActiveSessionForAgent(opts.companyId, opts.agentId);
+  if (existing && !existing.closed) {
+    return existing;
+  }
+
+  const agent = await resolveAgentRow(db, opts.companyId, opts.agentId);
+  if (!agent) throw new Error("agent not found");
+
+  const priorSessionId = issue.originId;
+  const resumeClaude = agent.adapterType === "claude_local" ? priorSessionId : null;
+
+  return createTerminalSession(db, {
+    companyId: opts.companyId,
+    agentId: opts.agentId,
+    mode: opts.mode ?? "cli",
+    cols: opts.cols ?? 100,
+    rows: opts.rows ?? 30,
+    openedBy: opts.openedBy ?? null,
+    reuseIssueId: opts.issueId,
+    resumeClaudeSessionId: resumeClaude,
+  });
+}
+
 // suppress unused import warning — desc reserved for future queries
 void desc;

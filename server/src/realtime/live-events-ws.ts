@@ -46,6 +46,27 @@ interface UpgradeContext {
   actorId: string;
 }
 
+type AuthFailureReason =
+  | "missing_token"
+  | "invalid_token"
+  | "session_missing"
+  | "company_access_denied";
+
+type AuthorizeResult =
+  | { ok: true; context: UpgradeContext }
+  | { ok: false; reason: AuthFailureReason };
+
+function httpStatusForReason(reason: AuthFailureReason): { status: number; line: string; message: string } {
+  switch (reason) {
+    case "missing_token":
+    case "session_missing":
+      return { status: 401, line: "401 Unauthorized", message: "unauthorized" };
+    case "invalid_token":
+    case "company_access_denied":
+      return { status: 403, line: "403 Forbidden", message: "forbidden" };
+  }
+}
+
 interface IncomingMessageWithContext extends IncomingMessage {
   combyneUpgradeContext?: UpgradeContext;
 }
@@ -54,9 +75,21 @@ function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
 
-function rejectUpgrade(socket: Duplex, statusLine: string, message: string) {
+function newRequestId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function rejectUpgrade(
+  socket: Duplex,
+  statusLine: string,
+  message: string,
+  reqId?: string,
+) {
   const safe = message.replace(/[\r\n]+/g, " ").trim();
-  socket.write(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n${safe}`);
+  const reqHeader = reqId ? `X-Request-Id: ${reqId}\r\n` : "";
+  socket.write(
+    `HTTP/1.1 ${statusLine}\r\nConnection: close\r\nContent-Type: text/plain\r\n${reqHeader}\r\n${safe}`,
+  );
   socket.destroy();
 }
 
@@ -101,7 +134,7 @@ async function authorizeUpgrade(
     deploymentMode: DeploymentMode;
     resolveSessionFromHeaders?: (headers: Headers) => Promise<BetterAuthSessionResult | null>;
   },
-): Promise<UpgradeContext | null> {
+): Promise<AuthorizeResult> {
   const queryToken = url.searchParams.get("token")?.trim() ?? "";
   const authToken = parseBearerToken(req.headers.authorization);
   const token = authToken ?? (queryToken.length > 0 ? queryToken : null);
@@ -110,19 +143,18 @@ async function authorizeUpgrade(
   if (!token) {
     if (opts.deploymentMode === "local_trusted") {
       return {
-        companyId,
-        actorType: "board",
-        actorId: "board",
+        ok: true,
+        context: { companyId, actorType: "board", actorId: "board" },
       };
     }
 
     if (opts.deploymentMode !== "authenticated" || !opts.resolveSessionFromHeaders) {
-      return null;
+      return { ok: false, reason: "missing_token" };
     }
 
     const session = await opts.resolveSessionFromHeaders(headersFromIncomingMessage(req));
     const userId = session?.user?.id;
-    if (!userId) return null;
+    if (!userId) return { ok: false, reason: "session_missing" };
 
     const [roleRow, memberships] = await Promise.all([
       db
@@ -143,12 +175,13 @@ async function authorizeUpgrade(
     ]);
 
     const hasCompanyMembership = memberships.some((row) => row.companyId === companyId);
-    if (!roleRow && !hasCompanyMembership) return null;
+    if (!roleRow && !hasCompanyMembership) {
+      return { ok: false, reason: "company_access_denied" };
+    }
 
     return {
-      companyId,
-      actorType: "board",
-      actorId: userId,
+      ok: true,
+      context: { companyId, actorType: "board", actorId: userId },
     };
   }
 
@@ -159,9 +192,8 @@ async function authorizeUpgrade(
     .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
     .then((rows) => rows[0] ?? null);
 
-  if (!key || key.companyId !== companyId) {
-    return null;
-  }
+  if (!key) return { ok: false, reason: "invalid_token" };
+  if (key.companyId !== companyId) return { ok: false, reason: "company_access_denied" };
 
   await db
     .update(agentApiKeys)
@@ -169,9 +201,8 @@ async function authorizeUpgrade(
     .where(eq(agentApiKeys.id, key.id));
 
   return {
-    companyId,
-    actorType: "agent",
-    actorId: key.agentId,
+    ok: true,
+    context: { companyId, actorType: "agent", actorId: key.agentId },
   };
 }
 
@@ -246,26 +277,36 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    const reqId = newRequestId();
+
     void authorizeUpgrade(db, req, companyId, url, {
       deploymentMode: opts.deploymentMode,
       resolveSessionFromHeaders: opts.resolveSessionFromHeaders,
     })
-      .then((context) => {
-        if (!context) {
-          rejectUpgrade(socket, "403 Forbidden", "forbidden");
+      .then((result) => {
+        if (!result.ok) {
+          const { line, message, status } = httpStatusForReason(result.reason);
+          logger.info(
+            { reqId, companyId, path: req.url, status, reason: result.reason },
+            "websocket upgrade rejected",
+          );
+          rejectUpgrade(socket, line, message, reqId);
           return;
         }
 
         const reqWithContext = req as IncomingMessageWithContext;
-        reqWithContext.combyneUpgradeContext = context;
+        reqWithContext.combyneUpgradeContext = result.context;
 
         wss.handleUpgrade(req, socket, head, (ws: WsSocket) => {
           wss.emit("connection", ws, reqWithContext);
         });
       })
       .catch((err) => {
-        logger.error({ err, path: req.url }, "failed websocket upgrade authorization");
-        rejectUpgrade(socket, "500 Internal Server Error", "upgrade failed");
+        logger.error(
+          { err, reqId, companyId, path: req.url },
+          "failed websocket upgrade authorization",
+        );
+        rejectUpgrade(socket, "500 Internal Server Error", "upgrade failed", reqId);
       });
   });
 

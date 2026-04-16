@@ -8,6 +8,7 @@ import { companiesApi } from "../api/companies";
 import { goalsApi } from "../api/goals";
 import { agentsApi } from "../api/agents";
 import { issuesApi } from "../api/issues";
+import { healthApi } from "../api/health";
 import { queryKeys } from "../lib/queryKeys";
 import { Dialog, DialogPortal } from "@/components/ui/dialog";
 import {
@@ -44,7 +45,9 @@ import {
   Loader2,
   FolderOpen,
   ChevronDown,
-  X
+  X,
+  Database,
+  Copy
 } from "lucide-react";
 
 type Step = 1 | 2 | 3 | 4;
@@ -69,6 +72,32 @@ export function OnboardingWizard() {
   const { selectedCompanyId, companies, setSelectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+
+  const healthQuery = useQuery({
+    queryKey: queryKeys.health,
+    queryFn: () => healthApi.get(),
+    enabled: onboardingOpen,
+    retry: false,
+  });
+  const dbInfo = healthQuery.data?.database ?? null;
+  const dbConnectionString = useMemo(() => {
+    if (!dbInfo || dbInfo.mode !== "embedded-postgres" || dbInfo.port == null) {
+      return null;
+    }
+    return `postgres://combyne:combyne@${dbInfo.host}:${dbInfo.port}/${dbInfo.database}`;
+  }, [dbInfo]);
+  const [dbPanelOpen, setDbPanelOpen] = useState(false);
+  const [dbCopied, setDbCopied] = useState(false);
+  const handleCopyConnection = useCallback(async () => {
+    if (!dbConnectionString) return;
+    try {
+      await navigator.clipboard.writeText(dbConnectionString);
+      setDbCopied(true);
+      setTimeout(() => setDbCopied(false), 1500);
+    } catch {
+      // Clipboard API may be blocked (insecure origin) — silently ignore.
+    }
+  }, [dbConnectionString]);
 
   const initialStep = onboardingOptions.initialStep ?? 1;
   const existingCompanyId = onboardingOptions.companyId;
@@ -605,6 +634,78 @@ export function OnboardingWizard() {
                       onChange={(e) => setCompanyGoal(e.target.value)}
                     />
                   </div>
+                  {dbInfo && (
+                    <div className="rounded-md border border-border bg-muted/20">
+                      <button
+                        type="button"
+                        className="flex w-full items-center gap-2 px-3 py-2 text-left"
+                        onClick={() => setDbPanelOpen((v) => !v)}
+                      >
+                        <Database className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                        <span className="text-xs font-medium">
+                          {dbInfo.mode === "embedded-postgres"
+                            ? "Embedded Postgres"
+                            : "External Postgres"}
+                        </span>
+                        {dbInfo.port != null && (
+                          <span className="text-[11px] text-muted-foreground font-mono">
+                            {dbInfo.host}:{dbInfo.port}
+                          </span>
+                        )}
+                        <ChevronDown
+                          className={cn(
+                            "ml-auto h-3 w-3 text-muted-foreground transition-transform",
+                            dbPanelOpen && "rotate-180"
+                          )}
+                        />
+                      </button>
+                      {dbPanelOpen && (
+                        <div className="border-t border-border px-3 py-2 space-y-1.5 text-[11px]">
+                          {dbConnectionString && (
+                            <div className="flex items-center gap-2">
+                              <code className="flex-1 truncate font-mono text-muted-foreground">
+                                {dbConnectionString}
+                              </code>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-[10px]"
+                                onClick={handleCopyConnection}
+                              >
+                                {dbCopied ? (
+                                  <Check className="h-3 w-3 mr-1" />
+                                ) : (
+                                  <Copy className="h-3 w-3 mr-1" />
+                                )}
+                                {dbCopied ? "Copied" : "Copy"}
+                              </Button>
+                            </div>
+                          )}
+                          <p className="text-muted-foreground leading-relaxed">
+                            {dbInfo.mode === "embedded-postgres" ? (
+                              <>
+                                Connect with pgAdmin using host{" "}
+                                <span className="font-mono">{dbInfo.host}</span>, port{" "}
+                                <span className="font-mono">{dbInfo.port}</span>, user{" "}
+                                <span className="font-mono">combyne</span>, password{" "}
+                                <span className="font-mono">combyne</span>, database{" "}
+                                <span className="font-mono">{dbInfo.database}</span>.
+                              </>
+                            ) : (
+                              <>
+                                Using an external Postgres at{" "}
+                                <span className="font-mono">
+                                  {dbInfo.host}
+                                  {dbInfo.port != null ? `:${dbInfo.port}` : ""}
+                                </span>
+                                /<span className="font-mono">{dbInfo.database}</span>.
+                              </>
+                            )}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 

@@ -16,6 +16,10 @@ import {
 import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
+import { appendTranscriptEntry, type TranscriptRole } from "./agent-transcripts.js";
+import { loadRecentMemory, summarizeRunAndPersist } from "./agent-memory.js";
+import { getPendingHandoffBrief, markHandoffConsumed } from "./agent-handoff.js";
+import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec } from "../adapters/index.js";
@@ -195,11 +199,22 @@ function deriveTaskKey(
   );
 }
 
+/**
+ * Rollback lever: set COMBYNE_RESET_SESSION_ON_ASSIGN=true to restore the
+ * pre-Phase-C4 behaviour of wiping the saved adapter session whenever an
+ * issue is re-assigned. Default (unset or "false") keeps the session warm
+ * and lets the memory/handoff pipeline inject new context instead.
+ */
+function resetSessionOnAssignEnabled(): boolean {
+  const raw = process.env.COMBYNE_RESET_SESSION_ON_ASSIGN?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (wakeReason === "issue_assigned") return true;
+  if (wakeReason === "issue_assigned" && resetSessionOnAssignEnabled()) return true;
 
   const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
   if (wakeSource === "timer") return true;
@@ -212,7 +227,9 @@ function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
+  if (wakeReason === "issue_assigned" && resetSessionOnAssignEnabled()) {
+    return "wake reason is issue_assigned (rollback lever active)";
+  }
 
   const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
   if (wakeSource === "timer") return "wake source is timer";
@@ -791,6 +808,51 @@ export function heartbeatService(db: Db) {
         payload: event.payload ?? null,
       },
     });
+
+    try {
+      const role = mapEventToTranscriptRole(event.eventType, event.stream);
+      const issueId = resolveRunIssueId(run);
+      await appendTranscriptEntry(db, {
+        companyId: run.companyId,
+        agentId: run.agentId,
+        runId: run.id,
+        issueId,
+        seq,
+        role,
+        contentKind: event.eventType,
+        content: {
+          message: event.message ?? null,
+          stream: event.stream ?? null,
+          level: event.level ?? null,
+          payload: event.payload ?? null,
+        },
+      });
+    } catch (err) {
+      logger.debug({ err, runId: run.id }, "transcript append failed");
+    }
+  }
+
+  function mapEventToTranscriptRole(
+    eventType: string,
+    stream: "system" | "stdout" | "stderr" | undefined,
+  ): TranscriptRole {
+    if (eventType === "lifecycle") return "lifecycle";
+    if (eventType === "error") return "stderr";
+    if (eventType === "adapter.invoke") return "system";
+    if (stream === "stderr") return "stderr";
+    if (stream === "stdout") return "assistant";
+    return "system";
+  }
+
+  function resolveRunIssueId(run: typeof heartbeatRuns.$inferSelect): string | null {
+    const snapshot = run.contextSnapshot as Record<string, unknown> | null | undefined;
+    if (!snapshot) return null;
+    const direct = snapshot.issueId;
+    if (typeof direct === "string" && direct.length > 0) return direct;
+    const wake = snapshot[DEFERRED_WAKE_CONTEXT_KEY] as Record<string, unknown> | undefined;
+    const nested = wake?.issueId;
+    if (typeof nested === "string" && nested.length > 0) return nested;
+    return null;
   }
 
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
@@ -1065,6 +1127,108 @@ export function heartbeatService(db: Db) {
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
+    const memoryIssueId = readNonEmptyString(context.issueId);
+    let pendingHandoffId: string | null = null;
+    try {
+      const handoff = await getPendingHandoffBrief(db, agent.id, memoryIssueId ?? null);
+      if (handoff) {
+        pendingHandoffId = handoff.id;
+        context.combyneHandoffBrief = {
+          id: handoff.id,
+          fromAgentId: handoff.fromAgentId,
+          brief: handoff.brief,
+          openQuestions: handoff.openQuestions ?? [],
+        };
+        try {
+          await appendTranscriptEntry(db, {
+            companyId: agent.companyId,
+            agentId: agent.id,
+            runId: run.id,
+            issueId: memoryIssueId ?? null,
+            seq: 0,
+            role: "user",
+            contentKind: "handoff_brief",
+            content: {
+              handoffId: handoff.id,
+              fromAgentId: handoff.fromAgentId,
+              brief: handoff.brief,
+              openQuestions: handoff.openQuestions ?? [],
+            },
+          });
+        } catch (err) {
+          logger.debug({ err, agentId: agent.id, runId }, "failed to transcript handoff brief");
+        }
+        try {
+          await markHandoffConsumed(db, handoff.id);
+        } catch (err) {
+          logger.debug({ err, handoffId: handoff.id }, "failed to mark handoff consumed");
+        }
+      }
+    } catch (err) {
+      logger.debug({ err, agentId: agent.id }, "failed to load pending handoff");
+    }
+    void pendingHandoffId;
+    try {
+      const memoryRows = await loadRecentMemory(db, {
+        companyId: agent.companyId,
+        agentId: agent.id,
+        issueId: memoryIssueId ?? null,
+        limit: 8,
+      });
+      if (memoryRows.length > 0) {
+        const preamble = memoryRows
+          .map((row) => {
+            const header = row.title ? `## ${row.title}` : `## ${row.scope}/${row.kind}`;
+            return `${header}\n${row.body}`;
+          })
+          .join("\n\n");
+        const capped = preamble.length > 16000 ? `${preamble.slice(0, 16000)}\n…(truncated)` : preamble;
+        context.combyneMemoryPreamble = {
+          body: capped,
+          entryCount: memoryRows.length,
+          scope: memoryIssueId ? "issue" : "agent",
+        };
+      }
+    } catch (err) {
+      logger.debug({ err, agentId: agent.id, runId }, "failed to load agent memory preamble");
+    }
+    if (memoryIssueId) {
+      try {
+        const bootstrap = await detectBootstrapAnalysis(db, {
+          companyId: agent.companyId,
+          agentId: agent.id,
+          issueId: memoryIssueId,
+        });
+        if (bootstrap) {
+          const preamble = await buildBootstrapPreamble({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            issueId: memoryIssueId,
+          });
+          context.combyneBootstrapAnalysis = { ...bootstrap, preamble };
+          try {
+            await appendTranscriptEntry(db, {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              runId: run.id,
+              issueId: memoryIssueId,
+              seq: 0,
+              role: "system",
+              contentKind: "bootstrap_preamble",
+              content: { body: preamble, reason: bootstrap.reason },
+            });
+          } catch (err) {
+            logger.debug({ err, agentId: agent.id, runId }, "failed to transcript bootstrap preamble");
+          }
+          logger.info(
+            { agentId: agent.id, issueId: memoryIssueId, runId },
+            "bootstrap analysis context attached (first top-level CEO issue)",
+          );
+        }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId }, "failed to detect bootstrap analysis context");
+      }
+    }
     const taskKey = deriveTaskKey(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
@@ -1360,6 +1524,26 @@ export function heartbeatService(db: Db) {
 
       const finalizedRun = await getRun(run.id);
       if (finalizedRun) {
+        if (adapterResult.resultJson || stdoutExcerpt) {
+          try {
+            await appendTranscriptEntry(db, {
+              companyId: finalizedRun.companyId,
+              agentId: finalizedRun.agentId,
+              runId: finalizedRun.id,
+              issueId: resolveRunIssueId(finalizedRun),
+              seq: seq++,
+              role: "assistant",
+              contentKind: "adapter.result",
+              content: {
+                resultJson: (adapterResult.resultJson ?? null) as Record<string, unknown> | null,
+                stdoutExcerpt: stdoutExcerpt || null,
+                usage: (adapterResult.usage ?? null) as Record<string, unknown> | null,
+              },
+            });
+          } catch (err) {
+            logger.debug({ err, runId: finalizedRun.id }, "transcript final append failed");
+          }
+        }
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
@@ -1371,6 +1555,12 @@ export function heartbeatService(db: Db) {
           },
         });
         await releaseIssueExecutionAndPromote(finalizedRun);
+        void summarizeRunAndPersist(db, {
+          runId: finalizedRun.id,
+          companyId: finalizedRun.companyId,
+          agentId: finalizedRun.agentId,
+          issueId: resolveRunIssueId(finalizedRun),
+        });
       }
 
       if (finalizedRun) {

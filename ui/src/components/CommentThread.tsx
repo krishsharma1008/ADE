@@ -241,6 +241,7 @@ export function CommentThread({
   const hasScrolledRef = useRef(false);
 
   const isClosed = issueStatus ? CLOSED_STATUSES.has(issueStatus) : false;
+  const isAwaitingUser = issueStatus === "awaiting_user";
 
   const timeline = useMemo<TimelineItem[]>(() => {
     const commentItems: TimelineItem[] = comments.map((comment) => ({
@@ -437,7 +438,7 @@ export function CommentThread({
             />
           )}
           <Button size="sm" disabled={!canSubmit} onClick={handleSubmit}>
-            {submitting ? "Posting..." : "Comment"}
+            {submitting ? "Posting..." : isAwaitingUser ? "Send & resume" : "Comment"}
           </Button>
         </div>
       </div>

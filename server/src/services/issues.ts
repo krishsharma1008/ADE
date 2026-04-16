@@ -18,8 +18,18 @@ import {
 } from "@combyne/db";
 import { extractProjectMentionIds } from "@combyne/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { createHandoff } from "./agent-handoff.js";
 
-const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const ALL_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "awaiting_user",
+  "blocked",
+  "done",
+  "cancelled",
+];
 
 function assertTransition(from: string, to: string) {
   if (from === to) return;
@@ -42,6 +52,13 @@ function applyStatusSideEffects(
   }
   if (status === "cancelled") {
     patch.cancelledAt = new Date();
+  }
+  if (status === "awaiting_user") {
+    (patch as Partial<typeof issues.$inferInsert> & { awaitingUserSince?: Date }).awaitingUserSince =
+      new Date();
+  } else if (status && status !== "awaiting_user") {
+    (patch as Partial<typeof issues.$inferInsert> & { awaitingUserSince?: Date | null }).awaitingUserSince =
+      null;
   }
   return patch;
 }
@@ -718,7 +735,7 @@ export function issueService(db: Db) {
         patch.checkoutRunId = null;
       }
 
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -732,6 +749,22 @@ export function issueService(db: Db) {
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
       });
+
+      if (
+        result &&
+        issueData.assigneeAgentId !== undefined &&
+        issueData.assigneeAgentId !== existing.assigneeAgentId &&
+        issueData.assigneeAgentId
+      ) {
+        void createHandoff(db, {
+          companyId: existing.companyId,
+          issueId: id,
+          fromAgentId: existing.assigneeAgentId ?? null,
+          toAgentId: issueData.assigneeAgentId,
+        });
+      }
+
+      return result;
     },
 
     remove: (id: string) =>

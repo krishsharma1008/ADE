@@ -335,7 +335,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[combyne] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}".\n`,
     );
   }
-  const prompt = renderTemplate(promptTemplate, {
+  const renderedPrompt = renderTemplate(promptTemplate, {
     agentId: agent.id,
     companyId: agent.companyId,
     runId,
@@ -344,6 +344,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   });
+  const preambleSegments: string[] = [];
+  const bootstrap = parseObject(context.combyneBootstrapAnalysis);
+  const bootstrapPreamble = asString(bootstrap.preamble, "").trim();
+  if (bootstrapPreamble.length > 0) {
+    preambleSegments.push(bootstrapPreamble);
+  }
+  const handoff = parseObject(context.combyneHandoffBrief);
+  const handoffBrief = asString(handoff.brief, "").trim();
+  if (handoffBrief.length > 0) {
+    preambleSegments.push(`# Handoff brief from prior agent\n\n${handoffBrief}`);
+  }
+  const memory = parseObject(context.combyneMemoryPreamble);
+  const memoryBody = asString(memory.body, "").trim();
+  if (memoryBody.length > 0) {
+    preambleSegments.push(`# Recent memory\n\n${memoryBody}`);
+  }
+  const prompt =
+    preambleSegments.length > 0
+      ? `${preambleSegments.join("\n\n---\n\n")}\n\n---\n\n${renderedPrompt}`
+      : renderedPrompt;
 
   const buildClaudeArgs = (resumeSessionId: string | null) => {
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
