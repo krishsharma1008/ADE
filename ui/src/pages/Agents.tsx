@@ -38,7 +38,16 @@ type FilterTab = "all" | "active" | "paused" | "error";
 function matchesFilter(status: string, tab: FilterTab, showTerminated: boolean): boolean {
   if (status === "terminated") return showTerminated;
   if (tab === "all") return true;
-  if (tab === "active") return status === "active" || status === "running" || status === "idle";
+  // `pending_approval` belongs in the active tab — a freshly-hired agent is
+  // invisible to the user otherwise, and they think creation failed. The
+  // status badge + AgentDetail banner flag the pending state.
+  if (tab === "active")
+    return (
+      status === "active" ||
+      status === "running" ||
+      status === "idle" ||
+      status === "pending_approval"
+    );
   if (tab === "paused") return status === "paused";
   if (tab === "error") return status === "error";
   return true;
@@ -205,7 +214,24 @@ export function Agents() {
       </div>
 
       {filtered.length > 0 && (
-        <p className="text-xs text-muted-foreground">{filtered.length} agent{filtered.length !== 1 ? "s" : ""}</p>
+        <p className="text-xs text-muted-foreground">
+          {filtered.length} agent{filtered.length !== 1 ? "s" : ""}
+          {(() => {
+            const pendingCount = (agents ?? []).filter((a) => a.status === "pending_approval").length;
+            if (pendingCount === 0) return null;
+            return (
+              <>
+                {" · "}
+                <button
+                  className="underline hover:text-foreground"
+                  onClick={() => navigate("/approvals/pending")}
+                >
+                  {pendingCount} pending approval{pendingCount !== 1 ? "s" : ""}
+                </button>
+              </>
+            );
+          })()}
+        </p>
       )}
 
       {error && <p className="text-sm text-destructive">{error.message}</p>}

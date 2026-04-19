@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
+import { useToast } from "../context/ToastContext";
 import { agentsApi } from "../api/agents";
 import { queryKeys } from "../lib/queryKeys";
 import { AGENT_ROLES } from "@combyne/shared";
@@ -54,6 +55,7 @@ function createValuesForAdapterType(
 export function NewAgent() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
+  const { pushToast } = useToast();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -122,6 +124,26 @@ export function NewAgent() {
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(selectedCompanyId!) });
       queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(selectedCompanyId!) });
+      // Make the pending-approval state explicit — previously users saw
+      // the agent land on its detail page with a disabled Run button and
+      // thought the hire had failed. Now a toast tells them what to do.
+      const requiresApproval = result.agent.status === "pending_approval";
+      if (requiresApproval) {
+        pushToast({
+          title: `${result.agent.name} created — awaiting board approval`,
+          body: "The hire_agent approval is on the approvals dashboard. Approve it to activate the agent.",
+          tone: "info",
+          action: { label: "Review", href: "/approvals/pending" },
+          ttlMs: 8000,
+        });
+      } else {
+        pushToast({
+          title: `${result.agent.name} created`,
+          body: "Agent is live and ready to pick up work.",
+          tone: "success",
+          ttlMs: 5000,
+        });
+      }
       navigate(agentUrl(result.agent));
     },
     onError: (error) => {
