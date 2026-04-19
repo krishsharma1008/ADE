@@ -370,6 +370,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (gitSummary.length > 0) {
     preambleSegments.push(`# Workspace git state\n\n${gitSummary}`);
   }
+  const companyProjects = parseObject(context.combyneCompanyProjects);
+  const projectsBody = asString(companyProjects.body, "").trim();
+  if (projectsBody.length > 0) {
+    preambleSegments.push(`# Company projects\n\n${projectsBody}`);
+  }
   const prompt =
     preambleSegments.length > 0
       ? `${preambleSegments.join("\n\n---\n\n")}\n\n---\n\n${renderedPrompt}`
@@ -387,6 +392,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--append-system-prompt-file", effectiveInstructionsFilePath);
     }
     args.push("--add-dir", skillsDir);
+    // Expose every Combyne-managed project workspace to Claude as an
+    // additional allowed directory. Mirrors the interactive-terminal fix
+    // so heartbeat runs don't come back with "project not found" when the
+    // user has wired the workspace on the Projects page.
+    const projectDirs = Array.isArray(context.combyneProjectWorkspaceDirs)
+      ? context.combyneProjectWorkspaceDirs.filter(
+          (value): value is string => typeof value === "string" && value.trim().length > 0,
+        )
+      : [];
+    for (const dir of projectDirs) {
+      args.push("--add-dir", dir);
+    }
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };

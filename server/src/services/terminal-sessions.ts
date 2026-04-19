@@ -347,10 +347,12 @@ async function buildCliLaunch(
   opts?: {
     resumeClaudeSessionId?: string | null;
     contextPreamble?: { body: string; title: string } | null;
+    projectWorkspaceDirs?: string[];
   },
 ): Promise<{ command: string; args: string[]; extraEnv: Record<string, string>; notes: string[] } | null> {
   const notes: string[] = [];
   const extraEnv: Record<string, string> = {};
+  const projectWorkspaceDirs = opts?.projectWorkspaceDirs ?? [];
 
   if (adapterType === "claude_local") {
     const command = asStringField(adapterConfig.command) || "claude";
@@ -376,6 +378,16 @@ async function buildCliLaunch(
     const skillsDir = await buildClaudeSkillsDir();
     args.push("--add-dir", skillsDir);
     notes.push(`--add-dir ${skillsDir}`);
+
+    // Surface every Combyne-managed project workspace to Claude as an
+    // additional allowed directory. Fixes the "CEO can't see the Lending
+    // Team folder" bug Krish flagged — the agent was silently scoped to
+    // its home workspace and had no way to reach the project paths even
+    // when the user had configured them in the UI.
+    for (const dir of projectWorkspaceDirs) {
+      args.push("--add-dir", dir);
+      notes.push(`--add-dir ${dir} (project workspace)`);
+    }
 
     // Persona: append-system-prompt-file if the agent was configured with one,
     // concatenated with the Combyne context preamble so the terminal Claude
@@ -461,6 +473,57 @@ async function ensureDir(dir: string) {
   }
 }
 
+function readNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+async function pathExists(p: string | null | undefined): Promise<boolean> {
+  if (!p) return false;
+  try {
+    const stat = await fs.stat(p);
+    return stat.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+const MAX_PROJECT_WORKSPACE_DIRS = 10;
+
+/**
+ * Pull the unique set of on-disk workspace paths across every Combyne project
+ * in the company. Passed to claude/codex as --add-dir so the REPL can ls/grep
+ * project paths even when the cwd is somewhere else. Filtered to existing
+ * directories and capped so a company with 40 projects doesn't blow up the
+ * spawn arg list.
+ */
+async function collectCompanyProjectWorkspaceDirs(
+  db: Db,
+  companyId: string,
+  skip: string | null,
+): Promise<string[]> {
+  try {
+    const overview = await loadCompanyProjectOverview(db, companyId);
+    const out = new Set<string>();
+    for (const project of overview.items) {
+      for (const ws of project.workspaces) {
+        if (!ws.cwd) continue;
+        if (skip && ws.cwd === skip) continue;
+        if (out.has(ws.cwd)) continue;
+        if (!(await pathExists(ws.cwd))) continue;
+        out.add(ws.cwd);
+        if (out.size >= MAX_PROJECT_WORKSPACE_DIRS) break;
+      }
+      if (out.size >= MAX_PROJECT_WORKSPACE_DIRS) break;
+    }
+    return Array.from(out);
+  } catch (err) {
+    logger.debug({ err, companyId }, "terminal: failed to load project workspace dirs");
+    return [];
+  }
+}
+
 async function resolveAgentRow(db: Db, companyId: string, agentId: string) {
   const row = await db
     .select()
@@ -513,8 +576,27 @@ export async function createTerminalSession(
   const agent = await resolveAgentRow(db, opts.companyId, opts.agentId);
   if (!agent) throw new Error("agent not found");
 
-  const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
+  // Resolve the effective working directory. Krish's pilot flagged this:
+  // the terminal was silently spawning in the agent-home workspace
+  // (`~/.combyne/instances/.../workspaces/<agent>`) even when the agent
+  // had a real working directory configured on its Configure page
+  // (adapterConfig.cwd). Honour that configured path first so the REPL
+  // lands inside the project the user actually set up.
+  const configuredCwd = readNonEmptyString(
+    (agent.adapterConfig as { cwd?: unknown })?.cwd,
+  );
+  const homeCwd = resolveDefaultAgentWorkspaceDir(agent.id);
+  const cwd = (await pathExists(configuredCwd)) ? configuredCwd! : homeCwd;
   await ensureDir(cwd);
+
+  // Also collect every Combyne-managed project workspace on this company so
+  // claude/codex can read/write across them via --add-dir — the alternative
+  // is the agent saying "project not found" when the user clearly set it up.
+  const projectWorkspaceDirs = await collectCompanyProjectWorkspaceDirs(
+    db,
+    agent.companyId,
+    cwd,
+  );
 
   let command: string;
   let args: string[];
@@ -544,6 +626,7 @@ export async function createTerminalSession(
     const cli = await buildCliLaunch(agent.adapterType, adapterConfig, {
       resumeClaudeSessionId: opts.resumeClaudeSessionId ?? null,
       contextPreamble,
+      projectWorkspaceDirs,
     });
     if (!cli) {
       // Unknown adapter — fall back to shell with a banner line.

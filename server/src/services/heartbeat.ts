@@ -1313,6 +1313,25 @@ export function heartbeatService(db: Db) {
       logger.debug({ err, agentId: agent.id, runId }, "failed to load assigned issue queue");
     }
 
+    // Surface Combyne-managed project workspaces to the adapter so it can
+    // ls/read/write across them — same fix as the terminal preamble,
+    // mirrored here so heartbeat runs don't ask "project not found" either.
+    try {
+      const overview = await loadCompanyProjectOverview(db, agent.companyId);
+      if (overview.items.length > 0) {
+        context.combyneCompanyProjects = overview;
+        const dirs: string[] = [];
+        for (const project of overview.items) {
+          for (const ws of project.workspaces) {
+            if (ws.cwd && !dirs.includes(ws.cwd)) dirs.push(ws.cwd);
+          }
+        }
+        if (dirs.length > 0) context.combyneProjectWorkspaceDirs = dirs.slice(0, 10);
+      }
+    } catch (err) {
+      logger.debug({ err, companyId: agent.companyId, runId }, "failed to load project overview");
+    }
+
     // Close the loop between git state and issue status: before the agent
     // says "nothing to do", let it see commits/branches that already mention
     // this issue. Best-effort; non-git workspaces degrade gracefully.

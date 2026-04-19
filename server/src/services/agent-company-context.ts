@@ -147,8 +147,11 @@ export async function loadCompanyProjectOverview(
     const primary = project.workspaces.find((w) => w.isPrimary) ?? project.workspaces[0];
     if (primary) {
       const repoPart = primary.repoUrl ? ` @ \`${primary.repoUrl}${primary.repoRef ? `#${primary.repoRef}` : ""}\`` : "";
-      const cwdPart = primary.cwd ? ` — cwd \`${primary.cwd}\`` : "";
+      const cwdPart = primary.cwd ? ` — **local path** \`${primary.cwd}\`` : "";
       lines.push(`    - Primary workspace: **${primary.name}**${repoPart}${cwdPart}`);
+      if (primary.cwd) {
+        lines.push(`    - _Accessible from this session via \`--add-dir\` — you can \`ls ${primary.cwd}\`, read/write files there directly._`);
+      }
     }
     if (project.workspaces.length > 1) {
       lines.push(`    - +${project.workspaces.length - 1} other workspace(s)`);
