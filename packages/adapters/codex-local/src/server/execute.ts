@@ -296,6 +296,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (memoryBody.length > 0) {
     preambleSegments.push(`# Recent memory\n\n${memoryBody}`);
   }
+  const assigned = parseObject(context.combyneAssignedIssues);
+  const assignedBody = asString(assigned.body, "").trim();
+  if (assignedBody.length > 0) {
+    preambleSegments.push(`# Your current task queue\n\n${assignedBody}`);
+  }
+  const gitState = parseObject(context.combyneGitState);
+  const gitSummary = asString(gitState.summary, "").trim();
+  if (gitSummary.length > 0) {
+    preambleSegments.push(`# Workspace git state\n\n${gitSummary}`);
+  }
   const combinedPrefix =
     preambleSegments.length > 0 ? `${preambleSegments.join("\n\n---\n\n")}\n\n---\n\n` : "";
   const prompt = `${combinedPrefix}${instructionsPrefix}${renderedPrompt}`;

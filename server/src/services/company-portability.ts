@@ -4,7 +4,9 @@ import type { Db } from "@combyne/db";
 import type {
   CompanyPortabilityAgentManifestEntry,
   CompanyPortabilityCollisionStrategy,
+  CompanyPortabilityEnvInput,
   CompanyPortabilityExport,
+  CompanyPortabilityFileEntry,
   CompanyPortabilityExportPreviewFile,
   CompanyPortabilityExportPreviewResult,
   CompanyPortabilityExportResult,
@@ -34,7 +36,12 @@ const SENSITIVE_ENV_KEY_RE =
 
 type ResolvedSource = {
   manifest: CompanyPortabilityManifest;
-  files: Record<string, string>;
+  // Inline sources can ship base64-encoded binary assets (logos) alongside
+  // plain-text markdown; the portability importer flattens both when reading.
+  files: Record<
+    string,
+    string | { data: string; encoding: "base64"; contentType?: string | null }
+  >;
   warnings: string[];
 };
 
@@ -159,7 +166,7 @@ function ensureMarkdownPath(pathValue: string) {
 function normalizePortableEnv(
   agentSlug: string,
   envValue: unknown,
-  requiredSecrets: CompanyPortabilityManifest["requiredSecrets"],
+  requiredSecrets: CompanyPortabilityEnvInput[],
 ) {
   if (typeof envValue !== "object" || envValue === null || Array.isArray(envValue)) return {};
   const env = envValue as Record<string, unknown>;
@@ -171,6 +178,10 @@ function normalizePortableEnv(
         key,
         description: `Set ${key} for agent ${agentSlug}`,
         agentSlug,
+        kind: "secret",
+        requirement: "required",
+        defaultValue: null,
+        portability: "portable",
         providerHint: null,
       });
       continue;
@@ -183,7 +194,7 @@ function normalizePortableEnv(
 function normalizePortableConfig(
   value: unknown,
   agentSlug: string,
-  requiredSecrets: CompanyPortabilityManifest["requiredSecrets"],
+  requiredSecrets: CompanyPortabilityEnvInput[],
 ): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
   const input = value as Record<string, unknown>;
@@ -398,10 +409,10 @@ async function fetchText(url: string) {
   return response.text();
 }
 
-function dedupeRequiredSecrets(values: CompanyPortabilityManifest["requiredSecrets"]) {
+function dedupeRequiredSecrets(values: CompanyPortabilityEnvInput[] | undefined) {
   const seen = new Set<string>();
-  const out: CompanyPortabilityManifest["requiredSecrets"] = [];
-  for (const value of values) {
+  const out: CompanyPortabilityEnvInput[] = [];
+  for (const value of values ?? []) {
     const key = `${value.agentSlug ?? ""}:${value.key.toUpperCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -818,7 +829,12 @@ export function companyPortabilityService(db: Db) {
             ? "update"
             : "none",
         agentPlans,
+        projectPlans: [],
+        issuePlans: [],
       },
+      manifest,
+      files: source.files as Record<string, CompanyPortabilityFileEntry>,
+      envInputs: manifest.envInputs ?? [],
       requiredSecrets: manifest.requiredSecrets ?? [],
       warnings,
       errors,
@@ -911,7 +927,8 @@ export function companyPortabilityService(db: Db) {
           continue;
         }
 
-        const markdownRaw = plan.source.files[manifestAgent.path];
+        const rawEntry = plan.source.files[manifestAgent.path];
+        const markdownRaw = typeof rawEntry === "string" ? rawEntry : null;
         if (!markdownRaw) {
           warnings.push(`Missing AGENTS markdown for ${manifestAgent.slug}; imported without prompt template.`);
         }

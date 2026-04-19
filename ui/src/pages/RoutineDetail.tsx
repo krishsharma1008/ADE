@@ -531,11 +531,13 @@ export function RoutineDetail() {
   const rotateTrigger = useMutation({
     mutationFn: (id: string): Promise<RotateRoutineTriggerResponse> => routinesApi.rotateTriggerSecret(id),
     onSuccess: async (result) => {
-      setSecretMessage({
-        title: "Webhook secret rotated",
-        webhookUrl: result.secretMaterial.webhookUrl,
-        webhookSecret: result.secretMaterial.webhookSecret,
-      });
+      if (result.secretMaterial) {
+        setSecretMessage({
+          title: "Webhook secret rotated",
+          webhookUrl: result.secretMaterial.webhookUrl,
+          webhookSecret: result.secretMaterial.webhookSecret,
+        });
+      }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(routineId!) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.activity(selectedCompanyId!, routineId!) }),

@@ -232,6 +232,20 @@
       "when": 1776369744700,
       "tag": "0032_issue_comment_kind",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1776369744900,
+      "tag": "0033_terminal_session_transcripts",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1776369745100,
+      "tag": "0034_pause_and_workspace_columns",
+      "breakpoints": true
     }
   ]
 }

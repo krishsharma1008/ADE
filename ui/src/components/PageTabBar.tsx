@@ -11,6 +11,9 @@ interface PageTabBarProps {
   items: PageTabItem[];
   value?: string;
   onValueChange?: (value: string) => void;
+  /** Horizontal alignment — reserved for future layout variants; ignored in the
+   *  current rendering but accepted so callers can declare intent. */
+  align?: "start" | "center" | "end";
 }
 
 export function PageTabBar({ items, value, onValueChange }: PageTabBarProps) {

@@ -1,4 +1,13 @@
-import type { Approval, Issue, IssueAttachment, IssueComment, IssueLabel } from "@combyne/shared";
+import type {
+  Approval,
+  DocumentRevision,
+  Issue,
+  IssueAttachment,
+  IssueComment,
+  IssueDocument,
+  IssueDocumentSummary,
+  IssueLabel,
+} from "@combyne/shared";
 import { api } from "./client";
 
 export const issuesApi = {
@@ -87,4 +96,41 @@ export const issuesApi = {
     api.post<Approval[]>(`/issues/${id}/approvals`, { approvalId }),
   unlinkApproval: (id: string, approvalId: string) =>
     api.delete<{ ok: true }>(`/issues/${id}/approvals/${approvalId}`),
+  listByExecutionWorkspace: (companyId: string, executionWorkspaceId: string) =>
+    api.get<Issue[]>(
+      `/companies/${companyId}/issues?executionWorkspaceId=${encodeURIComponent(executionWorkspaceId)}`,
+    ),
+
+  // Issue-scoped documents (PR-revisions-like doc thread). Backed by the
+  // issue_documents + document_revisions tables; UI thunks are below so
+  // pages can call them without each one rewiring fetch logic.
+  listDocuments: (issueId: string) =>
+    api.get<IssueDocumentSummary[]>(`/issues/${issueId}/documents`),
+  getDocument: (issueId: string, documentId: string) =>
+    api.get<IssueDocument>(`/issues/${issueId}/documents/${documentId}`),
+  upsertDocument: (
+    issueId: string,
+    key: string,
+    data: {
+      title?: string | null;
+      format?: "markdown";
+      body: string;
+      baseRevisionId?: string | null;
+    },
+  ) => api.post<IssueDocument>(`/issues/${issueId}/documents/${encodeURIComponent(key)}`, data),
+  deleteDocument: (issueId: string, documentIdOrKey: string) =>
+    api.delete<{ ok: true }>(`/issues/${issueId}/documents/${encodeURIComponent(documentIdOrKey)}`),
+  listDocumentRevisions: (issueId: string, documentIdOrKey: string) =>
+    api.get<DocumentRevision[]>(
+      `/issues/${issueId}/documents/${encodeURIComponent(documentIdOrKey)}/revisions`,
+    ),
+  restoreDocumentRevision: (
+    issueId: string,
+    documentIdOrKey: string,
+    revisionId: string,
+  ) =>
+    api.post<IssueDocument>(
+      `/issues/${issueId}/documents/${encodeURIComponent(documentIdOrKey)}/revisions/${revisionId}/restore`,
+      {},
+    ),
 };

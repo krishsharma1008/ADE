@@ -6,12 +6,20 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import type { Db } from "@combyne/db";
-import { agentTerminalSessions, agents as agentsTable } from "@combyne/db";
+import {
+  agentTerminalSessions,
+  agents as agentsTable,
+  companies as companiesTable,
+} from "@combyne/db";
 import { buildCombyneEnv } from "@combyne/adapter-utils/server-utils";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
+import { loadAssignedIssueQueue } from "./agent-queue.js";
+import { loadRecentMemory, summarizeTerminalSessionAndPersist } from "./agent-memory.js";
+import { getPendingHandoffBrief } from "./agent-handoff.js";
+import { appendTranscriptEntry } from "./agent-transcripts.js";
 
 const require = createRequire(import.meta.url);
 
@@ -97,10 +105,39 @@ interface TerminalSession {
   // Per-session stdin buffer used to detect "user committed a prompt line".
   // We only record trimmed lines on Enter; empty lines and /slash-commands are skipped.
   pendingInputLine: string;
+  // Monotonic sequence for agent_transcripts rows written against this session.
+  // Shared between user (stdin) turns and assistant (stdout flush) turns so
+  // replaying the transcript reconstructs the conversation order.
+  transcriptSeq: number;
+  // Rolling stdout buffer flushed to a transcript row on ~idle or when it
+  // grows large. Terminal output is naturally chunked into many tiny writes,
+  // so we coalesce to avoid one DB row per byte.
+  pendingOutputChunk: string;
+  pendingOutputTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const MAX_BUFFER_BYTES = 256 * 1024;
-const IDLE_GRACE_MS = Number(process.env.COMBYNE_TERMINAL_IDLE_GRACE_MS ?? 5 * 60_000);
+
+// Idle timeout for an unattached terminal session (no WS writers) before the
+// reaper kills it. Chris flagged the old 5-minute default as too short for
+// real work — a human reading code or thinking between prompts would lose
+// their session. The primary env var is COMBYNE_TERMINAL_IDLE_MS (ms);
+// we still honour the legacy COMBYNE_TERMINAL_IDLE_GRACE_MS if set.
+function resolveIdleGraceMs(): number {
+  const primary = process.env.COMBYNE_TERMINAL_IDLE_MS?.trim();
+  if (primary && !Number.isNaN(Number(primary))) {
+    const n = Number(primary);
+    if (n > 0) return n;
+  }
+  const legacy = process.env.COMBYNE_TERMINAL_IDLE_GRACE_MS?.trim();
+  if (legacy && !Number.isNaN(Number(legacy))) {
+    const n = Number(legacy);
+    if (n > 0) return n;
+  }
+  return 30 * 60_000; // 30 minutes — room for a coffee + a long read of the output
+}
+
+const IDLE_GRACE_MS = resolveIdleGraceMs();
 
 const sessionsByAgent = new Map<string, TerminalSession>(); // key: `${companyId}:${agentId}`
 const sessionsById = new Map<string, TerminalSession>();
@@ -206,13 +243,98 @@ function asBoolField(value: unknown): boolean {
   return value === true;
 }
 
+/**
+ * Build the Markdown block a terminal session injects as additional system
+ * context. Gives the agent a bird's-eye view of the company, its current
+ * assigned queue, any pending handoff brief, and the recent memory summary —
+ * the same pieces heartbeat runs already get, so the interactive terminal
+ * isn't a "raw Claude session" as Chris put it.
+ *
+ * Returns null if there's nothing meaningful to inject.
+ */
+export async function buildTerminalContextPreamble(
+  db: Db,
+  agent: { id: string; companyId: string; name: string; adapterType: string },
+  opts: { reuseIssueId?: string | null } = {},
+): Promise<{ body: string; title: string } | null> {
+  const segments: string[] = [];
+
+  // Company identity
+  try {
+    const company = await db
+      .select({ id: companiesTable.id, name: companiesTable.name })
+      .from(companiesTable)
+      .where(eq(companiesTable.id, agent.companyId))
+      .then((rows) => rows[0] ?? null);
+    if (company) {
+      segments.push(
+        `# Combyne context\n\n` +
+          `You are **${agent.name}** (${agent.adapterType}) working for **${company.name}** (${company.id}). ` +
+          `This terminal session is a live REPL — anything you change on disk stays on disk, and any prompt line you type is recorded as a comment on the session issue.`,
+      );
+    }
+  } catch (err) {
+    logger.debug({ err, agentId: agent.id }, "terminal preamble: failed to read company");
+  }
+
+  // Current assigned queue
+  try {
+    const queue = await loadAssignedIssueQueue(db, {
+      companyId: agent.companyId,
+      agentId: agent.id,
+    });
+    if (queue.items.length > 0) {
+      segments.push(`# Your current task queue\n\n${queue.body}`);
+    }
+  } catch (err) {
+    logger.debug({ err, agentId: agent.id }, "terminal preamble: failed to load queue");
+  }
+
+  // Pending handoff brief (if any)
+  try {
+    const handoff = await getPendingHandoffBrief(db, agent.id, opts.reuseIssueId ?? null);
+    if (handoff?.brief) {
+      segments.push(`# Pending handoff brief\n\n${handoff.brief}`);
+    }
+  } catch (err) {
+    logger.debug({ err, agentId: agent.id }, "terminal preamble: failed to load handoff");
+  }
+
+  // Recent memory
+  try {
+    const memory = await loadRecentMemory(db, {
+      companyId: agent.companyId,
+      agentId: agent.id,
+      limit: 6,
+    });
+    if (memory.length > 0) {
+      const memoryBody = memory
+        .map((row) => `## ${row.title ?? `${row.scope}/${row.kind}`}\n${row.body}`)
+        .join("\n\n");
+      const capped = memoryBody.length > 12000 ? `${memoryBody.slice(0, 12000)}\n…(truncated)` : memoryBody;
+      segments.push(`# Recent memory\n\n${capped}`);
+    }
+  } catch (err) {
+    logger.debug({ err, agentId: agent.id }, "terminal preamble: failed to load memory");
+  }
+
+  if (segments.length === 0) return null;
+  return {
+    title: "Combyne terminal context",
+    body: segments.join("\n\n---\n\n"),
+  };
+}
+
 // Resolve the command + args for an interactive CLI launch based on the
 // agent's stored adapterConfig. Parallels the (non-interactive) `execute.ts`
 // code paths but omits --print / exec flags so the REPL runs.
 async function buildCliLaunch(
   adapterType: string,
   adapterConfig: Record<string, unknown>,
-  opts?: { resumeClaudeSessionId?: string | null },
+  opts?: {
+    resumeClaudeSessionId?: string | null;
+    contextPreamble?: { body: string; title: string } | null;
+  },
 ): Promise<{ command: string; args: string[]; extraEnv: Record<string, string>; notes: string[] } | null> {
   const notes: string[] = [];
   const extraEnv: Record<string, string> = {};
@@ -242,18 +364,34 @@ async function buildCliLaunch(
     args.push("--add-dir", skillsDir);
     notes.push(`--add-dir ${skillsDir}`);
 
-    // Persona: append-system-prompt-file if the agent was configured with one.
+    // Persona: append-system-prompt-file if the agent was configured with one,
+    // concatenated with the Combyne context preamble so the terminal Claude
+    // session boots up knowing the company, its queue, any pending handoff,
+    // and its memory summary — instead of looking like a raw REPL.
     const instructionsFilePath = asStringField(adapterConfig.instructionsFilePath);
+    let instructionsRaw = "";
     if (instructionsFilePath) {
       try {
-        const raw = await fs.readFile(instructionsFilePath, "utf-8");
-        const pathDirective = `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${path.dirname(instructionsFilePath)}/.`;
-        const combined = path.join(skillsDir, "agent-instructions.md");
-        await fs.writeFile(combined, raw + pathDirective, "utf-8");
-        args.push("--append-system-prompt-file", combined);
-        notes.push(`--append-system-prompt-file ${combined}`);
+        instructionsRaw = await fs.readFile(instructionsFilePath, "utf-8");
       } catch (err) {
         logger.warn({ err, instructionsFilePath }, "terminal: failed to load agent instructions");
+      }
+    }
+    const preambleBody = opts?.contextPreamble?.body ?? "";
+    const pathDirective = instructionsFilePath
+      ? `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${path.dirname(instructionsFilePath)}/.`
+      : "";
+    const combinedSegments = [
+      instructionsRaw ? `${instructionsRaw}${pathDirective}` : "",
+      preambleBody,
+    ].filter((s) => s.length > 0);
+    if (combinedSegments.length > 0) {
+      const combined = path.join(skillsDir, "agent-instructions.md");
+      await fs.writeFile(combined, combinedSegments.join("\n\n---\n\n"), "utf-8");
+      args.push("--append-system-prompt-file", combined);
+      notes.push(`--append-system-prompt-file ${combined}`);
+      if (preambleBody.length > 0) {
+        notes.push(`combyne context preamble injected (${preambleBody.length} chars)`);
       }
     }
     return { command, args, extraEnv, notes };
@@ -361,10 +499,30 @@ export async function createTerminalSession(
   let args: string[];
   let extraEnv: Record<string, string> = {};
   const launchNotes: string[] = [];
+
+  // Assemble the Combyne-awareness preamble before we spawn the CLI so
+  // claude's --append-system-prompt-file can include it from turn zero.
+  let contextPreamble: { body: string; title: string } | null = null;
+  try {
+    contextPreamble = await buildTerminalContextPreamble(
+      db,
+      {
+        id: agent.id,
+        companyId: agent.companyId,
+        name: (agent as { name?: string }).name ?? agent.id,
+        adapterType: agent.adapterType,
+      },
+      { reuseIssueId: opts.reuseIssueId ?? null },
+    );
+  } catch (err) {
+    logger.warn({ err, agentId: agent.id }, "terminal: failed to build context preamble");
+  }
+
   if (opts.mode === "cli") {
     const adapterConfig = (agent.adapterConfig ?? {}) as Record<string, unknown>;
     const cli = await buildCliLaunch(agent.adapterType, adapterConfig, {
       resumeClaudeSessionId: opts.resumeClaudeSessionId ?? null,
+      contextPreamble,
     });
     if (!cli) {
       // Unknown adapter — fall back to shell with a banner line.
@@ -425,6 +583,9 @@ export async function createTerminalSession(
     logStream,
     sessionIssueId: null,
     pendingInputLine: "",
+    transcriptSeq: 1,
+    pendingOutputChunk: "",
+    pendingOutputTimer: null,
   };
 
   // Create a ticketing "session Issue" so the terminal shows up in the same
@@ -474,6 +635,21 @@ export async function createTerminalSession(
         { sessionId: id, issueId: session.sessionIssueId, agentId: agent.id },
         "terminal: session issue created",
       );
+      // Surface the Combyne-awareness preamble on the session issue so the
+      // user can see what context the agent was given. For claude this is
+      // already injected via --append-system-prompt-file; for other CLIs
+      // (codex/cursor/opencode) this comment is the only visible handle.
+      if (session.sessionIssueId && contextPreamble?.body) {
+        try {
+          await svc.addComment(
+            session.sessionIssueId,
+            `**Combyne context loaded** (${contextPreamble.body.length} chars):\n\n<details><summary>Show preamble</summary>\n\n${contextPreamble.body}\n\n</details>`,
+            { userId: opts.openedBy ?? undefined },
+          );
+        } catch (err) {
+          logger.debug({ err, sessionId: id }, "terminal: failed to post preamble comment");
+        }
+      }
     } catch (err) {
       logger.warn({ err, sessionId: id }, "terminal: failed to create session issue");
     }
@@ -486,6 +662,9 @@ export async function createTerminalSession(
       session.buffer = session.buffer.slice(session.buffer.length - MAX_BUFFER_BYTES);
     }
     session.logStream?.write(data);
+    // Coalesce stdout into transcript rows so we persist the conversation
+    // for replay / memory summarization without one row per byte.
+    bufferTranscriptOutput(session, data);
     const payload = Buffer.from(data, "utf8");
     for (const w of session.writers) {
       try {
@@ -498,6 +677,7 @@ export async function createTerminalSession(
 
   pty.onExit(async ({ exitCode, signal }) => {
     session.closed = true;
+    flushTranscriptOutput(session, "pty_exit");
     session.logStream?.end(`\n# exitCode=${exitCode} signal=${signal ?? ""}\n`);
     for (const w of session.writers) {
       try {
@@ -682,6 +862,93 @@ function recordPromptTurn(session: TerminalSession, prompt: string) {
       );
     }
   })();
+
+  // Also write a `user`-role transcript row so the agent's memory/handoff
+  // pipelines pick up terminal interactions alongside heartbeat runs. Flush
+  // any pending assistant output first so the ordering (user → assistant)
+  // in agent_transcripts.seq matches reality.
+  flushTranscriptOutput(session, "pre_user_turn");
+  const seq = session.transcriptSeq++;
+  void (async () => {
+    try {
+      await appendTranscriptEntry(db, {
+        companyId: session.companyId,
+        agentId: session.agentId,
+        terminalSessionId: session.id,
+        issueId,
+        seq,
+        role: "user",
+        contentKind: "terminal.prompt",
+        content: { message: prompt },
+      });
+    } catch (err) {
+      logger.debug(
+        { err, sessionId: session.id, issueId },
+        "terminal: failed to write prompt transcript",
+      );
+    }
+  })();
+}
+
+// Strip ANSI escape sequences + carriage returns so the persisted transcript
+// text is readable when replayed. We keep raw bytes in the live buffer for WS
+// writers — this only affects what's stored in agent_transcripts.
+const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[PX^_][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+function cleanForTranscript(raw: string): string {
+  const withoutAnsi = raw.replace(ANSI_PATTERN, "");
+  return withoutAnsi.replace(/\r\n?/g, "\n");
+}
+
+const TRANSCRIPT_FLUSH_IDLE_MS = 1_500;
+const TRANSCRIPT_FLUSH_MAX_BYTES = 8 * 1024;
+
+function bufferTranscriptOutput(session: TerminalSession, chunk: string) {
+  session.pendingOutputChunk += chunk;
+  if (session.pendingOutputChunk.length >= TRANSCRIPT_FLUSH_MAX_BYTES) {
+    flushTranscriptOutput(session, "size");
+    return;
+  }
+  if (session.pendingOutputTimer) return;
+  session.pendingOutputTimer = setTimeout(() => {
+    session.pendingOutputTimer = null;
+    flushTranscriptOutput(session, "idle");
+  }, TRANSCRIPT_FLUSH_IDLE_MS).unref?.() as ReturnType<typeof setTimeout>;
+}
+
+function flushTranscriptOutput(session: TerminalSession, _reason: string) {
+  if (session.pendingOutputTimer) {
+    clearTimeout(session.pendingOutputTimer);
+    session.pendingOutputTimer = null;
+  }
+  const raw = session.pendingOutputChunk;
+  if (!raw) return;
+  session.pendingOutputChunk = "";
+  const cleaned = cleanForTranscript(raw).trim();
+  if (!cleaned) return;
+  const db = dbBySession.get(session);
+  if (!db) return;
+  const issueId = session.sessionIssueId;
+  const seq = session.transcriptSeq++;
+  void (async () => {
+    try {
+      await appendTranscriptEntry(db, {
+        companyId: session.companyId,
+        agentId: session.agentId,
+        terminalSessionId: session.id,
+        issueId: issueId ?? null,
+        seq,
+        role: "assistant",
+        contentKind: "terminal.output",
+        content: { message: cleaned.slice(0, 16_000) },
+      });
+    } catch (err) {
+      logger.debug(
+        { err, sessionId: session.id },
+        "terminal: failed to write output transcript",
+      );
+    }
+  })();
 }
 
 export function resizeSession(session: TerminalSession, cols: number, rows: number) {
@@ -701,6 +968,17 @@ export async function closeSession(db: Db, session: TerminalSession, reason = "c
     // ignore
   }
   session.closed = true;
+  flushTranscriptOutput(session, `close_${reason}`);
+  // Roll terminal conversation into agent_memory so the next heartbeat wake
+  // sees a memory preamble that includes what just happened in the REPL.
+  // Fire-and-forget; failures are logged inside the summarizer and must not
+  // block the close path.
+  void summarizeTerminalSessionAndPersist(db, {
+    terminalSessionId: session.id,
+    companyId: session.companyId,
+    agentId: session.agentId,
+    issueId: session.sessionIssueId,
+  });
   session.logStream?.end(`\n# closed reason=${reason}\n`);
   sessionsByAgent.delete(agentKey(session.companyId, session.agentId));
   sessionsById.delete(session.id);

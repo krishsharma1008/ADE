@@ -68,6 +68,12 @@ export interface IssueDocumentSummary {
   updatedByUserId: string | null;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * Present when the list endpoint opts to include the body (currently the
+   * case for per-issue document lists). Detail endpoints always populate it
+   * via IssueDocument.
+   */
+  body?: string;
 }
 
 export interface IssueDocument extends IssueDocumentSummary {

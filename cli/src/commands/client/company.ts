@@ -119,7 +119,14 @@ async function writeExportToFolder(outDir: string, exported: CompanyPortabilityE
     const normalized = relativePath.replace(/\\/g, "/");
     const filePath = path.join(root, normalized);
     await mkdir(path.dirname(filePath), { recursive: true });
-    await writeFile(filePath, content, "utf8");
+    // Inline text files come through as a plain string; base64-encoded
+    // binaries (logos, etc) come as an object with { data, encoding } —
+    // decode those before writing so the on-disk bundle matches the server.
+    if (typeof content === "string") {
+      await writeFile(filePath, content, "utf8");
+    } else {
+      await writeFile(filePath, Buffer.from(content.data, "base64"));
+    }
   }
 }
 

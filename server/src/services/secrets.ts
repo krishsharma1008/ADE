@@ -285,6 +285,16 @@ export function secretService(db: Db) {
       return secret;
     },
 
+    // Expose the internal resolver so callers (routines.ts) can fetch a
+    // decrypted secret directly without having to go through an env-binding
+    // dance. Thin passthrough so all the provider / version handling stays
+    // in one place.
+    resolveSecretValue: (
+      companyId: string,
+      secretId: string,
+      version: number | "latest",
+    ) => resolveSecretValue(companyId, secretId, version),
+
     normalizeAdapterConfigForPersistence: async (
       companyId: string,
       adapterConfig: Record<string, unknown>,

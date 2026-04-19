@@ -22,6 +22,8 @@ export type {
   HireApprovedPayload,
   HireApprovedHookResult,
   ServerAdapterModule,
+  AdapterRuntimeServiceReport,
+  ProviderQuotaResultLike,
   TranscriptEntry,
   StdoutLineParser,
   CLIAdapterModule,

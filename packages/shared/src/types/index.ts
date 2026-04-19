@@ -38,7 +38,14 @@ export type {
   CompanySecret,
   SecretProviderDescriptor,
 } from "./secrets.js";
-export type { CostEvent, CostSummary, CostByAgent } from "./cost.js";
+export type {
+  CostEvent,
+  CostSummary,
+  CostByAgent,
+  CostByProviderModel,
+  CostByBiller,
+  CostWindowSpendRow,
+} from "./cost.js";
 export type {
   HeartbeatRun,
   HeartbeatRunEvent,

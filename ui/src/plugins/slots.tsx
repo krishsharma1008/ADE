@@ -7,10 +7,16 @@ import { queryKeys } from "@/lib/queryKeys";
 /* ------------------------------------------------------------------ */
 
 export interface PluginSlot {
-  id: string;
+  id?: string;
   pluginId: string;
   pluginKey: string;
-  slotType: string;
+  /** Slot classification emitted by the server. Newer contributions use `type`;
+   *  older/explicit ones use `slotType`. Consumers read `slotType ?? type`. */
+  slotType?: string;
+  type?: string;
+  pluginDisplayName?: string;
+  pluginVersion?: string;
+  routePath?: string;
   /** HTML or iframe src provided by the plugin */
   content?: string;
   /** Optional path the slot was registered for */

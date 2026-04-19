@@ -3,6 +3,7 @@ import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 import { issues } from "./issues.js";
+import { agentTerminalSessions } from "./agent_terminal_sessions.js";
 
 /**
  * Canonical per-agent conversation log.
@@ -23,6 +24,9 @@ export const agentTranscripts = pgTable(
       .references(() => agents.id),
     runId: uuid("run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     issueId: uuid("issue_id").references(() => issues.id, { onDelete: "set null" }),
+    terminalSessionId: uuid("terminal_session_id").references(() => agentTerminalSessions.id, {
+      onDelete: "set null",
+    }),
     seq: integer("seq").notNull(),
     role: text("role").notNull(),
     contentKind: text("content_kind"),
@@ -37,5 +41,9 @@ export const agentTranscripts = pgTable(
     ),
     issueSeqIdx: index("agent_transcripts_issue_seq_idx").on(table.issueId, table.seq),
     runSeqIdx: index("agent_transcripts_run_seq_idx").on(table.runId, table.seq),
+    terminalSessionSeqIdx: index("agent_transcripts_terminal_session_seq_idx").on(
+      table.terminalSessionId,
+      table.seq,
+    ),
   }),
 );
