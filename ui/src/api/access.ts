@@ -127,4 +127,28 @@ export const accessApi = {
 
   claimBoard: (token: string, code: string) =>
     api.post<{ claimed: true; userId: string }>(`/board-claim/${token}/claim`, { code }),
+
+  // CLI-auth challenge flow — a CLI opens a browser tab, the user approves,
+  // we return a minted key. Backs the single /cli-auth/:id page.
+  getCliAuthChallenge: (challengeId: string, token: string) =>
+    api.get<{
+      id: string;
+      status: "pending" | "approved" | "cancelled" | "expired";
+      expiresAt: string;
+      clientLabel: string | null;
+      /** Originating CLI invocation (e.g. `combyne login`) if known. */
+      command?: string | null;
+      /** Friendly display name of the client. */
+      clientName?: string | null;
+      /** Scope the CLI is requesting (single string) or a richer scope list. */
+      requestedAccess?: string | string[] | null;
+      requestedCompanyName?: string | null;
+      canApprove?: boolean;
+      /** If true, the user must sign in before the UI offers Approve. */
+      requiresSignIn?: boolean;
+    }>(`/cli-auth/${challengeId}?token=${encodeURIComponent(token)}`),
+  approveCliAuthChallenge: (challengeId: string, token: string) =>
+    api.post<{ approved: true }>(`/cli-auth/${challengeId}/approve`, { token }),
+  cancelCliAuthChallenge: (challengeId: string, token: string) =>
+    api.post<{ cancelled: true }>(`/cli-auth/${challengeId}/cancel`, { token }),
 };

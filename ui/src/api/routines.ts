@@ -11,12 +11,25 @@ export type RoutineTriggerResponse = {
   trigger: RoutineTrigger;
   webhookUrl?: string;
   webhookSecret?: string;
+  /**
+   * Present only on the create-trigger and rotate responses — the
+   * plaintext material the user needs to copy once. Never returned on
+   * subsequent reads.
+   */
+  secretMaterial?: {
+    webhookUrl: string;
+    webhookSecret: string;
+  } | null;
 };
 
 export type RotateRoutineTriggerResponse = {
   trigger: RoutineTrigger;
   webhookUrl?: string;
   webhookSecret?: string;
+  secretMaterial?: {
+    webhookUrl: string;
+    webhookSecret: string;
+  } | null;
 };
 
 export const routinesApi = {

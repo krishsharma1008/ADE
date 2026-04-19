@@ -46,6 +46,11 @@ export interface Routine {
   lastEnqueuedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * Populated when the list endpoint embeds the most recent run summary.
+   * Optional on the bare Routine so detail endpoints can omit it.
+   */
+  lastRun?: RoutineRunSummary | null;
 }
 
 export interface RoutineTrigger {
@@ -89,6 +94,12 @@ export interface RoutineRun {
   completedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * Embedded summaries populated by list endpoints. Callers who receive
+   * a `RoutineRun` off the bare run endpoint will see these as undefined.
+   */
+  linkedIssue?: RoutineIssueSummary | null;
+  trigger?: Pick<RoutineTrigger, "id" | "kind" | "label"> | null;
 }
 
 export interface RoutineTriggerSecretMaterial {

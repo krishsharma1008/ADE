@@ -46,7 +46,10 @@ function detectRootPath(paths: string[]): string | null {
 function inflateRaw(compressed: Uint8Array): Promise<Uint8Array> {
   const ds = new DecompressionStream("deflate-raw");
   const writer = ds.writable.getWriter();
-  writer.write(compressed);
+  // TS's DecompressionStream type wants a plain `BufferSource`, not the
+  // generic `Uint8Array<ArrayBufferLike>` returned by callers. Cast: the
+  // backing buffer here is always a regular ArrayBuffer at runtime.
+  writer.write(compressed as unknown as BufferSource);
   writer.close();
   const reader = ds.readable.getReader();
   const chunks: Uint8Array[] = [];

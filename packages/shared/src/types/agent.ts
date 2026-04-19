@@ -13,6 +13,8 @@ export interface Agent {
   companyId: string;
   name: string;
   urlKey: string;
+  /** URL-safe stable identifier. Alias for urlKey exposed on the read APIs. */
+  slug?: string;
   role: AgentRole;
   title: string | null;
   icon: string | null;

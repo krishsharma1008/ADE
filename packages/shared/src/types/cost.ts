@@ -39,6 +39,9 @@ export interface CostByProviderModel {
   provider: string;
   model: string;
   billingType: string;
+  /** Second-level billing attribution (e.g. "anthropic", "google") when the
+   *  provider routes through a middleware layer. Optional. */
+  biller?: string;
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;

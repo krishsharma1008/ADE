@@ -718,7 +718,8 @@ export function buildHostServices(
         const project = await projects.getById(params.projectId);
         if (!inCompany(project, companyId)) return null;
         const row = project.primaryWorkspace;
-        const path = sanitizeWorkspacePath(project.codebase.effectiveLocalFolder);
+        const codebase = (project as { codebase?: { effectiveLocalFolder?: string | null } | null }).codebase;
+        const path = sanitizeWorkspacePath(codebase?.effectiveLocalFolder ?? null);
         const name = sanitizeWorkspaceName(row?.name ?? project.name, path);
         return {
           id: row?.id ?? `${project.id}:managed`,
@@ -741,7 +742,8 @@ export function buildHostServices(
         const project = await projects.getById(projectId);
         if (!inCompany(project, companyId)) return null;
         const row = project.primaryWorkspace;
-        const path = sanitizeWorkspacePath(project.codebase.effectiveLocalFolder);
+        const codebase = (project as { codebase?: { effectiveLocalFolder?: string | null } | null }).codebase;
+        const path = sanitizeWorkspacePath(codebase?.effectiveLocalFolder ?? null);
         const name = sanitizeWorkspaceName(row?.name ?? project.name, path);
         return {
           id: row?.id ?? `${project.id}:managed`,

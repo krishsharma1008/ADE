@@ -767,7 +767,17 @@ function svgEscape(s: string): string {
 
 export async function renderOrgChartPng(orgTree: OrgNode[], style: OrgChartStyle = "warmth", overlay?: OrgChartOverlay): Promise<Buffer> {
   const svg = renderOrgChartSvg(orgTree, style, overlay);
-  const sharpModule = await import("sharp");
+  // `sharp` is an optional runtime dep — not installed by default so Docker
+  // minimal images stay slim. Dynamic-import with a runtime-cast so the
+  // server builds without the dep; if this route is hit without it, the
+  // caller gets a friendly install hint instead of a cryptic module error.
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-ignore — optional peer dep, resolved at runtime only
+  const sharpModule = (await import("sharp").catch((err: unknown) => {
+    throw new Error(
+      `Rendering the org-chart PNG requires the optional \`sharp\` dependency. Install it in the server workspace: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  })) as { default: (buf: Buffer, opts?: unknown) => any };
   const sharp = sharpModule.default;
   // Render at 2x density for retina quality, resize to exact target dimensions
   return sharp(Buffer.from(svg), { density: 144 })
