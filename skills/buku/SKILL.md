@@ -16,6 +16,12 @@ description: >
 > At minimum: `spotlessApply`, `clean compileJava compileTestJava check`, every
 > loader/variant `compileJava*` task, and the repo's test + static-check tasks.
 > Fix root causes; never push with `--no-verify` or by disabling failing checks.
+>
+> **When a build step fails, do not stop** — the Pre-Push Check now ships an
+> auto-heal cheatsheet that maps each canonical failure to a mechanical
+> remediation (e.g. `spotlessJavaCheck FAILED` → `./gradlew spotlessApply`,
+> then re-run). Apply the heal, commit the auto-fix separately, re-run the
+> failing command, and only escalate if the heal doesn't converge.
 
 ## Select Your Workflow
 
