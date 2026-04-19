@@ -17,7 +17,7 @@ import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 import { loadAssignedIssueQueue } from "./agent-queue.js";
-import { loadRecentMemory } from "./agent-memory.js";
+import { loadRecentMemory, summarizeTerminalSessionAndPersist } from "./agent-memory.js";
 import { getPendingHandoffBrief } from "./agent-handoff.js";
 import { appendTranscriptEntry } from "./agent-transcripts.js";
 
@@ -969,6 +969,16 @@ export async function closeSession(db: Db, session: TerminalSession, reason = "c
   }
   session.closed = true;
   flushTranscriptOutput(session, `close_${reason}`);
+  // Roll terminal conversation into agent_memory so the next heartbeat wake
+  // sees a memory preamble that includes what just happened in the REPL.
+  // Fire-and-forget; failures are logged inside the summarizer and must not
+  // block the close path.
+  void summarizeTerminalSessionAndPersist(db, {
+    terminalSessionId: session.id,
+    companyId: session.companyId,
+    agentId: session.agentId,
+    issueId: session.sessionIssueId,
+  });
   session.logStream?.end(`\n# closed reason=${reason}\n`);
   sessionsByAgent.delete(agentKey(session.companyId, session.agentId));
   sessionsById.delete(session.id);
