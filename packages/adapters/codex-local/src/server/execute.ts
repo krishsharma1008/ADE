@@ -306,6 +306,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (gitSummary.length > 0) {
     preambleSegments.push(`# Workspace git state\n\n${gitSummary}`);
   }
+  const companyProjects = parseObject(context.combyneCompanyProjects);
+  const projectsBody = asString(companyProjects.body, "").trim();
+  if (projectsBody.length > 0) {
+    preambleSegments.push(`# Company projects\n\n${projectsBody}`);
+  }
   const combinedPrefix =
     preambleSegments.length > 0 ? `${preambleSegments.join("\n\n---\n\n")}\n\n---\n\n` : "";
   const prompt = `${combinedPrefix}${instructionsPrefix}${renderedPrompt}`;

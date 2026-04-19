@@ -23,10 +23,12 @@ import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstr
 import { loadAssignedIssueQueue } from "./agent-queue.js";
 import { inspectGitStateForIssue } from "./git-state.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
+import { extractAndPostQuestions } from "./agent-question-extract.js";
+import { loadCompanyProjectOverview } from "./agent-company-context.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec } from "../adapters/index.js";
-import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { createLocalAgentJwt, ensureLocalAgentJwtSecretAtRuntime } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
@@ -1311,6 +1313,25 @@ export function heartbeatService(db: Db) {
       logger.debug({ err, agentId: agent.id, runId }, "failed to load assigned issue queue");
     }
 
+    // Surface Combyne-managed project workspaces to the adapter so it can
+    // ls/read/write across them — same fix as the terminal preamble,
+    // mirrored here so heartbeat runs don't ask "project not found" either.
+    try {
+      const overview = await loadCompanyProjectOverview(db, agent.companyId);
+      if (overview.items.length > 0) {
+        context.combyneCompanyProjects = overview;
+        const dirs: string[] = [];
+        for (const project of overview.items) {
+          for (const ws of project.workspaces) {
+            if (ws.cwd && !dirs.includes(ws.cwd)) dirs.push(ws.cwd);
+          }
+        }
+        if (dirs.length > 0) context.combyneProjectWorkspaceDirs = dirs.slice(0, 10);
+      }
+    } catch (err) {
+      logger.debug({ err, companyId: agent.companyId, runId }, "failed to load project overview");
+    }
+
     // Close the loop between git state and issue status: before the agent
     // says "nothing to do", let it see commits/branches that already mention
     // this issue. Best-effort; non-git workspaces degrade gracefully.
@@ -1489,6 +1510,25 @@ export function heartbeatService(db: Db) {
         logger.debug({ err, adapterType: agent.adapterType }, "adapter availability probe failed");
       }
 
+      // Self-heal the JWT secret before minting. If the server booted
+      // without the local-trusted bootstrap (non-local mode, env-scrubbed
+      // child, etc.), ensureLocalAgentJwtSecretAtRuntime() falls back to
+      // reading the on-disk key or generates + persists one. Prevents the
+      // silent-auth-failure loop Chris saw: every endpoint returning
+      // "Agent authentication required" because the token was null.
+      if (adapter.supportsLocalAgentJwt) {
+        try {
+          const minted = ensureLocalAgentJwtSecretAtRuntime();
+          if (!minted) {
+            logger.error(
+              { companyId: agent.companyId, agentId: agent.id, runId: run.id },
+              "failed to resolve or generate local agent JWT secret",
+            );
+          }
+        } catch (err) {
+          logger.error({ err, runId: run.id }, "ensureLocalAgentJwtSecretAtRuntime threw");
+        }
+      }
       const authToken = adapter.supportsLocalAgentJwt
         ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
         : null;
@@ -1626,6 +1666,32 @@ export function heartbeatService(db: Db) {
           agentId: finalizedRun.agentId,
           issueId: resolveRunIssueId(finalizedRun),
         });
+
+        // Auto-surface any numbered / bulleted questions the agent buried
+        // in its output as structured `kind="question"` comments, so the
+        // Reply-and-Wake card renders each with its own answer input
+        // instead of leaving them as prose in the plan document.
+        const runIssueId = resolveRunIssueId(finalizedRun);
+        if (runIssueId && outcome === "succeeded") {
+          const resultText =
+            adapterResult.resultJson && typeof adapterResult.resultJson === "object"
+              ? JSON.stringify(adapterResult.resultJson)
+              : "";
+          const sourceText = [stdoutExcerpt, resultText].filter(Boolean).join("\n\n");
+          if (sourceText.length > 0) {
+            void extractAndPostQuestions(db, {
+              companyId: finalizedRun.companyId,
+              agentId: finalizedRun.agentId,
+              issueId: runIssueId,
+              sourceText,
+            }).catch((err) => {
+              logger.debug(
+                { err, runId: finalizedRun.id, issueId: runIssueId },
+                "question-extractor failed",
+              );
+            });
+          }
+        }
       }
 
       if (finalizedRun) {

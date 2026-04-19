@@ -12,7 +12,7 @@ import {
   companies as companiesTable,
 } from "@combyne/db";
 import { buildCombyneEnv } from "@combyne/adapter-utils/server-utils";
-import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { createLocalAgentJwt, ensureLocalAgentJwtSecretAtRuntime } from "../agent-auth-jwt.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
@@ -20,6 +20,7 @@ import { loadAssignedIssueQueue } from "./agent-queue.js";
 import { loadRecentMemory, summarizeTerminalSessionAndPersist } from "./agent-memory.js";
 import { getPendingHandoffBrief } from "./agent-handoff.js";
 import { appendTranscriptEntry } from "./agent-transcripts.js";
+import { loadCompanyProjectOverview } from "./agent-company-context.js";
 
 const require = createRequire(import.meta.url);
 
@@ -76,6 +77,15 @@ export interface TerminalSessionInfo {
   status: "running" | "closed" | "crashed";
   exitCode: number | null;
   startedAt: string;
+  /** Current idle-timeout in ms. Surfaced so the UI can show the value on
+   *  the terminal page without re-reading server env vars. */
+  idleGraceMs: number;
+  /** ms before reap at which a `{type:"idle_warning"}` WS event fires. */
+  idleWarningMs: number;
+  /** Wall-clock instant the session will be idle-reaped at, assuming no
+   *  further activity. Refreshed on every keystroke, WS attach, or
+   *  `keep_alive` control message. */
+  idleReapsAt: string;
 }
 
 interface WsLike {
@@ -114,6 +124,9 @@ interface TerminalSession {
   // so we coalesce to avoid one DB row per byte.
   pendingOutputChunk: string;
   pendingOutputTimer: ReturnType<typeof setTimeout> | null;
+  // Prevents the pre-reap warning ping from firing more than once per
+  // idle period — resets whenever the session sees new activity.
+  idleWarningSentAt: number | null;
 }
 
 const MAX_BUFFER_BYTES = 256 * 1024;
@@ -138,6 +151,19 @@ function resolveIdleGraceMs(): number {
 }
 
 const IDLE_GRACE_MS = resolveIdleGraceMs();
+
+// How long before reap we send a `{type:"idle_warning"}` to any attached
+// WS client so the UI can show a "session will close in N minutes" banner
+// with a "Keep alive" button. Defaults to 5 minutes before reap, clamped
+// to at most half the idle window so short-timeout dev environments still
+// get a heads-up.
+function resolveIdleWarningMs(): number {
+  const configured = process.env.COMBYNE_TERMINAL_IDLE_WARNING_MS?.trim();
+  const parsed = configured && !Number.isNaN(Number(configured)) ? Number(configured) : 5 * 60_000;
+  const safe = parsed > 0 ? parsed : 5 * 60_000;
+  return Math.min(safe, Math.floor(IDLE_GRACE_MS / 2));
+}
+const IDLE_WARNING_MS = resolveIdleWarningMs();
 
 const sessionsByAgent = new Map<string, TerminalSession>(); // key: `${companyId}:${agentId}`
 const sessionsById = new Map<string, TerminalSession>();
@@ -290,6 +316,18 @@ export async function buildTerminalContextPreamble(
     logger.debug({ err, agentId: agent.id }, "terminal preamble: failed to load queue");
   }
 
+  // Combyne-managed projects — fixes the "agent says project not found"
+  // bug where the REPL only saw its on-disk workspace and was blind to
+  // projects/workspaces created through the UI.
+  try {
+    const overview = await loadCompanyProjectOverview(db, agent.companyId);
+    if (overview.body.length > 0) {
+      segments.push(`# Company projects\n\n${overview.body}`);
+    }
+  } catch (err) {
+    logger.debug({ err, agentId: agent.id }, "terminal preamble: failed to load projects");
+  }
+
   // Pending handoff brief (if any)
   try {
     const handoff = await getPendingHandoffBrief(db, agent.id, opts.reuseIssueId ?? null);
@@ -334,10 +372,12 @@ async function buildCliLaunch(
   opts?: {
     resumeClaudeSessionId?: string | null;
     contextPreamble?: { body: string; title: string } | null;
+    projectWorkspaceDirs?: string[];
   },
 ): Promise<{ command: string; args: string[]; extraEnv: Record<string, string>; notes: string[] } | null> {
   const notes: string[] = [];
   const extraEnv: Record<string, string> = {};
+  const projectWorkspaceDirs = opts?.projectWorkspaceDirs ?? [];
 
   if (adapterType === "claude_local") {
     const command = asStringField(adapterConfig.command) || "claude";
@@ -363,6 +403,16 @@ async function buildCliLaunch(
     const skillsDir = await buildClaudeSkillsDir();
     args.push("--add-dir", skillsDir);
     notes.push(`--add-dir ${skillsDir}`);
+
+    // Surface every Combyne-managed project workspace to Claude as an
+    // additional allowed directory. Fixes the "CEO can't see the Lending
+    // Team folder" bug Krish flagged — the agent was silently scoped to
+    // its home workspace and had no way to reach the project paths even
+    // when the user had configured them in the UI.
+    for (const dir of projectWorkspaceDirs) {
+      args.push("--add-dir", dir);
+      notes.push(`--add-dir ${dir} (project workspace)`);
+    }
 
     // Persona: append-system-prompt-file if the agent was configured with one,
     // concatenated with the Combyne context preamble so the terminal Claude
@@ -448,6 +498,57 @@ async function ensureDir(dir: string) {
   }
 }
 
+function readNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+async function pathExists(p: string | null | undefined): Promise<boolean> {
+  if (!p) return false;
+  try {
+    const stat = await fs.stat(p);
+    return stat.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+const MAX_PROJECT_WORKSPACE_DIRS = 10;
+
+/**
+ * Pull the unique set of on-disk workspace paths across every Combyne project
+ * in the company. Passed to claude/codex as --add-dir so the REPL can ls/grep
+ * project paths even when the cwd is somewhere else. Filtered to existing
+ * directories and capped so a company with 40 projects doesn't blow up the
+ * spawn arg list.
+ */
+async function collectCompanyProjectWorkspaceDirs(
+  db: Db,
+  companyId: string,
+  skip: string | null,
+): Promise<string[]> {
+  try {
+    const overview = await loadCompanyProjectOverview(db, companyId);
+    const out = new Set<string>();
+    for (const project of overview.items) {
+      for (const ws of project.workspaces) {
+        if (!ws.cwd) continue;
+        if (skip && ws.cwd === skip) continue;
+        if (out.has(ws.cwd)) continue;
+        if (!(await pathExists(ws.cwd))) continue;
+        out.add(ws.cwd);
+        if (out.size >= MAX_PROJECT_WORKSPACE_DIRS) break;
+      }
+      if (out.size >= MAX_PROJECT_WORKSPACE_DIRS) break;
+    }
+    return Array.from(out);
+  } catch (err) {
+    logger.debug({ err, companyId }, "terminal: failed to load project workspace dirs");
+    return [];
+  }
+}
+
 async function resolveAgentRow(db: Db, companyId: string, agentId: string) {
   const row = await db
     .select()
@@ -459,6 +560,14 @@ async function resolveAgentRow(db: Db, companyId: string, agentId: string) {
 
 function buildPtyEnv(agent: { id: string; companyId: string; adapterType: string }): Record<string, string> {
   const combyneEnv = buildCombyneEnv(agent);
+  // Self-heal the JWT secret — same rationale as heartbeat: keeps terminal
+  // sessions functional when the server didn't get to run the local-trusted
+  // bootstrap (unusual boot paths, missing env).
+  try {
+    ensureLocalAgentJwtSecretAtRuntime();
+  } catch (err) {
+    logger.warn({ err, agentId: agent.id }, "terminal: failed to ensure JWT secret");
+  }
   const authToken = createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, `terminal-${Date.now()}`);
   const baseEnv: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
@@ -492,8 +601,27 @@ export async function createTerminalSession(
   const agent = await resolveAgentRow(db, opts.companyId, opts.agentId);
   if (!agent) throw new Error("agent not found");
 
-  const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
+  // Resolve the effective working directory. Krish's pilot flagged this:
+  // the terminal was silently spawning in the agent-home workspace
+  // (`~/.combyne/instances/.../workspaces/<agent>`) even when the agent
+  // had a real working directory configured on its Configure page
+  // (adapterConfig.cwd). Honour that configured path first so the REPL
+  // lands inside the project the user actually set up.
+  const configuredCwd = readNonEmptyString(
+    (agent.adapterConfig as { cwd?: unknown })?.cwd,
+  );
+  const homeCwd = resolveDefaultAgentWorkspaceDir(agent.id);
+  const cwd = (await pathExists(configuredCwd)) ? configuredCwd! : homeCwd;
   await ensureDir(cwd);
+
+  // Also collect every Combyne-managed project workspace on this company so
+  // claude/codex can read/write across them via --add-dir — the alternative
+  // is the agent saying "project not found" when the user clearly set it up.
+  const projectWorkspaceDirs = await collectCompanyProjectWorkspaceDirs(
+    db,
+    agent.companyId,
+    cwd,
+  );
 
   let command: string;
   let args: string[];
@@ -523,6 +651,7 @@ export async function createTerminalSession(
     const cli = await buildCliLaunch(agent.adapterType, adapterConfig, {
       resumeClaudeSessionId: opts.resumeClaudeSessionId ?? null,
       contextPreamble,
+      projectWorkspaceDirs,
     });
     if (!cli) {
       // Unknown adapter — fall back to shell with a banner line.
@@ -586,6 +715,7 @@ export async function createTerminalSession(
     transcriptSeq: 1,
     pendingOutputChunk: "",
     pendingOutputTimer: null,
+    idleWarningSentAt: null,
   };
 
   // Create a ticketing "session Issue" so the terminal shows up in the same
@@ -657,6 +787,7 @@ export async function createTerminalSession(
 
   pty.onData((data) => {
     session.lastActivityAt = Date.now();
+    session.idleWarningSentAt = null;
     session.buffer += data;
     if (session.buffer.length > MAX_BUFFER_BYTES) {
       session.buffer = session.buffer.slice(session.buffer.length - MAX_BUFFER_BYTES);
@@ -751,6 +882,8 @@ export function detachWriter(session: TerminalSession, ws: WsLike) {
 
 export function writeStdin(session: TerminalSession, data: string) {
   if (session.closed) return;
+  session.lastActivityAt = Date.now();
+  session.idleWarningSentAt = null;
   session.pty.write(data);
   session.logStream?.write(`<stdin>${data}</stdin>`);
   // Feed bytes into the per-session prompt buffer so we can ticket each turn.
@@ -1000,7 +1133,7 @@ export async function closeSession(db: Db, session: TerminalSession, reason = "c
     try {
       const svc = issueService(db);
       const message = idleClosed
-        ? `Terminal session idle-closed at ${new Date().toISOString()}. Click **Continue** to resume this session.`
+        ? buildIdleCloseComment({ session, issueId })
         : `Terminal session closed (reason: \`${reason}\`) at ${new Date().toISOString()}.`;
       await svc.addComment(issueId, message, {
         userId: session.openedByUserId ?? undefined,
@@ -1015,7 +1148,64 @@ export async function closeSession(db: Db, session: TerminalSession, reason = "c
   }
 }
 
+/**
+ * Build the comment body posted on the session issue when a terminal is
+ * reaped for idle. Gives the user three explicit resume paths so nobody
+ * is left guessing how to get back into the REPL:
+ *   1. UI — the Continue button on this very issue
+ *   2. API — a curl the user can paste in any shell
+ *   3. CLI — the direct `claude --resume <sessionId>` fallback for the
+ *      Claude adapter so power users can skip the round-trip
+ * The server base URL is taken from COMBYNE_PUBLIC_URL when set, falling
+ * back to the canonical local-trusted dev URL so copy/paste still works.
+ */
+function buildIdleCloseComment(input: {
+  session: TerminalSession;
+  issueId: string;
+}): string {
+  const baseUrl =
+    process.env.COMBYNE_PUBLIC_URL?.trim().replace(/\/$/, "") ||
+    `http://127.0.0.1:${process.env.PORT?.trim() || "3100"}`;
+  const apiUrl = `${baseUrl}/api/companies/${input.session.companyId}/agents/${input.session.agentId}/terminal/continue`;
+  const curlLine = [
+    `curl -fsS -X POST '${apiUrl}'`,
+    `  -H 'content-type: application/json'`,
+    `  -d '${JSON.stringify({ issueId: input.issueId })}'`,
+  ].join(" \\\n");
+  const lines: string[] = [
+    `Terminal session idle-closed at ${new Date().toISOString()} after ${Math.round(IDLE_GRACE_MS / 60_000)} min of inactivity.`,
+    ``,
+    `**Resume this session:**`,
+    ``,
+    `1. **UI** — click the **Continue** button on this issue.`,
+    ``,
+    `2. **API** — run:`,
+    "   ```bash",
+    `   ${curlLine}`,
+    "   ```",
+  ];
+  // For Claude we also have the PTY session id — surface it as a
+  // power-user shortcut. The user can point their own claude CLI at it
+  // directly without going through the Combyne endpoint.
+  if (input.session.command.startsWith("claude")) {
+    lines.push(
+      ``,
+      `3. **Direct CLI** — from inside the workspace \`${input.session.cwd}\`:`,
+      "   ```bash",
+      `   claude --resume ${input.session.id} --dangerously-skip-permissions`,
+      "   ```",
+      `   _(This bypasses Combyne and talks to Claude directly; prompts won't be logged as comments.)_`,
+    );
+  }
+  lines.push(
+    ``,
+    `Issue status moved to **awaiting_user** so the agent won't auto-wake until you reply or click Continue.`,
+  );
+  return lines.join("\n");
+}
+
 export function toSessionInfo(session: TerminalSession): TerminalSessionInfo {
+  const reapsAt = new Date(session.lastActivityAt + IDLE_GRACE_MS);
   return {
     id: session.id,
     companyId: session.companyId,
@@ -1026,10 +1216,44 @@ export function toSessionInfo(session: TerminalSession): TerminalSessionInfo {
     status: session.closed ? "closed" : "running",
     exitCode: null,
     startedAt: session.startedAt,
+    idleGraceMs: IDLE_GRACE_MS,
+    idleWarningMs: IDLE_WARNING_MS,
+    idleReapsAt: reapsAt.toISOString(),
   };
 }
 
+/**
+ * Bump `lastActivityAt` without touching the PTY. Called from the WS
+ * control path when the client sends `{type:"keep_alive"}` from a
+ * "Keep session alive" button in the UI — resets the idle clock and
+ * clears any pending warning state so we don't re-send.
+ */
+export function touchSessionKeepAlive(session: TerminalSession) {
+  session.lastActivityAt = Date.now();
+  session.idleWarningSentAt = null;
+}
+
+/**
+ * Broadcast a structured event to every attached writer. Used for the
+ * pre-reap warning + the final reap notification; clients should decode
+ * the JSON and render an appropriate banner.
+ */
+function broadcastControlEvent(session: TerminalSession, payload: Record<string, unknown>) {
+  const body = JSON.stringify(payload);
+  for (const w of session.writers) {
+    try {
+      if (w.readyState === 1) w.send(body);
+    } catch {
+      // non-fatal
+    }
+  }
+}
+
 // Idle reaper: kill sessions with no attached writers after IDLE_GRACE_MS.
+// Emits a `{type:"idle_warning"}` event IDLE_WARNING_MS before reap so the
+// UI can show a "session closing in N minutes" banner with a keep-alive
+// button (no writers attached means nobody is watching anyway, but the
+// event also lands on the audit log so it's visible on reconnect).
 let reaperStarted = false;
 export function startTerminalSessionReaper(db: Db) {
   if (reaperStarted) return;
@@ -1037,9 +1261,25 @@ export function startTerminalSessionReaper(db: Db) {
   setInterval(() => {
     const now = Date.now();
     for (const session of sessionsById.values()) {
-      if (session.writers.size > 0) continue;
-      if (now - session.lastActivityAt >= IDLE_GRACE_MS) {
+      const idleFor = now - session.lastActivityAt;
+      if (idleFor >= IDLE_GRACE_MS) {
         void closeSession(db, session, "idle");
+        continue;
+      }
+      // Warn window — once per idle period, bail when already warned.
+      const timeUntilReap = IDLE_GRACE_MS - idleFor;
+      if (
+        timeUntilReap <= IDLE_WARNING_MS &&
+        session.idleWarningSentAt === null &&
+        session.writers.size > 0
+      ) {
+        session.idleWarningSentAt = now;
+        broadcastControlEvent(session, {
+          type: "idle_warning",
+          reapsInSec: Math.max(1, Math.ceil(timeUntilReap / 1_000)),
+          idleGraceMs: IDLE_GRACE_MS,
+          hint: "Send a `keep_alive` control message or type anything to keep the session alive.",
+        });
       }
     }
   }, 30_000).unref?.();
