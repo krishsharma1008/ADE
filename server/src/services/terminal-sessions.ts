@@ -77,6 +77,15 @@ export interface TerminalSessionInfo {
   status: "running" | "closed" | "crashed";
   exitCode: number | null;
   startedAt: string;
+  /** Current idle-timeout in ms. Surfaced so the UI can show the value on
+   *  the terminal page without re-reading server env vars. */
+  idleGraceMs: number;
+  /** ms before reap at which a `{type:"idle_warning"}` WS event fires. */
+  idleWarningMs: number;
+  /** Wall-clock instant the session will be idle-reaped at, assuming no
+   *  further activity. Refreshed on every keystroke, WS attach, or
+   *  `keep_alive` control message. */
+  idleReapsAt: string;
 }
 
 interface WsLike {
@@ -115,6 +124,9 @@ interface TerminalSession {
   // so we coalesce to avoid one DB row per byte.
   pendingOutputChunk: string;
   pendingOutputTimer: ReturnType<typeof setTimeout> | null;
+  // Prevents the pre-reap warning ping from firing more than once per
+  // idle period — resets whenever the session sees new activity.
+  idleWarningSentAt: number | null;
 }
 
 const MAX_BUFFER_BYTES = 256 * 1024;
@@ -139,6 +151,19 @@ function resolveIdleGraceMs(): number {
 }
 
 const IDLE_GRACE_MS = resolveIdleGraceMs();
+
+// How long before reap we send a `{type:"idle_warning"}` to any attached
+// WS client so the UI can show a "session will close in N minutes" banner
+// with a "Keep alive" button. Defaults to 5 minutes before reap, clamped
+// to at most half the idle window so short-timeout dev environments still
+// get a heads-up.
+function resolveIdleWarningMs(): number {
+  const configured = process.env.COMBYNE_TERMINAL_IDLE_WARNING_MS?.trim();
+  const parsed = configured && !Number.isNaN(Number(configured)) ? Number(configured) : 5 * 60_000;
+  const safe = parsed > 0 ? parsed : 5 * 60_000;
+  return Math.min(safe, Math.floor(IDLE_GRACE_MS / 2));
+}
+const IDLE_WARNING_MS = resolveIdleWarningMs();
 
 const sessionsByAgent = new Map<string, TerminalSession>(); // key: `${companyId}:${agentId}`
 const sessionsById = new Map<string, TerminalSession>();
@@ -690,6 +715,7 @@ export async function createTerminalSession(
     transcriptSeq: 1,
     pendingOutputChunk: "",
     pendingOutputTimer: null,
+    idleWarningSentAt: null,
   };
 
   // Create a ticketing "session Issue" so the terminal shows up in the same
@@ -761,6 +787,7 @@ export async function createTerminalSession(
 
   pty.onData((data) => {
     session.lastActivityAt = Date.now();
+    session.idleWarningSentAt = null;
     session.buffer += data;
     if (session.buffer.length > MAX_BUFFER_BYTES) {
       session.buffer = session.buffer.slice(session.buffer.length - MAX_BUFFER_BYTES);
@@ -855,6 +882,8 @@ export function detachWriter(session: TerminalSession, ws: WsLike) {
 
 export function writeStdin(session: TerminalSession, data: string) {
   if (session.closed) return;
+  session.lastActivityAt = Date.now();
+  session.idleWarningSentAt = null;
   session.pty.write(data);
   session.logStream?.write(`<stdin>${data}</stdin>`);
   // Feed bytes into the per-session prompt buffer so we can ticket each turn.
@@ -1176,6 +1205,7 @@ function buildIdleCloseComment(input: {
 }
 
 export function toSessionInfo(session: TerminalSession): TerminalSessionInfo {
+  const reapsAt = new Date(session.lastActivityAt + IDLE_GRACE_MS);
   return {
     id: session.id,
     companyId: session.companyId,
@@ -1186,10 +1216,44 @@ export function toSessionInfo(session: TerminalSession): TerminalSessionInfo {
     status: session.closed ? "closed" : "running",
     exitCode: null,
     startedAt: session.startedAt,
+    idleGraceMs: IDLE_GRACE_MS,
+    idleWarningMs: IDLE_WARNING_MS,
+    idleReapsAt: reapsAt.toISOString(),
   };
 }
 
+/**
+ * Bump `lastActivityAt` without touching the PTY. Called from the WS
+ * control path when the client sends `{type:"keep_alive"}` from a
+ * "Keep session alive" button in the UI — resets the idle clock and
+ * clears any pending warning state so we don't re-send.
+ */
+export function touchSessionKeepAlive(session: TerminalSession) {
+  session.lastActivityAt = Date.now();
+  session.idleWarningSentAt = null;
+}
+
+/**
+ * Broadcast a structured event to every attached writer. Used for the
+ * pre-reap warning + the final reap notification; clients should decode
+ * the JSON and render an appropriate banner.
+ */
+function broadcastControlEvent(session: TerminalSession, payload: Record<string, unknown>) {
+  const body = JSON.stringify(payload);
+  for (const w of session.writers) {
+    try {
+      if (w.readyState === 1) w.send(body);
+    } catch {
+      // non-fatal
+    }
+  }
+}
+
 // Idle reaper: kill sessions with no attached writers after IDLE_GRACE_MS.
+// Emits a `{type:"idle_warning"}` event IDLE_WARNING_MS before reap so the
+// UI can show a "session closing in N minutes" banner with a keep-alive
+// button (no writers attached means nobody is watching anyway, but the
+// event also lands on the audit log so it's visible on reconnect).
 let reaperStarted = false;
 export function startTerminalSessionReaper(db: Db) {
   if (reaperStarted) return;
@@ -1197,9 +1261,25 @@ export function startTerminalSessionReaper(db: Db) {
   setInterval(() => {
     const now = Date.now();
     for (const session of sessionsById.values()) {
-      if (session.writers.size > 0) continue;
-      if (now - session.lastActivityAt >= IDLE_GRACE_MS) {
+      const idleFor = now - session.lastActivityAt;
+      if (idleFor >= IDLE_GRACE_MS) {
         void closeSession(db, session, "idle");
+        continue;
+      }
+      // Warn window — once per idle period, bail when already warned.
+      const timeUntilReap = IDLE_GRACE_MS - idleFor;
+      if (
+        timeUntilReap <= IDLE_WARNING_MS &&
+        session.idleWarningSentAt === null &&
+        session.writers.size > 0
+      ) {
+        session.idleWarningSentAt = now;
+        broadcastControlEvent(session, {
+          type: "idle_warning",
+          reapsInSec: Math.max(1, Math.ceil(timeUntilReap / 1_000)),
+          idleGraceMs: IDLE_GRACE_MS,
+          hint: "Send a `keep_alive` control message or type anything to keep the session alive.",
+        });
       }
     }
   }, 30_000).unref?.();
