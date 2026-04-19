@@ -52,7 +52,15 @@ export interface AdapterExecutionResult {
   costUsd?: number | null;
   resultJson?: Record<string, unknown> | null;
   summary?: string | null;
+  question?:
+    | string
+    | {
+        prompt: string;
+        choices: Array<{ key: string; label: string; description?: string }>;
+      }
+    | null;
   clearSession?: boolean;
+  biller?: string | null;
 }
 
 export interface AdapterSessionCodec {
@@ -69,6 +77,7 @@ export interface AdapterInvocationMeta {
   commandNotes?: string[];
   env?: Record<string, string>;
   prompt?: string;
+  promptMetrics?: Record<string, number>;
   context?: Record<string, unknown>;
 }
 
@@ -80,6 +89,7 @@ export interface AdapterExecutionContext {
   context: Record<string, unknown>;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
+  onSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
   authToken?: string;
 }
 

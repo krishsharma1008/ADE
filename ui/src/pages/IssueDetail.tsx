@@ -51,9 +51,11 @@ import {
   Trash2,
   UserPlus,
   X as XIcon,
+  XCircle,
 } from "lucide-react";
 import type { ActivityEvent } from "@combyne/shared";
 import type { Agent, IssueAttachment } from "@combyne/shared";
+import { resolveAgentErrorCode } from "@combyne/shared";
 
 type CommentReassignment = {
   assigneeAgentId: string | null;
@@ -775,6 +777,56 @@ export function IssueDetail() {
           ))}
         </div>
       )}
+
+      {/* Failed-run banner — surfaces error taxonomy so the user sees
+          what to fix. Fires only when the most-recent non-live run ended
+          in failure / timeout and there's no in-flight run that might
+          recover. */}
+      {(() => {
+        if (hasLiveRuns) return null;
+        const latest = timelineRuns[0];
+        if (!latest) return null;
+        if (latest.status !== "failed" && latest.status !== "timed_out") return null;
+        const entry = resolveAgentErrorCode(latest.errorCode ?? null);
+        return (
+          <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2.5 text-sm space-y-2">
+            <div className="flex items-start gap-2">
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+              <div className="flex-1 min-w-0 space-y-1">
+                <div className="font-medium text-red-900 dark:text-red-200">
+                  Last run {latest.status === "timed_out" ? "timed out" : "failed"}
+                  {latest.errorCode ? ` (${latest.errorCode})` : ""}
+                </div>
+                {latest.error && (
+                  <div className="text-xs text-red-900/80 dark:text-red-200/80 break-words">
+                    {latest.error}
+                  </div>
+                )}
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="shrink-0"
+                onClick={() => navigate(`/agents/${latest.agentId}/runs/${latest.runId}`)}
+              >
+                Open run
+              </Button>
+            </div>
+            {entry && (
+              <div className="rounded border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-xs space-y-1 ml-6">
+                <div className="font-medium text-amber-900 dark:text-amber-200">{entry.title}</div>
+                <div className="text-amber-900/80 dark:text-amber-200/80 leading-relaxed">
+                  {entry.body}
+                </div>
+                <div className="text-amber-900 dark:text-amber-200 leading-relaxed">
+                  <span className="font-medium">How to fix: </span>
+                  {entry.remediation}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {issue.status === "awaiting_user" && openQuestions.length === 0 && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">

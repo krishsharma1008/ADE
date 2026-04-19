@@ -40,6 +40,7 @@ import {
 import { Identity } from "../components/Identity";
 import { PageTabBar } from "../components/PageTabBar";
 import type { HeartbeatRun, Issue, JoinRequest } from "@combyne/shared";
+import { resolveAgentErrorCode } from "@combyne/shared";
 
 const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
 const RECENT_ISSUES_LIMIT = 100;
@@ -287,6 +288,32 @@ function FailedRunCard({
         <div className="rounded-md border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm">
           {displayError}
         </div>
+
+        {(() => {
+          const entry = resolveAgentErrorCode(run.errorCode);
+          if (!entry) return null;
+          return (
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs space-y-1.5">
+              <div className="font-medium text-amber-900 dark:text-amber-200">{entry.title}</div>
+              <div className="text-amber-900/80 dark:text-amber-200/80 leading-relaxed">{entry.body}</div>
+              <div className="text-amber-900 dark:text-amber-200 leading-relaxed whitespace-pre-line">
+                <span className="font-medium">How to fix: </span>
+                {entry.remediation}
+              </div>
+              {entry.docsUrl && (
+                <a
+                  href={entry.docsUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center text-amber-900 dark:text-amber-200 underline hover:no-underline"
+                >
+                  Docs
+                  <ArrowUpRight className="ml-0.5 h-3 w-3" />
+                </a>
+              )}
+            </div>
+          );
+        })()}
 
         <div className="text-xs">
           <span className="font-mono text-muted-foreground">run {run.id.slice(0, 8)}</span>
