@@ -89,8 +89,12 @@ describe("resolveRuntimeSessionParamsForWorkspace", () => {
 });
 
 describe("shouldResetTaskSessionForWake", () => {
-  it("resets session context on assignment wake", () => {
-    expect(shouldResetTaskSessionForWake({ wakeReason: "issue_assigned" })).toBe(true);
+  // Post-Phase-C: the default is to KEEP the adapter session warm across
+  // issue_assigned wakes — the memory/handoff preamble carries the new
+  // context. The rollback lever COMBYNE_RESET_SESSION_ON_ASSIGN=true is
+  // covered by shouldResetTaskSessionForWake.test.ts.
+  it("does NOT reset session context on assignment wake by default", () => {
+    expect(shouldResetTaskSessionForWake({ wakeReason: "issue_assigned" })).toBe(false);
   });
 
   it("resets session context on timer heartbeats", () => {

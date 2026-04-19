@@ -40,6 +40,11 @@ const ADAPTERS: AdapterDef[] = [
   },
 ];
 
+// Built-in adapters don't need a CLI on PATH. Surfacing them in the report
+// so `combyne doctor` doesn't mislead new users into thinking only CLI-based
+// adapters exist (Chris's pilot ran into this).
+const BUILT_IN_ADAPTERS = ["process", "http", "openclaw_gateway"] as const;
+
 export async function adapterCliCheck(): Promise<CheckResult> {
   const results = await Promise.all(
     ADAPTERS.map(async (def) => {
@@ -63,11 +68,13 @@ export async function adapterCliCheck(): Promise<CheckResult> {
     .map((r) => `${r.def.label} [${r.def.installHint}]`)
     .join(" · ");
 
+  const builtInNote = `Built-in adapters always available: ${BUILT_IN_ADAPTERS.join(", ")}.`;
+
   if (installed.length === 0) {
     return {
       name: "Adapter CLIs",
       status: "fail",
-      message: "No agent adapter CLIs found on PATH — agents cannot run until at least one is installed",
+      message: `No CLI-backed agent adapter found on PATH — agents using claude/codex/cursor/gemini/opencode/pi cannot run until at least one is installed. ${builtInNote}`,
       canRepair: false,
       repairHint: `Install one of: ${missingSummary}`,
     };
@@ -77,14 +84,14 @@ export async function adapterCliCheck(): Promise<CheckResult> {
     return {
       name: "Adapter CLIs",
       status: "pass",
-      message: `All adapter CLIs available: ${installedSummary}`,
+      message: `All adapter CLIs available: ${installedSummary}. ${builtInNote}`,
     };
   }
 
   return {
     name: "Adapter CLIs",
     status: "warn",
-    message: `Installed: ${installedSummary}. Missing (optional): ${missing.map((r) => r.def.label).join(", ")}`,
+    message: `Installed: ${installedSummary}. Missing (optional): ${missing.map((r) => r.def.label).join(", ")}. ${builtInNote}`,
     canRepair: false,
     repairHint: `Install missing CLIs if needed: ${missingSummary}`,
   };

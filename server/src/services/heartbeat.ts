@@ -20,6 +20,9 @@ import { appendTranscriptEntry, type TranscriptRole } from "./agent-transcripts.
 import { loadRecentMemory, summarizeRunAndPersist } from "./agent-memory.js";
 import { getPendingHandoffBrief, markHandoffConsumed } from "./agent-handoff.js";
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
+import { loadAssignedIssueQueue } from "./agent-queue.js";
+import { inspectGitStateForIssue } from "./git-state.js";
+import { probeAdapterAvailability } from "./adapter-availability.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec } from "../adapters/index.js";
@@ -1292,6 +1295,44 @@ export function heartbeatService(db: Db) {
     if (resolvedWorkspace.projectId && !readNonEmptyString(context.projectId)) {
       context.projectId = resolvedWorkspace.projectId;
     }
+
+    // Tell the agent what else is on its plate. Without this, a wake triggered
+    // by one assignment leaves the adapter with `context.issueId` only and no
+    // visibility into the rest of the queue — which is exactly what Chris saw
+    // as "no tasks to run" in the test pilot. Capped inside the service.
+    try {
+      const queue = await loadAssignedIssueQueue(db, {
+        companyId: agent.companyId,
+        agentId: agent.id,
+        currentIssueId: memoryIssueId ?? null,
+      });
+      context.combyneAssignedIssues = queue;
+    } catch (err) {
+      logger.debug({ err, agentId: agent.id, runId }, "failed to load assigned issue queue");
+    }
+
+    // Close the loop between git state and issue status: before the agent
+    // says "nothing to do", let it see commits/branches that already mention
+    // this issue. Best-effort; non-git workspaces degrade gracefully.
+    if (memoryIssueId) {
+      try {
+        const issueRow = await db
+          .select({ identifier: issues.identifier, title: issues.title })
+          .from(issues)
+          .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (issueRow) {
+          const gitState = await inspectGitStateForIssue({
+            cwd: resolvedWorkspace.cwd,
+            issueIdentifier: issueRow.identifier ?? null,
+            issueTitle: issueRow.title ?? "",
+          });
+          if (gitState) context.combyneGitState = gitState;
+        }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId }, "failed to inspect git state for issue");
+      }
+    }
     const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
     const previousSessionDisplayId = truncateDisplayId(
       taskSessionForRun?.sessionDisplayId ??
@@ -1424,6 +1465,30 @@ export function heartbeatService(db: Db) {
       };
 
       const adapter = getServerAdapter(agent.adapterType);
+
+      // Pre-flight: if the agent's adapter depends on a CLI that isn't on the
+      // PATH, fail fast with the adapter-specific install hint instead of
+      // letting the adapter spawn and surface a generic "command not found"
+      // error. Fixes the "adapter_failed" mystery Chris saw on pilots.
+      try {
+        const probes = await probeAdapterAvailability();
+        const probe = probes[agent.adapterType];
+        if (probe && probe.requiresCli && !probe.available) {
+          const hint = probe.installHint || "Install the adapter's CLI and retry.";
+          const bin = probe.binary || agent.adapterType;
+          const message = `Adapter "${agent.adapterType}" requires the \`${bin}\` CLI, which was not found on PATH. ${hint}`;
+          await onLog("stderr", `[combyne] ${message}\n`);
+          const err = new Error(message) as Error & { code?: string };
+          err.code = "adapter_cli_missing";
+          throw err;
+        }
+      } catch (err) {
+        if (err instanceof Error && (err as { code?: string }).code === "adapter_cli_missing") {
+          throw err;
+        }
+        logger.debug({ err, adapterType: agent.adapterType }, "adapter availability probe failed");
+      }
+
       const authToken = adapter.supportsLocalAgentJwt
         ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
         : null;
@@ -1601,9 +1666,13 @@ export function heartbeatService(db: Db) {
         }
       }
 
+      const errorCode =
+        err instanceof Error && typeof (err as { code?: string }).code === "string"
+          ? ((err as { code?: string }).code ?? "adapter_failed")
+          : "adapter_failed";
       const failedRun = await setRunStatus(run.id, "failed", {
         error: message,
-        errorCode: "adapter_failed",
+        errorCode,
         finishedAt: new Date(),
         stdoutExcerpt,
         stderrExcerpt,

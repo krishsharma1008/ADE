@@ -48,10 +48,28 @@ export interface AdapterExecutionResult {
   sessionDisplayId?: string | null;
   provider?: string | null;
   model?: string | null;
+  /**
+   * Optional second-level billing attribution (e.g. `"google"` for gemini via
+   * Google's API). Parallel to `provider`; heartbeat-level accounting
+   * collapses both into `cost_events.provider`.
+   */
+  biller?: string | null;
   billingType?: AdapterBillingType | null;
   costUsd?: number | null;
   resultJson?: Record<string, unknown> | null;
   summary?: string | null;
+  /**
+   * Optional prompt-side adapter question surfaced to the UI. Either a plain
+   * string or a structured ask-user payload with choices — the UI handles
+   * both variants.
+   */
+  question?:
+    | string
+    | {
+        prompt: string;
+        choices: Array<{ key: string; label: string; description?: string }>;
+      }
+    | null;
   clearSession?: boolean;
 }
 
@@ -69,6 +87,12 @@ export interface AdapterInvocationMeta {
   commandNotes?: string[];
   env?: Record<string, string>;
   prompt?: string;
+  /**
+   * Pre-send metrics derived from the assembled prompt (token estimate,
+   * byte count, etc.). Optional — adapters can omit this and Combyne falls
+   * back to heuristics.
+   */
+  promptMetrics?: Record<string, unknown>;
   context?: Record<string, unknown>;
 }
 
@@ -80,6 +104,12 @@ export interface AdapterExecutionContext {
   context: Record<string, unknown>;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
+  /**
+   * Optional lifecycle hook invoked with the PID as soon as the child
+   * process is spawned. Adapters use it to register the process for
+   * orphan-reaping; no-ops when the adapter doesn't spawn a child.
+   */
+  onSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
   authToken?: string;
 }
 
