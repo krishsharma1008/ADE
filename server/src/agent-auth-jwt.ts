@@ -1,4 +1,13 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 
 interface JwtHeader {
   alg: string;
@@ -25,8 +34,82 @@ function parseNumber(value: string | undefined, fallback: number) {
   return Math.floor(parsed);
 }
 
+/**
+ * Resolve the on-disk path that `ensureLocalAgentJwtSecret()` in index.ts
+ * writes to. Kept in sync with `resolveCombyneInstanceRoot()`.
+ */
+function resolveInstanceSecretPath(): string {
+  const explicit = process.env.COMBYNE_INSTANCE_ROOT?.trim();
+  const instanceName = process.env.COMBYNE_INSTANCE_NAME?.trim() || "default";
+  const root = explicit
+    ? explicit
+    : resolve(homedir(), ".combyne", "instances", instanceName);
+  return resolve(root, "secrets", "agent-jwt.key");
+}
+
+let cachedDiskSecret: string | null = null;
+
+/**
+ * Read the persisted JWT secret from disk if the env var is missing. Caches
+ * the result so repeated calls don't touch the filesystem. Fixes the
+ * "local agent jwt secret missing or invalid" failure mode where the server
+ * was started without the local-trusted bootstrap firing (non-local mode,
+ * env-scrubbed child process, etc.).
+ */
+function readSecretFromDisk(): string | null {
+  if (cachedDiskSecret) return cachedDiskSecret;
+  const secretPath = resolveInstanceSecretPath();
+  if (!existsSync(secretPath)) return null;
+  try {
+    const content = readFileSync(secretPath, "utf8").trim();
+    if (content.length < 32) return null;
+    cachedDiskSecret = content;
+    return content;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Generate a JWT secret on demand and persist it to the canonical path so
+ * the next cold boot reuses it. Used as a last-ditch fallback when both
+ * the env var and disk file are missing — keeps local-trusted agents
+ * functional instead of silently failing every authenticated endpoint.
+ */
+function generateAndPersistSecret(): string {
+  const secret = randomBytes(48).toString("base64url");
+  const secretPath = resolveInstanceSecretPath();
+  try {
+    mkdirSync(resolve(secretPath, ".."), { recursive: true });
+    writeFileSync(secretPath, secret, { encoding: "utf8" });
+    try { chmodSync(secretPath, 0o600); } catch {
+      // Chmod failing on an exotic FS is not fatal — the secret is usable.
+    }
+  } catch {
+    // Persisting failed; still return the secret so this process keeps
+    // working. A later boot will bootstrap again.
+  }
+  cachedDiskSecret = secret;
+  process.env.COMBYNE_AGENT_JWT_SECRET = secret;
+  return secret;
+}
+
+function resolveJwtSecret(): string | null {
+  const fromEnv = process.env.COMBYNE_AGENT_JWT_SECRET?.trim();
+  if (fromEnv) return fromEnv;
+  const fromDisk = readSecretFromDisk();
+  if (fromDisk) {
+    // Rehydrate env so downstream code that also reads the var directly
+    // (adapters, tests) sees a consistent value without repeating the
+    // disk read.
+    process.env.COMBYNE_AGENT_JWT_SECRET = fromDisk;
+    return fromDisk;
+  }
+  return null;
+}
+
 function jwtConfig() {
-  const secret = process.env.COMBYNE_AGENT_JWT_SECRET?.trim();
+  const secret = resolveJwtSecret();
   if (!secret) return null;
 
   return {
@@ -35,6 +118,18 @@ function jwtConfig() {
     issuer: process.env.COMBYNE_AGENT_JWT_ISSUER ?? "combyne",
     audience: process.env.COMBYNE_AGENT_JWT_AUDIENCE ?? "combyne-api",
   };
+}
+
+/**
+ * Expose a runtime hook so callers (heartbeat pre-flight, health endpoint)
+ * can self-heal a missing JWT secret rather than failing every run. The
+ * generated secret is persisted to the same path ensureLocalAgentJwtSecret
+ * writes to, so the next boot reuses it.
+ */
+export function ensureLocalAgentJwtSecretAtRuntime(): string {
+  const existing = resolveJwtSecret();
+  if (existing) return existing;
+  return generateAndPersistSecret();
 }
 
 function base64UrlEncode(value: string) {

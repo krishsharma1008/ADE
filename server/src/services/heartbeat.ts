@@ -23,10 +23,12 @@ import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstr
 import { loadAssignedIssueQueue } from "./agent-queue.js";
 import { inspectGitStateForIssue } from "./git-state.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
+import { extractAndPostQuestions } from "./agent-question-extract.js";
+import { loadCompanyProjectOverview } from "./agent-company-context.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec } from "../adapters/index.js";
-import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { createLocalAgentJwt, ensureLocalAgentJwtSecretAtRuntime } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
@@ -1489,6 +1491,25 @@ export function heartbeatService(db: Db) {
         logger.debug({ err, adapterType: agent.adapterType }, "adapter availability probe failed");
       }
 
+      // Self-heal the JWT secret before minting. If the server booted
+      // without the local-trusted bootstrap (non-local mode, env-scrubbed
+      // child, etc.), ensureLocalAgentJwtSecretAtRuntime() falls back to
+      // reading the on-disk key or generates + persists one. Prevents the
+      // silent-auth-failure loop Chris saw: every endpoint returning
+      // "Agent authentication required" because the token was null.
+      if (adapter.supportsLocalAgentJwt) {
+        try {
+          const minted = ensureLocalAgentJwtSecretAtRuntime();
+          if (!minted) {
+            logger.error(
+              { companyId: agent.companyId, agentId: agent.id, runId: run.id },
+              "failed to resolve or generate local agent JWT secret",
+            );
+          }
+        } catch (err) {
+          logger.error({ err, runId: run.id }, "ensureLocalAgentJwtSecretAtRuntime threw");
+        }
+      }
       const authToken = adapter.supportsLocalAgentJwt
         ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
         : null;
@@ -1626,6 +1647,32 @@ export function heartbeatService(db: Db) {
           agentId: finalizedRun.agentId,
           issueId: resolveRunIssueId(finalizedRun),
         });
+
+        // Auto-surface any numbered / bulleted questions the agent buried
+        // in its output as structured `kind="question"` comments, so the
+        // Reply-and-Wake card renders each with its own answer input
+        // instead of leaving them as prose in the plan document.
+        const runIssueId = resolveRunIssueId(finalizedRun);
+        if (runIssueId && outcome === "succeeded") {
+          const resultText =
+            adapterResult.resultJson && typeof adapterResult.resultJson === "object"
+              ? JSON.stringify(adapterResult.resultJson)
+              : "";
+          const sourceText = [stdoutExcerpt, resultText].filter(Boolean).join("\n\n");
+          if (sourceText.length > 0) {
+            void extractAndPostQuestions(db, {
+              companyId: finalizedRun.companyId,
+              agentId: finalizedRun.agentId,
+              issueId: runIssueId,
+              sourceText,
+            }).catch((err) => {
+              logger.debug(
+                { err, runId: finalizedRun.id, issueId: runIssueId },
+                "question-extractor failed",
+              );
+            });
+          }
+        }
       }
 
       if (finalizedRun) {

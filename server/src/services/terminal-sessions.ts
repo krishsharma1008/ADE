@@ -12,7 +12,7 @@ import {
   companies as companiesTable,
 } from "@combyne/db";
 import { buildCombyneEnv } from "@combyne/adapter-utils/server-utils";
-import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { createLocalAgentJwt, ensureLocalAgentJwtSecretAtRuntime } from "../agent-auth-jwt.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
@@ -20,6 +20,7 @@ import { loadAssignedIssueQueue } from "./agent-queue.js";
 import { loadRecentMemory, summarizeTerminalSessionAndPersist } from "./agent-memory.js";
 import { getPendingHandoffBrief } from "./agent-handoff.js";
 import { appendTranscriptEntry } from "./agent-transcripts.js";
+import { loadCompanyProjectOverview } from "./agent-company-context.js";
 
 const require = createRequire(import.meta.url);
 
@@ -290,6 +291,18 @@ export async function buildTerminalContextPreamble(
     logger.debug({ err, agentId: agent.id }, "terminal preamble: failed to load queue");
   }
 
+  // Combyne-managed projects — fixes the "agent says project not found"
+  // bug where the REPL only saw its on-disk workspace and was blind to
+  // projects/workspaces created through the UI.
+  try {
+    const overview = await loadCompanyProjectOverview(db, agent.companyId);
+    if (overview.body.length > 0) {
+      segments.push(`# Company projects\n\n${overview.body}`);
+    }
+  } catch (err) {
+    logger.debug({ err, agentId: agent.id }, "terminal preamble: failed to load projects");
+  }
+
   // Pending handoff brief (if any)
   try {
     const handoff = await getPendingHandoffBrief(db, agent.id, opts.reuseIssueId ?? null);
@@ -459,6 +472,14 @@ async function resolveAgentRow(db: Db, companyId: string, agentId: string) {
 
 function buildPtyEnv(agent: { id: string; companyId: string; adapterType: string }): Record<string, string> {
   const combyneEnv = buildCombyneEnv(agent);
+  // Self-heal the JWT secret — same rationale as heartbeat: keeps terminal
+  // sessions functional when the server didn't get to run the local-trusted
+  // bootstrap (unusual boot paths, missing env).
+  try {
+    ensureLocalAgentJwtSecretAtRuntime();
+  } catch (err) {
+    logger.warn({ err, agentId: agent.id }, "terminal: failed to ensure JWT secret");
+  }
   const authToken = createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, `terminal-${Date.now()}`);
   const baseEnv: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
@@ -1000,7 +1021,7 @@ export async function closeSession(db: Db, session: TerminalSession, reason = "c
     try {
       const svc = issueService(db);
       const message = idleClosed
-        ? `Terminal session idle-closed at ${new Date().toISOString()}. Click **Continue** to resume this session.`
+        ? buildIdleCloseComment({ session, issueId })
         : `Terminal session closed (reason: \`${reason}\`) at ${new Date().toISOString()}.`;
       await svc.addComment(issueId, message, {
         userId: session.openedByUserId ?? undefined,
@@ -1013,6 +1034,62 @@ export async function closeSession(db: Db, session: TerminalSession, reason = "c
       );
     }
   }
+}
+
+/**
+ * Build the comment body posted on the session issue when a terminal is
+ * reaped for idle. Gives the user three explicit resume paths so nobody
+ * is left guessing how to get back into the REPL:
+ *   1. UI — the Continue button on this very issue
+ *   2. API — a curl the user can paste in any shell
+ *   3. CLI — the direct `claude --resume <sessionId>` fallback for the
+ *      Claude adapter so power users can skip the round-trip
+ * The server base URL is taken from COMBYNE_PUBLIC_URL when set, falling
+ * back to the canonical local-trusted dev URL so copy/paste still works.
+ */
+function buildIdleCloseComment(input: {
+  session: TerminalSession;
+  issueId: string;
+}): string {
+  const baseUrl =
+    process.env.COMBYNE_PUBLIC_URL?.trim().replace(/\/$/, "") ||
+    `http://127.0.0.1:${process.env.PORT?.trim() || "3100"}`;
+  const apiUrl = `${baseUrl}/api/companies/${input.session.companyId}/agents/${input.session.agentId}/terminal/continue`;
+  const curlLine = [
+    `curl -fsS -X POST '${apiUrl}'`,
+    `  -H 'content-type: application/json'`,
+    `  -d '${JSON.stringify({ issueId: input.issueId })}'`,
+  ].join(" \\\n");
+  const lines: string[] = [
+    `Terminal session idle-closed at ${new Date().toISOString()} after ${Math.round(IDLE_GRACE_MS / 60_000)} min of inactivity.`,
+    ``,
+    `**Resume this session:**`,
+    ``,
+    `1. **UI** — click the **Continue** button on this issue.`,
+    ``,
+    `2. **API** — run:`,
+    "   ```bash",
+    `   ${curlLine}`,
+    "   ```",
+  ];
+  // For Claude we also have the PTY session id — surface it as a
+  // power-user shortcut. The user can point their own claude CLI at it
+  // directly without going through the Combyne endpoint.
+  if (input.session.command.startsWith("claude")) {
+    lines.push(
+      ``,
+      `3. **Direct CLI** — from inside the workspace \`${input.session.cwd}\`:`,
+      "   ```bash",
+      `   claude --resume ${input.session.id} --dangerously-skip-permissions`,
+      "   ```",
+      `   _(This bypasses Combyne and talks to Claude directly; prompts won't be logged as comments.)_`,
+    );
+  }
+  lines.push(
+    ``,
+    `Issue status moved to **awaiting_user** so the agent won't auto-wake until you reply or click Continue.`,
+  );
+  return lines.join("\n");
 }
 
 export function toSessionInfo(session: TerminalSession): TerminalSessionInfo {
