@@ -26,6 +26,30 @@ Task → Find Services → Check Patterns → Write Code → Test → Pre-Push C
 
 Run these **in order**, from the repo root, and only push when all pass. If any step fails, fix the root cause — do not push with `--no-verify`, do not comment-out tests, do not suppress compile errors.
 
+> ### 📋 Auto-heal cheatsheet — what to do when a step fails
+>
+> Before escalating, try the mechanical remediation. Most BUKU build failures map 1-to-1 to a fix:
+>
+> | Failure signal in build output                                                  | Auto-heal                                                                       | Then re-run                              |
+> | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ---------------------------------------- |
+> | `spotlessJavaCheck FAILED` / `The following files had format violations`        | `./gradlew spotlessApply`  (Maven: `mvn spotless:apply`)                        | `./gradlew spotlessCheck` — must be green |
+> | `checkstyleMain FAILED` / `Checkstyle rule violated`                            | Apply the rule the check names (usually import order / line length)             | `./gradlew checkstyleMain`               |
+> | `cannot find symbol` / `package X does not exist` in a loader-variant source set | Import lives in the wrong source set — move or re-scope; never cross `net.minecraftforge.*` into a Fabric source set | `./gradlew clean compileJava*`           |
+> | `unmappedMethodAccess` / `unmappedFieldAccess`                                  | Re-resolve against the current source set's mappings (don't copy names across mapping sets) | `./gradlew compileJava*`                  |
+> | Lombok `getX()` / `builder()` missing on a POJO                                 | Add `lombok` to that source set's `annotationProcessor` configuration            | Recompile                                |
+> | Flyway version clash (`FlywayValidateException: Detected resolved migration not applied`) | Rename your migration to the next monotonic `V{YYYYMMDD}{seq}__*.sql` — never edit an already-applied migration | `./gradlew flywayInfo`                   |
+> | `ClassNotFoundException` / `Package ... is not exported` at test time           | Add the missing dependency to the right source set (`implementation` vs `testImplementation` vs per-variant config) | `./gradlew test`                          |
+> | `-Pfabric` / `-Pforge` task compiles but fails on the other loader              | You edited code that lives in *both* loader source sets and only tested one — run `./gradlew tasks --all \| grep -i '^compile'` to list every compile task, run all of them | All compile tasks green                  |
+> | `ResolveException: Could not resolve <artifact>`                                 | Dependency missing or versioned incorrectly — diff `build.gradle(.kts)` with `origin/main` and reconcile; don't delete the dep to silence the error | `./gradlew --refresh-dependencies build` |
+> | CI red but laptop green                                                          | Compare compile tasks between CI YAML and your local — CI is compiling a source set you skipped. Run it locally, reproduce, fix | Push again only after local reproduces CI |
+>
+> **Rules for auto-healing:**
+> 1. Run the heal command from the **repo root**, not inside a sub-module.
+> 2. Commit the auto-healed files **separately** from the functional change (`git add <files> && git commit -m "chore: spotlessApply"`) so the diff stays reviewable.
+> 3. After healing, **re-run the original failing command** — don't just proceed.
+> 4. If the same failure re-appears after a heal, stop and investigate the root cause. Don't loop.
+> 5. Never delete a test, suppress a rule, or `-x` a task to make the build green.
+
 ### 1. Format
 | Build Tool | Command |
 |------------|---------|
@@ -33,6 +57,8 @@ Run these **in order**, from the repo root, and only push when all pass. If any 
 | Maven  | `mvn spotless:apply` |
 
 Commit any formatting changes separately so the diff stays readable.
+
+**If `spotlessJavaCheck` fails during the compile step, come back here** — run `./gradlew spotlessApply`, stage the reformatted files, commit as `chore: spotlessApply`, then re-run `./gradlew spotlessCheck` to confirm green. Only then move on.
 
 ### 2. Full compile — all source sets
 A green `build` on your laptop is not enough; CI compiles **every** source set (main, test, and any loader-specific sets like `fabric`, `forge`, `neoforge`, integration tests). Run:
