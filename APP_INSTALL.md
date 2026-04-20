@@ -122,6 +122,31 @@ claude login
 defaults write com.apple.dock ResetLaunchPad -bool true && killall Dock
 ```
 
+### Agent tries to run `bd init`, `linear`, or some other tool that isn't installed
+ADE itself does not install or depend on Beads (`bd`), Linear CLI, GitHub CLI, or any similar per-user tooling. If an agent shells out to `bd init` (or similar) and the command isn't on your `PATH`, the call is coming from one of two places on **your** machine:
+
+1. **An MCP server you registered** with the Claude/Codex CLI (e.g. the `beads` MCP). List what the agent sees:
+   ```bash
+   # Claude Code MCP registrations
+   cat ~/.claude.json 2>/dev/null | jq '.mcpServers // {}'
+   claude mcp list
+
+   # Codex MCP registrations
+   cat ~/.codex/config.json 2>/dev/null | jq '.mcpServers // {}'
+   ```
+   Remove one you don't want: `claude mcp remove beads` (or delete the entry from the JSON).
+2. **Instructions that tell the agent to use the tool** — check your per-agent `instructionsFilePath` (configurable in the Agent settings UI), any `CLAUDE.md` / `AGENTS.md` in the project workspace, and any company skills listed on the company's **Skills** page.
+
+ADE ships zero references to `bd`, `beads`, or a local-issue-tracker CLI — `rg "bd init|beads" packages server skills docs` returns nothing. If you want agents to stay fully local without external tool calls, remove the corresponding MCP + skill.
+
+### Pulling updates (for pilots)
+```bash
+git pull origin main
+pnpm install
+pnpm --filter @combyne/db migrate   # applies any new migrations (e.g. 0033, 0034)
+```
+Then restart the server (`pnpm dev`) or the macOS app.
+
 ## Brand
 
 - **Background**: Deep black `#0B0B0F`
