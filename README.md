@@ -50,6 +50,8 @@ Think of it as a company operating system — org charts, governance, budgets, a
 
 > You don't need to install all of them — pick the adapter(s) you plan to use. The onboarding wizard auto-detects what's installed and picks a default for you. Agents with missing CLIs are greyed out with install instructions.
 
+> **ADE has no hidden CLI dependencies.** If a running agent shells out to a tool like `bd` (Beads), `linear`, or `gh` and you see a "command not found" error, the call is coming from an MCP server or an agent instruction on **your** machine — ADE itself contains zero references to those tools. See [`APP_INSTALL.md`](./APP_INSTALL.md#agent-tries-to-run-bd-init-linear-or-some-other-tool-that-isnt-installed) for how to list and remove them.
+
 ### Platform support
 
 | OS | Status | Notes |
