@@ -56,6 +56,7 @@ import {
   ArrowLeft,
   Settings,
   TerminalSquare,
+  Shield,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { AgentIcon, AgentIconPicker } from "../components/AgentIconPicker";
@@ -441,6 +442,33 @@ export function AgentDetail() {
 
   return (
     <div className={cn("space-y-6", isMobile && showConfigActionBar && "pb-24")}>
+      {/* Pending-approval banner — newly-hired agents land here before the
+          board decides; without this banner the user just sees a disabled
+          page and assumes hiring failed. */}
+      {isPendingApproval && (
+        <div className="rounded-md border border-amber-300/60 bg-amber-50/60 dark:border-amber-500/40 dark:bg-amber-500/10 px-3 py-2.5 text-sm flex items-start gap-3">
+          <Shield className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <div className="font-medium text-amber-900 dark:text-amber-200">
+              Agent awaiting board approval
+            </div>
+            <div className="text-xs text-amber-900/80 dark:text-amber-200/80 mt-0.5">
+              This agent was created but can't run until the board approves the hire.
+              The pending <code className="rounded bg-amber-100 dark:bg-amber-500/20 px-1 py-0.5 text-[11px]">hire_agent</code>{" "}
+              approval is on the approvals dashboard.
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={() => navigate("/approvals/pending")}
+          >
+            Review approvals
+          </Button>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-3 min-w-0">
