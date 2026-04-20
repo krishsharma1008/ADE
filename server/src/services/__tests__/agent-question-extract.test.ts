@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { and, eq, isNull } from "drizzle-orm";
-import { agents, companies, issueComments, issues } from "@combyne/db";
+import { and, desc, eq, isNull } from "drizzle-orm";
+import { activityLog, agents, companies, issueComments, issues } from "@combyne/db";
 import {
   extractQuestionsFromText,
   extractAndPostQuestions,
@@ -150,6 +150,40 @@ That's all for now.
         .where(eq(issues.id, issueId));
       expect(refreshed.status).toBe("awaiting_user");
       expect(refreshed.awaitingUserSince).not.toBeNull();
+    });
+
+    it("emits a single activity_log entry per extraction so the issue timeline surfaces it", async () => {
+      const sourceText = `
+## Open questions
+1. Activity-log emit question one?
+2. Activity-log emit question two?
+      `;
+      await extractAndPostQuestions(handle.db, {
+        companyId,
+        agentId,
+        issueId,
+        sourceText,
+      });
+      const rows = await handle.db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.action, "issue.questions_extracted"),
+            eq(activityLog.entityId, issueId),
+          ),
+        )
+        .orderBy(desc(activityLog.createdAt))
+        .limit(1);
+      expect(rows).toHaveLength(1);
+      const row = rows[0]!;
+      expect(row.actorType).toBe("agent");
+      expect(row.actorId).toBe(agentId);
+      expect(row.entityType).toBe("issue");
+      const details = (row.details ?? {}) as Record<string, unknown>;
+      expect(typeof details.posted).toBe("number");
+      expect((details.posted as number) > 0).toBe(true);
     });
 
     it("skips questions already open on the issue so re-runs don't multiply cards", async () => {
