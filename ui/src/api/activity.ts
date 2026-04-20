@@ -11,6 +11,10 @@ export interface RunForIssue {
   invocationSource: string;
   usageJson: Record<string, unknown> | null;
   resultJson: Record<string, unknown> | null;
+  /** Free-form error message — the last thing the adapter said. */
+  error?: string | null;
+  /** Machine-readable code, resolvable via resolveAgentErrorCode(). */
+  errorCode?: string | null;
 }
 
 export interface IssueForRun {

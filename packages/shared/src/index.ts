@@ -644,3 +644,9 @@ export {
   type SecretsLocalEncryptedConfig,
   type ConfigMeta,
 } from "./config-schema.js";
+
+export {
+  resolveAgentErrorCode,
+  KNOWN_AGENT_ERROR_CODES,
+  type AgentErrorCodeEntry,
+} from "./agent-error-codes.js";

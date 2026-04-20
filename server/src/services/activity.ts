@@ -72,6 +72,11 @@ export function activityService(db: Db) {
           invocationSource: heartbeatRuns.invocationSource,
           usageJson: heartbeatRuns.usageJson,
           resultJson: heartbeatRuns.resultJson,
+          // Expose the failure metadata so the IssueDetail page can render
+          // a user-actionable banner (error-code taxonomy lookup) without a
+          // second fetch per run.
+          error: heartbeatRuns.error,
+          errorCode: heartbeatRuns.errorCode,
         })
         .from(heartbeatRuns)
         .where(
