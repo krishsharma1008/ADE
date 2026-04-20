@@ -2,6 +2,7 @@ import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { issueComments, issues } from "@combyne/db";
 import { logger } from "../middleware/logger.js";
+import { logActivity } from "./activity-log.js";
 
 export interface ExtractedQuestionSource {
   companyId: string;
@@ -188,6 +189,30 @@ export async function extractAndPostQuestions(
       logger.warn(
         { err, issueId: input.issueId },
         "question-extractor: failed to mark issue awaiting_user",
+      );
+    }
+  }
+
+  if (posted > 0) {
+    try {
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "agent",
+        actorId: input.agentId,
+        agentId: input.agentId,
+        action: "issue.questions_extracted",
+        entityType: "issue",
+        entityId: input.issueId,
+        details: {
+          posted,
+          skippedExisting,
+          statusTransitioned,
+        },
+      });
+    } catch (err) {
+      logger.debug(
+        { err, issueId: input.issueId },
+        "question-extractor: activity emit failed",
       );
     }
   }

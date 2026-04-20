@@ -24,6 +24,7 @@ import { loadAssignedIssueQueue } from "./agent-queue.js";
 import { inspectGitStateForIssue } from "./git-state.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
 import { extractAndPostQuestions } from "./agent-question-extract.js";
+import { logActivity } from "./activity-log.js";
 import { loadCompanyProjectOverview } from "./agent-company-context.js";
 import {
   agentCanHire,
@@ -1703,6 +1704,44 @@ export function heartbeatService(db: Db) {
             exitCode: adapterResult.exitCode,
           },
         });
+
+        // Surface non-success outcomes on the issue timeline so the user
+        // can see "run failed" / "timed out" / "cancelled" without opening
+        // the run log. Success is noisy (every assignment succeeds) and is
+        // already implied by the new work-product / comment, so skip it.
+        if (outcome !== "succeeded") {
+          const timelineIssueId = resolveRunIssueId(finalizedRun);
+          if (timelineIssueId) {
+            try {
+              await logActivity(db, {
+                companyId: finalizedRun.companyId,
+                actorType: "agent",
+                actorId: finalizedRun.agentId,
+                agentId: finalizedRun.agentId,
+                runId: finalizedRun.id,
+                action: `heartbeat_run.${outcome}`,
+                entityType: "issue",
+                entityId: timelineIssueId,
+                details: {
+                  status,
+                  errorCode:
+                    outcome === "timed_out"
+                      ? "timeout"
+                      : outcome === "cancelled"
+                        ? "cancelled"
+                        : adapterResult.errorCode ?? "adapter_failed",
+                  errorMessage: adapterResult.errorMessage ?? null,
+                  exitCode: adapterResult.exitCode,
+                },
+              });
+            } catch (err) {
+              logger.debug(
+                { err, runId: finalizedRun.id },
+                "run-outcome activity emit failed",
+              );
+            }
+          }
+        }
         await releaseIssueExecutionAndPromote(finalizedRun);
         void summarizeRunAndPersist(db, {
           runId: finalizedRun.id,
