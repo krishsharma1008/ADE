@@ -25,6 +25,11 @@ import { inspectGitStateForIssue } from "./git-state.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
 import { extractAndPostQuestions } from "./agent-question-extract.js";
 import { loadCompanyProjectOverview } from "./agent-company-context.js";
+import {
+  agentCanHire,
+  buildHirePlaybook,
+  detectHireIntent,
+} from "./agent-hire-playbook.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec } from "../adapters/index.js";
@@ -1330,6 +1335,45 @@ export function heartbeatService(db: Db) {
       }
     } catch (err) {
       logger.debug({ err, companyId: agent.companyId, runId }, "failed to load project overview");
+    }
+
+    // Hire-agent playbook — fires when the current issue reads as a hire
+    // request and this agent has permission to create agents. Fixes the
+    // regression where a "Create a new agent" issue got "standing by —
+    // nothing actionable" because the ceo-bootstrap SKILL (the only place
+    // the hire flow was explained) only fires on the very first top-level
+    // CEO issue.
+    if (memoryIssueId) {
+      try {
+        const issueRow = await db
+          .select({
+            title: issues.title,
+            description: issues.description,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (
+          issueRow &&
+          detectHireIntent({ title: issueRow.title, description: issueRow.description }) &&
+          agentCanHire({
+            id: agent.id,
+            role: agent.role,
+            permissions: agent.permissions as Record<string, unknown> | null,
+          })
+        ) {
+          context.combyneHirePlaybook = {
+            body: buildHirePlaybook({
+              companyId: agent.companyId,
+              issue: { title: issueRow.title, description: issueRow.description },
+              agentName: agent.name,
+            }),
+            issueId: memoryIssueId,
+          };
+        }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId }, "failed to build hire playbook");
+      }
     }
 
     // Close the loop between git state and issue status: before the agent

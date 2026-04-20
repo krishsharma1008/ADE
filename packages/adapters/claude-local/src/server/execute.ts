@@ -375,6 +375,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (projectsBody.length > 0) {
     preambleSegments.push(`# Company projects\n\n${projectsBody}`);
   }
+  const hirePlaybook = parseObject(context.combyneHirePlaybook);
+  const hireBody = asString(hirePlaybook.body, "").trim();
+  if (hireBody.length > 0) {
+    preambleSegments.push(hireBody);
+  }
   const prompt =
     preambleSegments.length > 0
       ? `${preambleSegments.join("\n\n---\n\n")}\n\n---\n\n${renderedPrompt}`
