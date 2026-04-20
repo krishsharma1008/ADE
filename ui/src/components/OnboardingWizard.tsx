@@ -219,6 +219,15 @@ export function OnboardingWizard() {
     return cliTypes.every((t) => adapterAvailability[t]?.available === false);
   }, [adapterAvailability]);
 
+  // Block step 2 Next when the selected adapter depends on a CLI that
+  // isn't installed. Without this gate, Chris's "new users end up with
+  // a non-functional agent" footgun is still open — onboarding completes
+  // but every heartbeat run fails with adapter_cli_missing.
+  const selectedAdapterProbe = adapterAvailability?.[adapterType] ?? null;
+  const selectedAdapterMissing = Boolean(
+    selectedAdapterProbe?.requiresCli && selectedAdapterProbe?.available === false,
+  );
+
   const {
     data: adapterModels,
     error: adapterModelsError,
@@ -1288,7 +1297,15 @@ export function OnboardingWizard() {
                     <Button
                       size="sm"
                       disabled={
-                        !agentName.trim() || loading || adapterEnvLoading
+                        !agentName.trim() ||
+                        loading ||
+                        adapterEnvLoading ||
+                        selectedAdapterMissing
+                      }
+                      title={
+                        selectedAdapterMissing && selectedAdapterProbe
+                          ? `Install the ${selectedAdapterProbe.binary} CLI first: ${selectedAdapterProbe.installHint}`
+                          : undefined
                       }
                       onClick={handleStep2Next}
                     >
@@ -1297,7 +1314,11 @@ export function OnboardingWizard() {
                       ) : (
                         <ArrowRight className="h-3.5 w-3.5 mr-1" />
                       )}
-                      {loading ? "Creating..." : "Next"}
+                      {loading
+                        ? "Creating..."
+                        : selectedAdapterMissing
+                          ? "Install CLI first"
+                          : "Next"}
                     </Button>
                   )}
                   {step === 3 && (

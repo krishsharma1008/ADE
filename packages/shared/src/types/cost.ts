@@ -34,3 +34,40 @@ export interface CostByAgent {
   subscriptionInputTokens: number;
   subscriptionOutputTokens: number;
 }
+
+export interface CostByProviderModel {
+  provider: string;
+  model: string;
+  billingType: string;
+  /** Second-level billing attribution (e.g. "anthropic", "google") when the
+   *  provider routes through a middleware layer. Optional. */
+  biller?: string;
+  costCents: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  apiRunCount: number;
+  subscriptionRunCount: number;
+  subscriptionInputTokens: number;
+  subscriptionOutputTokens: number;
+}
+
+export interface CostByBiller {
+  biller: string;
+  costCents: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  apiRunCount: number;
+  subscriptionRunCount: number;
+  providerCount: number;
+  modelCount: number;
+}
+
+export interface CostWindowSpendRow {
+  provider: string;
+  window: string;
+  costCents: number;
+  inputTokens: number;
+  outputTokens: number;
+}

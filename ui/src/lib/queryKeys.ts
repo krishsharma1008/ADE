@@ -32,6 +32,9 @@ export const queryKeys = {
     approvals: (issueId: string) => ["issues", "approvals", issueId] as const,
     liveRuns: (issueId: string) => ["issues", "live-runs", issueId] as const,
     activeRun: (issueId: string) => ["issues", "active-run", issueId] as const,
+    documents: (issueId: string) => ["issues", "documents", issueId] as const,
+    documentRevisions: (issueId: string, documentId: string) =>
+      ["issues", "documents", issueId, documentId, "revisions"] as const,
   },
   projects: {
     list: (companyId: string) => ["projects", companyId] as const,
@@ -85,8 +88,21 @@ export const queryKeys = {
       ["routines", "activity", companyId, routineId] as const,
   },
   executionWorkspaces: {
-    list: (companyId: string, filter?: { projectId?: string }) =>
-      ["execution-workspaces", companyId, filter?.projectId] as const,
+    list: (
+      companyId: string,
+      filter?: {
+        projectId?: string;
+        projectWorkspaceId?: string;
+        reuseEligible?: boolean;
+      },
+    ) =>
+      [
+        "execution-workspaces",
+        companyId,
+        filter?.projectId,
+        filter?.projectWorkspaceId,
+        filter?.reuseEligible ?? false,
+      ] as const,
     detail: (id: string) => ["execution-workspaces", "detail", id] as const,
     closeReadiness: (id: string) => ["execution-workspaces", "close-readiness", id] as const,
     workspaceOperations: (id: string) =>

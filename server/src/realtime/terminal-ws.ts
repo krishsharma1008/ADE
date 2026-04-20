@@ -18,6 +18,7 @@ import {
   resizeSession,
   startTerminalSessionReaper,
   toSessionInfo,
+  touchSessionKeepAlive,
   writeStdin,
   type TerminalMode,
 } from "../services/terminal-sessions.js";
@@ -216,7 +217,7 @@ async function authorizeUpgrade(
 }
 
 interface ClientControlMessage {
-  type: "start" | "resize" | "input" | "close";
+  type: "start" | "resize" | "input" | "close" | "keep_alive";
   mode?: TerminalMode;
   cols?: number;
   rows?: number;
@@ -332,6 +333,19 @@ export function setupTerminalWebSocketServer(
       if (control.type === "close" && session) {
         void closeSession(db, session, "client requested");
         socket.close();
+        return;
+      }
+      // "Keep session alive" button from the UI — resets the idle clock
+      // without sending anything to the PTY, so passive watchers can
+      // extend the timeout explicitly. Server acks with the updated
+      // session info so the UI can re-render the countdown.
+      if (control.type === "keep_alive" && session) {
+        touchSessionKeepAlive(session);
+        try {
+          socket.send(JSON.stringify({ type: "keep_alive_ack", session: toSessionInfo(session) }));
+        } catch {
+          /* ignore */
+        }
         return;
       }
     });

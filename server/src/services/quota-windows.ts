@@ -24,7 +24,15 @@ export async function fetchAllQuotaWindows(): Promise<ProviderQuotaResult[]> {
   const adapters = listServerAdapters().filter((a) => a.getQuotaWindows != null);
 
   const settled = await Promise.allSettled(
-    adapters.map((adapter) => withQuotaTimeout(adapter.type, adapter.getQuotaWindows!())),
+    adapters.map((adapter) =>
+      // The adapter-utils type is ProviderQuotaResultLike (decoupled to avoid
+      // a circular import); every adapter that actually implements this hook
+      // conforms to the richer ProviderQuotaResult shape from @combyne/shared.
+      withQuotaTimeout(
+        adapter.type,
+        adapter.getQuotaWindows!() as unknown as Promise<ProviderQuotaResult>,
+      ),
+    ),
   );
 
   return settled.map((result, i) => {

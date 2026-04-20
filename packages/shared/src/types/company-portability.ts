@@ -1,9 +1,9 @@
 export interface CompanyPortabilityInclude {
   company: boolean;
   agents: boolean;
-  projects: boolean;
-  issues: boolean;
-  skills: boolean;
+  projects?: boolean;
+  issues?: boolean;
+  skills?: boolean;
 }
 
 export interface CompanyPortabilityEnvInput {
@@ -14,6 +14,12 @@ export interface CompanyPortabilityEnvInput {
   requirement: "required" | "optional";
   defaultValue: string | null;
   portability: "portable" | "system_dependent";
+  /**
+   * Human-readable hint about which external system the secret comes from
+   * (e.g. "Anthropic Console", "Jira API token"). Optional — emitted by the
+   * exporter when it knows.
+   */
+  providerHint?: string | null;
 }
 
 export type CompanyPortabilityFileEntry =
@@ -29,7 +35,7 @@ export interface CompanyPortabilityCompanyManifestEntry {
   name: string;
   description: string | null;
   brandColor: string | null;
-  logoPath: string | null;
+  logoPath?: string | null;
   requireBoardApprovalForNewAgents: boolean;
 }
 
@@ -108,7 +114,7 @@ export interface CompanyPortabilityAgentManifestEntry {
   slug: string;
   name: string;
   path: string;
-  skills: string[];
+  skills?: string[];
   role: string;
   title: string | null;
   icon: string | null;
@@ -155,14 +161,20 @@ export interface CompanyPortabilityManifest {
   projects: CompanyPortabilityProjectManifestEntry[];
   issues: CompanyPortabilityIssueManifestEntry[];
   envInputs: CompanyPortabilityEnvInput[];
+  /**
+   * Optional hints about secrets the importing instance must supply for the
+   * bundle to run end-to-end. Emitted by the exporter, consumed by the
+   * preview/import UI.
+   */
+  requiredSecrets?: CompanyPortabilityEnvInput[];
 }
 
 export interface CompanyPortabilityExportResult {
-  rootPath: string;
+  rootPath?: string;
   manifest: CompanyPortabilityManifest;
   files: Record<string, CompanyPortabilityFileEntry>;
   warnings: string[];
-  combyneExtensionPath: string;
+  combyneExtensionPath?: string;
 }
 
 export interface CompanyPortabilityExportPreviewFile {
@@ -171,7 +183,7 @@ export interface CompanyPortabilityExportPreviewFile {
 }
 
 export interface CompanyPortabilityExportPreviewResult {
-  rootPath: string;
+  rootPath?: string;
   manifest: CompanyPortabilityManifest;
   files: Record<string, CompanyPortabilityFileEntry>;
   fileInventory: CompanyPortabilityExportPreviewFile[];
@@ -183,7 +195,7 @@ export interface CompanyPortabilityExportPreviewResult {
     issues: number;
   };
   warnings: string[];
-  combyneExtensionPath: string;
+  combyneExtensionPath?: string;
 }
 
 export type CompanyPortabilitySource =
@@ -191,9 +203,14 @@ export type CompanyPortabilitySource =
       type: "inline";
       rootPath?: string | null;
       files: Record<string, CompanyPortabilityFileEntry>;
+      manifest?: CompanyPortabilityManifest;
     }
   | {
       type: "github";
+      url: string;
+    }
+  | {
+      type: "url";
       url: string;
     };
 
@@ -261,6 +278,7 @@ export interface CompanyPortabilityPreviewResult {
   envInputs: CompanyPortabilityEnvInput[];
   warnings: string[];
   errors: string[];
+  requiredSecrets?: CompanyPortabilityEnvInput[];
 }
 
 export interface CompanyPortabilityAdapterOverride {
@@ -285,15 +303,16 @@ export interface CompanyPortabilityImportResult {
     name: string;
     reason: string | null;
   }[];
-  projects: {
+  projects?: {
     slug: string;
     id: string | null;
     action: "created" | "updated" | "skipped";
     name: string;
     reason: string | null;
   }[];
-  envInputs: CompanyPortabilityEnvInput[];
+  envInputs?: CompanyPortabilityEnvInput[];
   warnings: string[];
+  requiredSecrets?: CompanyPortabilityEnvInput[];
 }
 
 export interface CompanyPortabilityExportRequest {

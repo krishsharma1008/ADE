@@ -14,10 +14,11 @@ export const portabilityEnvInputSchema = z.object({
   key: z.string().min(1),
   description: z.string().nullable(),
   agentSlug: z.string().min(1).nullable(),
-  kind: z.enum(["secret", "plain"]),
-  requirement: z.enum(["required", "optional"]),
-  defaultValue: z.string().nullable(),
-  portability: z.enum(["portable", "system_dependent"]),
+  kind: z.enum(["secret", "plain"]).default("secret"),
+  requirement: z.enum(["required", "optional"]).default("required"),
+  defaultValue: z.string().nullable().default(null),
+  portability: z.enum(["portable", "system_dependent"]).default("portable"),
+  providerHint: z.string().nullable().optional(),
 });
 
 export const portabilityFileEntrySchema = z.union([
@@ -166,6 +167,7 @@ export const portabilityManifestSchema = z.object({
   projects: z.array(portabilityProjectManifestEntrySchema).default([]),
   issues: z.array(portabilityIssueManifestEntrySchema).default([]),
   envInputs: z.array(portabilityEnvInputSchema).default([]),
+  requiredSecrets: z.array(portabilityEnvInputSchema).optional(),
 });
 
 export const portabilitySourceSchema = z.discriminatedUnion("type", [
@@ -173,9 +175,16 @@ export const portabilitySourceSchema = z.discriminatedUnion("type", [
     type: z.literal("inline"),
     rootPath: z.string().min(1).optional().nullable(),
     files: z.record(portabilityFileEntrySchema),
+    // Optional pre-parsed manifest, supplied by the export→preview round-trip
+    // so the UI doesn't have to re-parse from files every keystroke.
+    manifest: z.record(z.unknown()).optional(),
   }),
   z.object({
     type: z.literal("github"),
+    url: z.string().url(),
+  }),
+  z.object({
+    type: z.literal("url"),
     url: z.string().url(),
   }),
 ]);

@@ -273,7 +273,7 @@ export function ProviderQuotaCard({
                           {row.model}
                         </span>
                         <span className="text-[11px] text-muted-foreground truncate block">
-                          {providerDisplayName(row.biller)} · {billingTypeDisplayName(row.billingType)}
+                          {providerDisplayName(row.biller ?? row.provider)} · {billingTypeDisplayName(row.billingType)}
                         </span>
                       </div>
                       <div className="flex items-center gap-3 shrink-0 tabular-nums text-xs">
@@ -322,9 +322,17 @@ export function ProviderQuotaCard({
               {quotaLoading ? (
                 <QuotaPanelSkeleton />
               ) : isClaudeQuotaPanel ? (
-                <ClaudeSubscriptionPanel windows={quotaWindows} source={quotaSource} error={quotaError} />
+                <ClaudeSubscriptionPanel
+                  quotaWindows={quotaWindows}
+                  quotaSource={quotaSource}
+                  quotaError={quotaError}
+                />
               ) : isCodexQuotaPanel ? (
-                <CodexSubscriptionPanel windows={quotaWindows} source={quotaSource} error={quotaError} />
+                <CodexSubscriptionPanel
+                  quotaWindows={quotaWindows}
+                  quotaSource={quotaSource}
+                  quotaError={quotaError}
+                />
               ) : (
                 <>
                   {quotaError ? (

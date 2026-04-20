@@ -63,7 +63,7 @@ export interface RuntimeServiceRef {
   issueId: string | null;
   serviceName: string;
   status: "starting" | "running" | "stopped" | "failed";
-  lifecycle: "shared" | "ephemeral";
+  lifecycle: "shared" | "ephemeral" | "persistent";
   scopeType: "project_workspace" | "execution_workspace" | "run" | "agent";
   scopeId: string | null;
   reuseKey: string | null;
@@ -71,6 +71,9 @@ export interface RuntimeServiceRef {
   cwd: string | null;
   port: number | null;
   url: string | null;
+  // "adapter_managed" is reported by AdapterRuntimeServiceReport when an
+  // adapter's own runtime is what's being tracked; "local_process" is the
+  // local-service-supervisor path.
   provider: "local_process" | "adapter_managed";
   providerRef: string | null;
   ownerAgentId: string | null;
@@ -82,6 +85,7 @@ export interface RuntimeServiceRef {
   healthStatus: "unknown" | "healthy" | "unhealthy";
   reused: boolean;
 }
+
 
 interface RuntimeServiceRecord extends RuntimeServiceRef {
   db?: Db;

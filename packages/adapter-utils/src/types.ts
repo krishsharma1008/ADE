@@ -48,10 +48,21 @@ export interface AdapterExecutionResult {
   sessionDisplayId?: string | null;
   provider?: string | null;
   model?: string | null;
+  /**
+   * Optional second-level billing attribution (e.g. `"google"` for gemini via
+   * Google's API). Parallel to `provider`; heartbeat-level accounting
+   * collapses both into `cost_events.provider`.
+   */
+  biller?: string | null;
   billingType?: AdapterBillingType | null;
   costUsd?: number | null;
   resultJson?: Record<string, unknown> | null;
   summary?: string | null;
+  /**
+   * Optional prompt-side adapter question surfaced to the UI. Either a plain
+   * string or a structured ask-user payload with choices — the UI handles
+   * both variants.
+   */
   question?:
     | string
     | {
@@ -60,7 +71,6 @@ export interface AdapterExecutionResult {
       }
     | null;
   clearSession?: boolean;
-  biller?: string | null;
 }
 
 export interface AdapterSessionCodec {
@@ -77,7 +87,12 @@ export interface AdapterInvocationMeta {
   commandNotes?: string[];
   env?: Record<string, string>;
   prompt?: string;
-  promptMetrics?: Record<string, number>;
+  /**
+   * Pre-send metrics derived from the assembled prompt (token estimate,
+   * byte count, etc.). Optional — adapters can omit this and Combyne falls
+   * back to heuristics.
+   */
+  promptMetrics?: Record<string, unknown>;
   context?: Record<string, unknown>;
 }
 
@@ -89,6 +104,11 @@ export interface AdapterExecutionContext {
   context: Record<string, unknown>;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
+  /**
+   * Optional lifecycle hook invoked with the PID as soon as the child
+   * process is spawned. Adapters use it to register the process for
+   * orphan-reaping; no-ops when the adapter doesn't spawn a child.
+   */
   onSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
   authToken?: string;
 }
@@ -167,6 +187,59 @@ export interface ServerAdapterModule {
     payload: HireApprovedPayload,
     adapterConfig: Record<string, unknown>,
   ) => Promise<HireApprovedHookResult>;
+  /**
+   * Optional skill-discovery hook. Adapters that manage per-agent skills
+   * (claude-local, codex-local) expose this so `company-skills` can report
+   * desired vs installed state without every caller reaching into adapter
+   * internals.
+   */
+  listSkills?: (ctx: AdapterSkillContext) => Promise<AdapterSkillSnapshot>;
+  /**
+   * Optional provider-quota hook. Adapters that can self-report upstream
+   * subscription windows (claude-local, codex-local) implement this so
+   * `fetchAllQuotaWindows` can aggregate across every registered adapter.
+   */
+  getQuotaWindows?: () => Promise<import("./types.js").ProviderQuotaResultLike>;
+}
+
+/**
+ * Shape expected by `server/src/services/quota-windows.ts`. Kept as a type
+ * alias to avoid a circular import with `@combyne/shared.ProviderQuotaResult`.
+ */
+export interface ProviderQuotaResultLike {
+  provider: string;
+  ok: boolean;
+  error?: string | null;
+  windows: unknown[];
+  source?: string | null;
+  fetchedAt?: string;
+}
+
+/**
+ * Report emitted by an adapter's execute() summarizing a runtime-service
+ * side-effect (spawned dev server, etc). Consumed by
+ * `server/src/services/workspace-runtime.ts` to mirror adapter-managed
+ * services into `workspace_runtime_services`.
+ */
+export interface AdapterRuntimeServiceReport {
+  id?: string | null;
+  serviceName?: string | null;
+  status?: "starting" | "running" | "stopped" | "failed" | null;
+  lifecycle?: "ephemeral" | "persistent" | "shared" | null;
+  healthStatus?: "healthy" | "unhealthy" | "unknown" | null;
+  scopeType?: "project_workspace" | "execution_workspace" | "run" | "agent" | null;
+  scopeId?: string | null;
+  reuseKey?: string | null;
+  providerRef?: string | null;
+  command?: string | null;
+  cwd?: string | null;
+  port?: number | null;
+  url?: string | null;
+  projectId?: string | null;
+  projectWorkspaceId?: string | null;
+  issueId?: string | null;
+  ownerAgentId?: string | null;
+  stopPolicy?: Record<string, unknown> | null;
 }
 
 // ---------------------------------------------------------------------------

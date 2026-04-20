@@ -17,12 +17,26 @@ export interface ProjectWorkspace {
   isPrimary: boolean;
   createdAt: Date;
   updatedAt: Date;
+  // Optional provisioning/runtime metadata populated by the workspace-runtime
+  // service. Absent on bare-bones workspaces.
+  sourceType?: string | null;
+  visibility?: string | null;
+  defaultRef?: string | null;
+  setupCommand?: string | null;
+  cleanupCommand?: string | null;
+  remoteProvider?: string | null;
+  remoteWorkspaceRef?: string | null;
+  sharedWorkspaceKey?: string | null;
+  runtimeConfig?: Record<string, unknown> | null;
+  runtimeServices?: Array<Record<string, unknown>> | null;
 }
 
 export interface Project {
   id: string;
   companyId: string;
   urlKey: string;
+  /** URL-safe stable identifier. Alias for urlKey on the read APIs. */
+  slug?: string;
   /** @deprecated Use goalIds / goals instead */
   goalId: string | null;
   goalIds: string[];

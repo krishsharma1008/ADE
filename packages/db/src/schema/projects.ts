@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, date, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, date, jsonb, index } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { goals } from "./goals.js";
 import { agents } from "./agents.js";
@@ -16,6 +16,10 @@ export const projects = pgTable(
     targetDate: date("target_date"),
     color: text("color"),
     archivedAt: timestamp("archived_at", { withTimezone: true }),
+    pauseReason: text("pause_reason"),
+    pausedAt: timestamp("paused_at", { withTimezone: true }),
+    executionWorkspacePolicy: jsonb("execution_workspace_policy").$type<Record<string, unknown>>(),
+    codebase: jsonb("codebase").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

@@ -16,6 +16,7 @@ export interface AppendTranscriptInput {
   agentId: string;
   runId?: string | null;
   issueId?: string | null;
+  terminalSessionId?: string | null;
   seq: number;
   role: TranscriptRole;
   contentKind?: string | null;
@@ -28,6 +29,7 @@ export async function appendTranscriptEntry(db: Db, input: AppendTranscriptInput
     agentId: input.agentId,
     runId: input.runId ?? null,
     issueId: input.issueId ?? null,
+    terminalSessionId: input.terminalSessionId ?? null,
     seq: input.seq,
     role: input.role,
     contentKind: input.contentKind ?? null,
@@ -63,5 +65,13 @@ export async function loadRunTranscript(db: Db, runId: string) {
     .select()
     .from(agentTranscripts)
     .where(eq(agentTranscripts.runId, runId))
+    .orderBy(asc(agentTranscripts.seq));
+}
+
+export async function loadTerminalSessionTranscript(db: Db, terminalSessionId: string) {
+  return db
+    .select()
+    .from(agentTranscripts)
+    .where(eq(agentTranscripts.terminalSessionId, terminalSessionId))
     .orderBy(asc(agentTranscripts.seq));
 }
