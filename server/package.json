@@ -43,6 +43,7 @@
     "@combyne/adapter-opencode-local": "workspace:*",
     "@combyne/adapter-pi-local": "workspace:*",
     "@combyne/adapter-utils": "workspace:*",
+    "@combyne/context-budget": "workspace:*",
     "@combyne/db": "workspace:*",
     "@combyne/plugin-sdk": "workspace:*",
     "@combyne/shared": "workspace:*",
