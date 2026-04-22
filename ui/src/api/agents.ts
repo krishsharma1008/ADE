@@ -144,4 +144,46 @@ export const agentsApi = {
   ) => api.post<HeartbeatRun | { status: "skipped" }>(agentPath(id, companyId, "/wakeup"), data),
   loginWithClaude: (id: string, companyId?: string) =>
     api.post<ClaudeLoginResult>(agentPath(id, companyId, "/claude-login"), {}),
+  contextBudget: (id: string, companyId?: string, limit = 20) =>
+    api.get<AgentContextBudgetRun[]>(
+      agentPath(id, companyId, `/context-budget?limit=${limit}`),
+    ),
+  summaries: (id: string, companyId?: string, limit = 20) =>
+    api.get<AgentSummaryRow[]>(agentPath(id, companyId, `/summaries?limit=${limit}`)),
 };
+
+export interface AgentContextBudgetRun {
+  id: string;
+  status: string;
+  invocationSource: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  createdAt: string;
+  issueId: string | null;
+  promptBudgetJson: {
+    estimatedInputTokens?: number;
+    actualInputTokens?: number | null;
+    tokenizerFamily?: string;
+    calibrationRatio?: number | null;
+    composer?: {
+      totalTokens: number;
+      dropped: string[];
+      cachePrefixHash?: string;
+      sections?: Array<{ name: string; tokens: number; truncated?: boolean }>;
+    };
+    cacheHit?: boolean;
+  } | null;
+}
+
+export interface AgentSummaryRow {
+  id: string;
+  scopeKind: "standing" | "working";
+  scopeId: string | null;
+  cutoffSeq: number;
+  sourceInputTokens: number | null;
+  sourceTurnCount: number | null;
+  summarizerModel: string;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  createdAt: string;
+}

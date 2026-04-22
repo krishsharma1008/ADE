@@ -12,6 +12,7 @@ import type {
   CompanySkillUpdateStatus,
 } from "@combyne/shared";
 import { companySkillsApi } from "../api/companySkills";
+import { SkillScopeEditor } from "../components/SkillScopeEditor";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useToast } from "../context/ToastContext";
@@ -1163,6 +1164,9 @@ export function CompanySkills() {
             onSave={() => saveFile.mutate()}
             savePending={saveFile.isPending}
           />
+          {selectedCompanyId && selectedSkillId && activeDetail && (
+            <SkillScopeEditor companyId={selectedCompanyId} skillId={selectedSkillId} />
+          )}
         </div>
       </div>
     </>

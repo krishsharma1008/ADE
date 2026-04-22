@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
-import { companySkills } from "@combyne/db";
+import { companySkills, skillAgents, skillProjects } from "@combyne/db";
 import { readCombyneSkillSyncPreference, writeCombyneSkillSyncPreference } from "@combyne/adapter-utils/server-utils";
 import type { CombyneSkillEntry } from "@combyne/adapter-utils/server-utils";
 import type {
@@ -97,6 +97,12 @@ export type ProjectSkillScanTarget = {
 
 type RuntimeSkillEntryOptions = {
   materializeMissing?: boolean;
+  // Round 3 Phase 10 — when provided, only surface skills that are
+  // globally scoped OR scoped to this agent OR scoped to one of the
+  // provided projects. Omit both to preserve pre-scoping behaviour
+  // (every skill in the company shows up).
+  agentId?: string | null;
+  projectIds?: string[] | null;
 };
 
 const skillInventoryRefreshPromises = new Map<string, Promise<void>>();
@@ -1524,14 +1530,115 @@ export function companySkillService(db: Db) {
     });
   }
 
-  async function listFull(companyId: string): Promise<CompanySkill[]> {
+  async function listFull(
+    companyId: string,
+    scope?: { agentId?: string | null; projectIds?: string[] | null },
+  ): Promise<CompanySkill[]> {
     await ensureSkillInventoryCurrent(companyId);
     const rows = await db
       .select()
       .from(companySkills)
       .where(eq(companySkills.companyId, companyId))
       .orderBy(asc(companySkills.name), asc(companySkills.key));
-    return rows.map((row) => toCompanySkill(row));
+    const all = rows.map((row) => toCompanySkill(row));
+    const hasScopeInput =
+      (scope?.agentId != null && scope.agentId !== "") ||
+      (scope?.projectIds != null && scope.projectIds.length > 0);
+    if (!hasScopeInput) return all;
+
+    // Round 3 Phase 10 — scope filter.
+    // Empty join-table rows = "globally scoped, visible to everyone"
+    // (backward compat). When rows exist, the skill is only visible to
+    // the union of matched agents/projects.
+    const skillIds = all.map((s) => s.id);
+    if (skillIds.length === 0) return all;
+
+    const [projectScopes, agentScopes] = await Promise.all([
+      db
+        .select()
+        .from(skillProjects)
+        .where(inArray(skillProjects.skillId, skillIds)),
+      db
+        .select()
+        .from(skillAgents)
+        .where(inArray(skillAgents.skillId, skillIds)),
+    ]);
+
+    const projectsBySkill = new Map<string, Set<string>>();
+    for (const row of projectScopes) {
+      let set = projectsBySkill.get(row.skillId);
+      if (!set) {
+        set = new Set<string>();
+        projectsBySkill.set(row.skillId, set);
+      }
+      set.add(row.projectId);
+    }
+    const agentsBySkill = new Map<string, Set<string>>();
+    for (const row of agentScopes) {
+      let set = agentsBySkill.get(row.skillId);
+      if (!set) {
+        set = new Set<string>();
+        agentsBySkill.set(row.skillId, set);
+      }
+      set.add(row.agentId);
+    }
+
+    const scopeAgentId = scope?.agentId ?? null;
+    const scopeProjectIds = new Set(scope?.projectIds ?? []);
+
+    return all.filter((skill) => {
+      const skillProjectScopes = projectsBySkill.get(skill.id);
+      const skillAgentScopes = agentsBySkill.get(skill.id);
+      const isGloballyScoped = !skillProjectScopes && !skillAgentScopes;
+      if (isGloballyScoped) return true;
+      if (scopeAgentId && skillAgentScopes?.has(scopeAgentId)) return true;
+      if (skillProjectScopes) {
+        for (const projectId of scopeProjectIds) {
+          if (skillProjectScopes.has(projectId)) return true;
+        }
+      }
+      return false;
+    });
+  }
+
+  async function listScopes(
+    skillId: string,
+  ): Promise<{ projectIds: string[]; agentIds: string[] }> {
+    const [projectRows, agentRows] = await Promise.all([
+      db.select().from(skillProjects).where(eq(skillProjects.skillId, skillId)),
+      db.select().from(skillAgents).where(eq(skillAgents.skillId, skillId)),
+    ]);
+    return {
+      projectIds: projectRows.map((r) => r.projectId),
+      agentIds: agentRows.map((r) => r.agentId),
+    };
+  }
+
+  async function setScopes(
+    skillId: string,
+    scopes: { projectIds?: string[]; agentIds?: string[] },
+  ): Promise<{ projectIds: string[]; agentIds: string[] }> {
+    await db.transaction(async (tx) => {
+      if (scopes.projectIds !== undefined) {
+        await tx.delete(skillProjects).where(eq(skillProjects.skillId, skillId));
+        if (scopes.projectIds.length > 0) {
+          await tx
+            .insert(skillProjects)
+            .values(scopes.projectIds.map((projectId) => ({ skillId, projectId })))
+            .onConflictDoNothing();
+        }
+      }
+      if (scopes.agentIds !== undefined) {
+        await tx.delete(skillAgents).where(eq(skillAgents.skillId, skillId));
+        if (scopes.agentIds.length > 0) {
+          await tx
+            .insert(skillAgents)
+            .values(scopes.agentIds.map((agentId) => ({ skillId, agentId })))
+            .onConflictDoNothing();
+        }
+      }
+    });
+    return listScopes(skillId);
   }
 
   async function getById(id: string) {
@@ -2041,7 +2148,10 @@ export function companySkillService(db: Db) {
     companyId: string,
     options: RuntimeSkillEntryOptions = {},
   ): Promise<CombyneSkillEntry[]> {
-    const skills = await listFull(companyId);
+    const skills = await listFull(companyId, {
+      agentId: options.agentId ?? null,
+      projectIds: options.projectIds ?? null,
+    });
 
     const out: CombyneSkillEntry[] = [];
     for (const skill of skills) {
@@ -2351,5 +2461,7 @@ export function companySkillService(db: Db) {
     importPackageFiles,
     installUpdate,
     listRuntimeSkillEntries,
+    listScopes,
+    setScopes,
   };
 }

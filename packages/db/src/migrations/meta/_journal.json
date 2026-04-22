@@ -246,6 +246,41 @@
       "when": 1776369745100,
       "tag": "0034_pause_and_workspace_columns",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1776369745300,
+      "tag": "0035_skill_scoping",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1776369745500,
+      "tag": "0036_project_issue_cascade",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1776369745700,
+      "tag": "0037_context_budget_and_summaries",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1776369745900,
+      "tag": "0038_routine_autoclose",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1776369746100,
+      "tag": "0039_summarizer_ordinal_and_failures",
+      "breakpoints": true
     }
   ]
 }

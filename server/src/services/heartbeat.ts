@@ -21,10 +21,40 @@ import { loadRecentMemory, summarizeRunAndPersist } from "./agent-memory.js";
 import { getPendingHandoffBrief, markHandoffConsumed } from "./agent-handoff.js";
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
 import { loadAssignedIssueQueue } from "./agent-queue.js";
+import {
+  composeAndApplyBudget,
+  contextBudgetComposerEnabled,
+  estimatePromptBudget,
+  runShadowComposer,
+  resolveContextBudgetTokens,
+  persistRunBudget,
+  recordCalibrationSample,
+  shouldAlertDivergence,
+  resolvePruningMode,
+  snapshotCalibrationRatio,
+  summarizeComposed,
+  trackCachePrefixHit,
+  type BudgetSnapshot,
+  type BudgetSnapshotComposer,
+} from "./context-budget-telemetry.js";
+import { resolveModel } from "@combyne/context-budget";
 import { inspectGitStateForIssue } from "./git-state.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
 import { extractAndPostQuestions } from "./agent-question-extract.js";
 import { loadCompanyProjectOverview } from "./agent-company-context.js";
+import {
+  loadLatestSummary,
+  DEFAULT_MIN_TRIGGER_TOKENS_STANDING,
+  DEFAULT_MIN_TRIGGER_TOKENS_WORKING,
+  type SummaryScope,
+} from "./transcript-summarizer.js";
+import { getSummarizerQueue } from "./summarizer-queue.js";
+import { isQuarantined } from "./summarizer-failures.js";
+import {
+  renderRecentTurns,
+  unsummarizedTokensFor,
+  RECENT_TURNS_MAX_TOKENS,
+} from "./summarizer-triggers.js";
 import {
   agentCanHire,
   buildHirePlaybook,
@@ -34,7 +64,7 @@ import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec } from "../adapters/index.js";
 import { createLocalAgentJwt, ensureLocalAgentJwtSecretAtRuntime } from "../agent-auth-jwt.js";
-import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import { parseObject, asBoolean, asNumber, asString, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 
@@ -966,8 +996,13 @@ export function heartbeatService(db: Db) {
     }
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; hardCapMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    // Round 3 Phase 8 — wall-clock hard cap. A run that started >hardCapMs ago
+    // is reaped regardless of updatedAt freshness. Catches the failure mode
+    // where a stuck child process keeps writing events but the top-level work
+    // never completes. Default 60 min, matches the Round 3 plan.
+    const hardCapMs = opts?.hardCapMs ?? 60 * 60 * 1000;
     const now = new Date();
 
     // Find all runs in "queued" or "running" state
@@ -981,20 +1016,41 @@ export function heartbeatService(db: Db) {
     for (const run of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
 
-      // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
+      // Hard-cap short-circuit: if the run started long enough ago, reap it
+      // regardless of updatedAt. Uses startedAt when present, falls back to
+      // createdAt so queued-but-never-started runs can also be swept.
+      let hardCapHit = false;
+      const startRef = run.startedAt ?? run.createdAt ?? null;
+      if (startRef && hardCapMs > 0) {
+        const ageMs = now.getTime() - new Date(startRef).getTime();
+        if (ageMs >= hardCapMs) {
+          hardCapHit = true;
+          logger.warn(
+            { runId: run.id, agentId: run.agentId, ageMs, hardCapMs },
+            "run.hard_cap_exceeded",
+          );
+        }
+      }
+
+      // Apply staleness threshold to avoid false positives, UNLESS the hard
+      // cap already fired — a hard-cap hit overrides the staleness check.
+      if (!hardCapHit && staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
       await setRunStatus(run.id, "failed", {
-        error: "Process lost -- server may have restarted",
-        errorCode: "process_lost",
+        error: hardCapHit
+          ? "Run exceeded wall-clock hard cap"
+          : "Process lost -- server may have restarted",
+        errorCode: hardCapHit ? "run_hard_cap_exceeded" : "process_lost",
         finishedAt: now,
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
-        error: "Process lost -- server may have restarted",
+        error: hardCapHit
+          ? "Run exceeded wall-clock hard cap"
+          : "Process lost -- server may have restarted",
       });
       const updatedRun = await getRun(run.id);
       if (updatedRun) {
@@ -1002,7 +1058,9 @@ export function heartbeatService(db: Db) {
           eventType: "lifecycle",
           stream: "system",
           level: "error",
-          message: "Process lost -- server may have restarted",
+          message: hardCapHit
+            ? "Run exceeded wall-clock hard cap"
+            : "Process lost -- server may have restarted",
         });
         await releaseIssueExecutionAndPromote(updatedRun);
       }
@@ -1016,6 +1074,128 @@ export function heartbeatService(db: Db) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
     return { reaped: reaped.length, runIds: reaped };
+  }
+
+  // Round 3 Phase 8 — issue-side reaper.
+  //
+  // Sweeps issues that still point at a heartbeat run via
+  // `execution_run_id` even though the referenced run is terminal
+  // (succeeded / failed / cancelled) or absent. The run-side reaper
+  // catches live orphans; this companion catches the lock-leak mode
+  // where the run transitioned cleanly but `releaseIssueExecutionAndPromote`
+  // failed to clear the issue row (transient DB error, deleted agent,
+  // etc.). Codex P0 respected: we only ever clear when the referenced
+  // run is terminal or missing — never on lock age alone.
+  async function reapOrphanedIssueLocks(opts?: { issueId?: string }) {
+    const reaped: Array<{ issueId: string; runId: string | null; runStatus: string | null }> = [];
+
+    const conditions = [sql`${issues.executionRunId} IS NOT NULL`];
+    if (opts?.issueId) {
+      conditions.push(eq(issues.id, opts.issueId));
+    }
+
+    const rows = await db
+      .select({
+        issueId: issues.id,
+        companyId: issues.companyId,
+        executionRunId: issues.executionRunId,
+        runStatus: heartbeatRuns.status,
+      })
+      .from(issues)
+      .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+      .where(and(...conditions));
+
+    for (const row of rows) {
+      // Only clear when the run is terminal or absent. Live runs
+      // ('queued' or 'running') are left alone — the run-side reaper
+      // owns them.
+      const runStatus = row.runStatus;
+      const isLive = runStatus === "queued" || runStatus === "running";
+      if (isLive) continue;
+
+      await db
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, row.issueId));
+
+      reaped.push({
+        issueId: row.issueId,
+        runId: row.executionRunId,
+        runStatus: runStatus ?? null,
+      });
+
+      logger.warn(
+        {
+          issueId: row.issueId,
+          runId: row.executionRunId,
+          runStatus: runStatus ?? null,
+        },
+        "issue.lock_reaped",
+      );
+    }
+
+    return { reaped: reaped.length, reapedIssues: reaped };
+  }
+
+  // Round 3 Phase 8 — operator-initiated force-unlock for a single issue.
+  // Used when an admin decides an issue is stuck and wants to recover it
+  // without waiting for the reaper. Returns the same shape as the bulk
+  // reaper so the caller can tell whether any work was actually done.
+  async function forceUnlockIssue(issueId: string, actor: { actorType: string; actorId: string | null }) {
+    const [issue] = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    if (!issue) throw notFound("Issue not found");
+    if (!issue.executionRunId) {
+      return { cleared: false, previousRunId: null, previousRunStatus: null };
+    }
+
+    // Look up the referenced run for audit purposes. We DO clear even if
+    // the run is still 'running' — this is an explicit operator override.
+    // The route layer is responsible for gating who can call this.
+    const [run] = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, issue.executionRunId));
+
+    await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(issues.id, issue.id));
+
+    logger.warn(
+      {
+        issueId: issue.id,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        previousRunId: issue.executionRunId,
+        previousRunStatus: run?.status ?? null,
+      },
+      "issue.force_unlocked",
+    );
+
+    return {
+      cleared: true,
+      previousRunId: issue.executionRunId,
+      previousRunStatus: run?.status ?? null,
+    };
   }
 
   async function updateRuntimeState(
@@ -1308,12 +1488,58 @@ export function heartbeatService(db: Db) {
     // visibility into the rest of the queue — which is exactly what Chris saw
     // as "no tasks to run" in the test pilot. Capped inside the service.
     try {
+      // Focus mode — defaults ON. When enabled the queue service emits a loud
+      // "## 🎯 Current focus" block + directive so the model stops bleeding
+      // attention across sibling issues (Round 3 item #2).
+      const adapterCfgRaw = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+      const focusMode = adapterCfgRaw.focusMode !== false;
+
+      // Pull a short description body for the focus-block preview. Bounded
+      // inside renderFocusSection; we only fetch when a focus issue exists.
+      let focusIssueBody: string | null = null;
+      if (memoryIssueId && focusMode) {
+        const focusRow = await db
+          .select({ description: issues.description })
+          .from(issues)
+          .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        focusIssueBody = focusRow?.description ?? null;
+      }
+
       const queue = await loadAssignedIssueQueue(db, {
         companyId: agent.companyId,
         agentId: agent.id,
         currentIssueId: memoryIssueId ?? null,
+        currentIssueBody: focusIssueBody,
+        focusMode,
       });
       context.combyneAssignedIssues = queue;
+
+      if (queue.focusBody && queue.directive) {
+        context.combyneFocusDirective = {
+          body: queue.focusBody,
+          directive: queue.directive,
+          issueId: memoryIssueId,
+        };
+      }
+
+      if (queue.currentIssueMissing) {
+        logger.warn(
+          { agentId: agent.id, runId, currentIssueId: memoryIssueId },
+          "agent_queue.current_issue_missing",
+        );
+      }
+      if (queue.focusItem) {
+        logger.debug(
+          {
+            agentId: agent.id,
+            runId,
+            issueId: queue.focusItem.id,
+            bodyChars: queue.focusBody.length,
+          },
+          "agent_queue.focus_section_rendered",
+        );
+      }
     } catch (err) {
       logger.debug({ err, agentId: agent.id, runId }, "failed to load assigned issue queue");
     }
@@ -1514,12 +1740,236 @@ export function heartbeatService(db: Db) {
         agent.companyId,
         mergedConfig,
       );
+
+      // Round 3 Phase 6 PR 6.3 — pre-run summary load.
+      //
+      // Reads the latest standing (cross-ticket) and working (per-issue)
+      // summary rows and attaches them as combyneStandingSummary /
+      // combyneWorkingSummary. Also populates combyneRecentTurns with the
+      // tail of un-summarized transcript so the agent sees its most recent
+      // thread without re-discovering state. All three become typed sections
+      // consumed by buildPreambleSectionsFromContext, so the composer owns
+      // truncation — we just pre-clip the recent-turns block to a rough cap.
+      const summarizerModelName = asString(
+        (resolvedConfig as Record<string, unknown>).model,
+        agent.adapterType,
+      );
+
+      // Round 3 Phase 6 PR 6.4 — snapshot the rolling-median calibration
+      // ratio ONCE at run start so every caller (composer, shadow composer,
+      // summarizer triggers, summarizer driver) applies the same correction.
+      // If we re-query per call, two tokenizer calls seconds apart might
+      // pick different ratios and bust the cache-prefix stability invariant.
+      const modelFamily = resolveModel(summarizerModelName).family;
+      const calibrationRatio = await snapshotCalibrationRatio(db, modelFamily);
+      const pruningMode = resolvePruningMode();
+
+      try {
+        const cfg = agent.adapterConfig as Record<string, unknown> | null;
+        const summarizerCfg = cfg && typeof cfg === "object"
+          ? ((cfg as Record<string, unknown>).summarizer as Record<string, unknown> | undefined)
+          : undefined;
+        const summarizerEnabled = summarizerCfg?.enabled !== false;
+        if (summarizerEnabled) {
+          const standingLatest = await loadLatestSummary(db, {
+            agentId: agent.id,
+            scopeKind: "standing",
+            scopeId: null,
+          });
+          if (standingLatest?.content) {
+            context.combyneStandingSummary = {
+              body: standingLatest.content,
+              summaryId: standingLatest.id,
+              cutoffOrdinal: Number(standingLatest.cutoffSeq),
+              createdAt: standingLatest.createdAt.toISOString(),
+            };
+          }
+
+          if (memoryIssueId) {
+            const workingLatest = await loadLatestSummary(db, {
+              agentId: agent.id,
+              scopeKind: "working",
+              scopeId: memoryIssueId,
+            });
+            if (workingLatest?.content) {
+              context.combyneWorkingSummary = {
+                body: workingLatest.content,
+                summaryId: workingLatest.id,
+                issueId: memoryIssueId,
+                cutoffOrdinal: Number(workingLatest.cutoffSeq),
+                createdAt: workingLatest.createdAt.toISOString(),
+              };
+            }
+          }
+
+          // Recent raw turns since the most relevant cutoff. Prefer the
+          // working cutoff when an issue is in focus (keeps the block
+          // ticket-scoped); fall back to the standing cutoff.
+          const scopeForRecent: SummaryScope = memoryIssueId ? "working" : "standing";
+          const recent = await unsummarizedTokensFor(db, {
+            companyId: agent.companyId,
+            agentId: agent.id,
+            scope: scopeForRecent,
+            issueId: memoryIssueId ?? null,
+            model: summarizerModelName,
+            calibrationRatio,
+            pruningMode,
+          });
+          if (recent.entries.length > 0) {
+            const rendered = renderRecentTurns(recent.entries, summarizerModelName, {
+              maxTokens: RECENT_TURNS_MAX_TOKENS,
+              calibrationRatio,
+            });
+            if (rendered.body) {
+              context.combyneRecentTurns = {
+                body: rendered.body,
+                tokens: rendered.tokens,
+                turnCount: rendered.turnCount,
+                sinceOrdinal: recent.cutoffOrdinal,
+                scope: scopeForRecent,
+              };
+            }
+          }
+        }
+      } catch (err) {
+        logger.debug(
+          { err, agentId: agent.id, runId },
+          "summarizer.preamble_load_failed",
+        );
+      }
+
+      // Round 3 Phase 5 — composer-enabled mode. Opt-in via
+      // COMBYNE_CONTEXT_BUDGET_ENABLED=1. When on, the composer runs
+      // BEFORE the adapter builds its prompt and writes per-section
+      // token-budgeted content back into the context.combyne* fields.
+      // The existing byte caps in agent-queue / memory / adapter-utils
+      // stay in place as a defence-in-depth lower bound.
+      const composerRef: {
+        summary: BudgetSnapshotComposer | null;
+        cacheHit: boolean | null;
+        previousCachePrefixHash: string | null;
+      } = { summary: null, cacheHit: null, previousCachePrefixHash: null };
+      if (contextBudgetComposerEnabled()) {
+        try {
+          const modelName = asString(
+            (resolvedConfig as Record<string, unknown>).model,
+            agent.adapterType,
+          );
+          const result = composeAndApplyBudget(context, {
+            adapterType: agent.adapterType,
+            adapterConfig: (agent.adapterConfig ?? {}) as Record<string, unknown>,
+            model: modelName,
+            calibrationRatio,
+          });
+          if (result) {
+            const cacheTrack = trackCachePrefixHit(agent.id, result.composed.cachePrefixHash);
+            composerRef.summary = summarizeComposed(result.composed, result.applied);
+            composerRef.cacheHit = cacheTrack.hit;
+            composerRef.previousCachePrefixHash = cacheTrack.previousHash;
+            logger.info(
+              {
+                runId: run.id,
+                agentId: agent.id,
+                applied: result.applied,
+                skippedReason: result.skippedReason,
+                totalTokens: result.composed.totalTokens,
+                stableTokens: result.composed.stableTokens,
+                varyTokens: result.composed.varyTokens,
+                dropped: result.composed.dropped,
+                truncated: result.composed.truncated,
+                warnings: result.composed.warnings,
+                cachePrefixHash: result.composed.cachePrefixHash.slice(0, 12),
+                calibrationRatio,
+                cacheHit: cacheTrack.hit,
+                previousCachePrefixHash: cacheTrack.previousHash?.slice(0, 12) ?? null,
+                pruningMode,
+              },
+              cacheTrack.hit ? "context_budget.cache_hit" : "context_budget.cache_miss",
+            );
+          }
+        } catch (err) {
+          logger.warn({ err, agentId: agent.id, runId }, "context_budget.fallback");
+        }
+      }
+
+      // Round 3 Phase 3 — prompt-budget snapshot captured on the FIRST
+      // adapter.invoke of the run. Telemetry-only for now: the composer
+      // phase will consume this to decide truncation.
+      const promptBudgetRef: { snapshot: BudgetSnapshot | null } = { snapshot: null };
+
       const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
         if (meta.env && secretKeys.size > 0) {
           for (const key of secretKeys) {
             if (key in meta.env) meta.env[key] = "***REDACTED***";
           }
         }
+
+        if (!promptBudgetRef.snapshot && typeof meta.prompt === "string" && meta.prompt.length > 0) {
+          const modelName = asString(
+            (resolvedConfig as Record<string, unknown>).model,
+            agent.adapterType,
+          );
+          const snapshot = estimatePromptBudget(meta.prompt, modelName, {
+            calibrationRatio,
+          });
+          if (composerRef.summary) {
+            snapshot.composer = composerRef.summary;
+          }
+          if (composerRef.cacheHit != null) {
+            snapshot.cacheHit = composerRef.cacheHit;
+            snapshot.previousCachePrefixHash = composerRef.previousCachePrefixHash;
+          }
+          snapshot.pruningMode = pruningMode;
+          promptBudgetRef.snapshot = snapshot;
+          await persistRunBudget(db, currentRun.id, snapshot);
+          logger.debug(
+            {
+              runId: currentRun.id,
+              agentId: agent.id,
+              estimatedInputTokens: snapshot.estimatedInputTokens,
+              family: snapshot.tokenizerFamily,
+              promptChars: snapshot.promptChars,
+            },
+            "context_budget.estimated",
+          );
+
+          // Phase 4 shadow composer — compose from the section context
+          // fields and compare against the adapter's actual prompt. No
+          // behavior change; logged for measurement only.
+          const shadow = runShadowComposer({
+            context,
+            adapterType: agent.adapterType,
+            adapterConfig: (agent.adapterConfig ?? {}) as Record<string, unknown>,
+            actualPrompt: meta.prompt,
+            model: modelName,
+            calibrationRatio,
+          });
+          if (shadow) {
+            logger.info(
+              {
+                runId: currentRun.id,
+                agentId: agent.id,
+                budget: resolveContextBudgetTokens(
+                  agent.adapterType,
+                  (agent.adapterConfig ?? {}) as Record<string, unknown>,
+                ),
+                composedTokens: shadow.composed.totalTokens,
+                stableTokens: shadow.composed.stableTokens,
+                varyTokens: shadow.composed.varyTokens,
+                actualPromptTokens: shadow.actualPromptTokens,
+                deltaPct: Number((shadow.deltaPct * 100).toFixed(1)),
+                bytesSaved: shadow.bytesSaved,
+                dropped: shadow.composed.dropped,
+                truncated: shadow.composed.truncated,
+                warnings: shadow.composed.warnings,
+                cachePrefixHash: shadow.composed.cachePrefixHash.slice(0, 12),
+                sectionUsage: shadow.composed.usage,
+              },
+              "context_budget.shadow_composition",
+            );
+          }
+        }
+
         await appendRunEvent(currentRun, seq++, {
           eventType: "adapter.invoke",
           stream: "system",
@@ -1640,6 +2090,36 @@ export function heartbeatService(db: Db) {
             } as Record<string, unknown>)
           : null;
 
+      // Round 3 Phase 3 — close the calibration loop. Compares our
+      // pre-run estimate with the adapter-reported actual usage.inputTokens
+      // so the composer phase can trust family-specific ratios.
+      try {
+        const actualInput = adapterResult.usage?.inputTokens ?? 0;
+        const snapshot = promptBudgetRef.snapshot;
+        if (snapshot && actualInput > 0) {
+          await recordCalibrationSample(db, {
+            runId: run.id,
+            family: snapshot.tokenizerFamily,
+            estimatedTokens: snapshot.estimatedInputTokens,
+            actualTokens: actualInput,
+          });
+          if (shouldAlertDivergence(snapshot.estimatedInputTokens, actualInput)) {
+            logger.warn(
+              {
+                runId: run.id,
+                agentId: agent.id,
+                estimated: snapshot.estimatedInputTokens,
+                actual: actualInput,
+                family: snapshot.tokenizerFamily,
+              },
+              "tokenizer.calibration_diverged",
+            );
+          }
+        }
+      } catch (err) {
+        logger.debug({ err, runId: run.id }, "context_budget.calibration_hook_failed");
+      }
+
       await setRunStatus(run.id, status, {
         finishedAt: new Date(),
         error:
@@ -1710,6 +2190,140 @@ export function heartbeatService(db: Db) {
           agentId: finalizedRun.agentId,
           issueId: resolveRunIssueId(finalizedRun),
         });
+
+        // Round 3 Phase 6 PR 6.3 — post-run summarizer enqueue.
+        //
+        // Fire-and-forget: the queue does its own coalescing, cooldown, and
+        // quarantine handling, so repeated enqueues within ~10 min are cheap
+        // no-ops. We skip only the clearly-useless cases here (disabled,
+        // missing driver, below trigger, already quarantined).
+        void (async () => {
+          const queue = getSummarizerQueue();
+          if (!queue) return;
+
+          const cfgRaw = agent.adapterConfig as Record<string, unknown> | null;
+          const summarizerCfg = cfgRaw && typeof cfgRaw === "object"
+            ? ((cfgRaw as Record<string, unknown>).summarizer as Record<string, unknown> | undefined)
+            : undefined;
+          if (summarizerCfg?.enabled === false) return;
+
+          const configuredModel =
+            typeof summarizerCfg?.model === "string" && summarizerCfg.model.length > 0
+              ? (summarizerCfg.model as string)
+              : null;
+          const summarizerModel = configuredModel ?? summarizerModelName;
+          const minStanding =
+            typeof summarizerCfg?.minTriggerTokensStanding === "number" &&
+            summarizerCfg.minTriggerTokensStanding > 0
+              ? Math.floor(summarizerCfg.minTriggerTokensStanding as number)
+              : DEFAULT_MIN_TRIGGER_TOKENS_STANDING;
+          const minWorking =
+            typeof summarizerCfg?.minTriggerTokensWorking === "number" &&
+            summarizerCfg.minTriggerTokensWorking > 0
+              ? Math.floor(summarizerCfg.minTriggerTokensWorking as number)
+              : DEFAULT_MIN_TRIGGER_TOKENS_WORKING;
+          const maxCostUsd =
+            typeof summarizerCfg?.maxCostUsd === "number" && summarizerCfg.maxCostUsd > 0
+              ? (summarizerCfg.maxCostUsd as number)
+              : undefined;
+
+          const finalizedIssueId = resolveRunIssueId(finalizedRun);
+
+          // Standing scope — every successful run is an opportunity to
+          // refresh cross-ticket knowledge.
+          try {
+            if (
+              !(await isQuarantined(db, {
+                agentId: agent.id,
+                scopeKind: "standing",
+                scopeId: null,
+              }))
+            ) {
+              const { tokens } = await unsummarizedTokensFor(db, {
+                companyId: agent.companyId,
+                agentId: agent.id,
+                scope: "standing",
+                model: summarizerModel,
+                calibrationRatio,
+              });
+              if (tokens >= minStanding) {
+                const result = await queue.maybeEnqueue(db, {
+                  companyId: agent.companyId,
+                  agentId: agent.id,
+                  scope: "standing",
+                  adapterModel: summarizerModel,
+                  summarizerModel: configuredModel,
+                  minTriggerTokens: minStanding,
+                  maxCostUsd,
+                  calibrationRatio,
+                });
+                logger.debug(
+                  {
+                    agentId: agent.id,
+                    runId: finalizedRun.id,
+                    scope: "standing",
+                    tokens,
+                    status: result.status,
+                  },
+                  "summarizer.enqueue_attempted",
+                );
+              }
+            }
+          } catch (err) {
+            logger.debug({ err, agentId: agent.id, runId: finalizedRun.id }, "summarizer.standing_enqueue_failed");
+          }
+
+          // Working scope — only when this run had an issue in focus.
+          if (finalizedIssueId) {
+            try {
+              if (
+                !(await isQuarantined(db, {
+                  agentId: agent.id,
+                  scopeKind: "working",
+                  scopeId: finalizedIssueId,
+                }))
+              ) {
+                const { tokens } = await unsummarizedTokensFor(db, {
+                  companyId: agent.companyId,
+                  agentId: agent.id,
+                  scope: "working",
+                  issueId: finalizedIssueId,
+                  model: summarizerModel,
+                  calibrationRatio,
+                });
+                if (tokens >= minWorking) {
+                  const result = await queue.maybeEnqueue(db, {
+                    companyId: agent.companyId,
+                    agentId: agent.id,
+                    scope: "working",
+                    issueId: finalizedIssueId,
+                    adapterModel: summarizerModel,
+                    summarizerModel: configuredModel,
+                    minTriggerTokens: minWorking,
+                    maxCostUsd,
+                    calibrationRatio,
+                  });
+                  logger.debug(
+                    {
+                      agentId: agent.id,
+                      runId: finalizedRun.id,
+                      issueId: finalizedIssueId,
+                      scope: "working",
+                      tokens,
+                      status: result.status,
+                    },
+                    "summarizer.enqueue_attempted",
+                  );
+                }
+              }
+            } catch (err) {
+              logger.debug(
+                { err, agentId: agent.id, runId: finalizedRun.id, issueId: finalizedIssueId },
+                "summarizer.working_enqueue_failed",
+              );
+            }
+          }
+        })();
 
         // Auto-surface any numbered / bulleted questions the agent buried
         // in its output as structured `kind="question"` comments, so the
@@ -2573,6 +3187,8 @@ export function heartbeatService(db: Db) {
     wakeup: enqueueWakeup,
 
     reapOrphanedRuns,
+    reapOrphanedIssueLocks,
+    forceUnlockIssue,
 
     tickTimers: async (now = new Date()) => {
       const allAgents = await db.select().from(agents);

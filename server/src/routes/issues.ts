@@ -232,6 +232,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
       unreadForUserId,
       projectId: req.query.projectId as string | undefined,
       labelId: req.query.labelId as string | undefined,
+      originKind: req.query.originKind as string | undefined,
+      excludeOriginKind: req.query.excludeOriginKind as string | undefined,
       q: req.query.q as string | undefined,
     });
     res.json(result);
@@ -987,6 +989,48 @@ export function issueRoutes(db: Db, storage: StorageService) {
     });
 
     res.json(released);
+  });
+
+  // Round 3 Phase 8 — operator-initiated force-unlock for a stuck issue.
+  // Clears issues.executionRunId unconditionally (even if the run is still
+  // 'running'). Callers MUST be user actors — agent tokens cannot force-unlock.
+  router.post("/issues/:id/force-unlock", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+    if (req.actor.type !== "user") {
+      res.status(403).json({ error: "Only users may force-unlock an issue" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const result = await heartbeat.forceUnlockIssue(id, {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+    });
+
+    if (result.cleared) {
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.force_unlocked",
+        entityType: "issue",
+        entityId: id,
+        details: {
+          previousRunId: result.previousRunId,
+          previousRunStatus: result.previousRunStatus,
+        },
+      });
+    }
+
+    res.json(result);
   });
 
   router.get("/issues/:id/comments", async (req, res) => {

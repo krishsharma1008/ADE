@@ -126,6 +126,8 @@ export const queryKeys = {
       ["company-skills", companyId, skillId, "file", path] as const,
     updateStatus: (companyId: string, skillId: string) =>
       ["company-skills", companyId, skillId, "update-status"] as const,
+    scopes: (companyId: string, skillId: string) =>
+      ["company-skills", companyId, skillId, "scopes"] as const,
   },
   instanceSettings: {
     general: ["instance-settings", "general"] as const,

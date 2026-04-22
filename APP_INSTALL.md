@@ -122,6 +122,14 @@ claude login
 defaults write com.apple.dock ResetLaunchPad -bool true && killall Dock
 ```
 
+## Round 3 tuning (optional)
+
+Round 3 adds a context-budget composer and transcript summarizer. Defaults work out of the box; these env vars only matter if you want to tune per-adapter behaviour.
+
+- `COMBYNE_SUMMARIZER_ENABLED` — `1` or `true` to turn on the Anthropic summarizer queue. Off by default while we finish the Round 3 rollout; requires `ANTHROPIC_API_KEY` (or `COMBYNE_SUMMARIZER_ANTHROPIC_API_KEY`).
+- `COMBYNE_CLAUDE_CONTEXT_BUDGET_TOKENS`, `COMBYNE_CODEX_CONTEXT_BUDGET_TOKENS`, `COMBYNE_CURSOR_CONTEXT_BUDGET_TOKENS`, `COMBYNE_GEMINI_CONTEXT_BUDGET_TOKENS`, `COMBYNE_OPENCODE_CONTEXT_BUDGET_TOKENS`, `COMBYNE_PI_CONTEXT_BUDGET_TOKENS` — override per-adapter input-token budgets; per-agent `adapterConfig.contextBudgetTokens` still wins.
+- Per-routine `autoCloseAfterMs` (set via the Routines UI) auto-closes stale routine-origin issues so they don't pile up in the inbox.
+
 ## Brand
 
 - **Background**: Deep black `#0B0B0F`

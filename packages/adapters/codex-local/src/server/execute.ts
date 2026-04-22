@@ -283,6 +283,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     context,
   });
   const preambleSegments: string[] = [];
+
+  // Focus directive — Round 3 item #2. FIRST segment so the model reads
+  // "work on THIS one only" before the rest of the queue context.
+  const focusDirective = parseObject(context.combyneFocusDirective);
+  const focusDirectiveBody = asString(focusDirective.body, "").trim();
+  if (focusDirectiveBody.length > 0) {
+    preambleSegments.push(focusDirectiveBody);
+  }
+
   const bootstrap = parseObject(context.combyneBootstrapAnalysis);
   const bootstrapPreamble = asString(bootstrap.preamble, "").trim();
   if (bootstrapPreamble.length > 0) preambleSegments.push(bootstrapPreamble);
@@ -297,9 +306,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     preambleSegments.push(`# Recent memory\n\n${memoryBody}`);
   }
   const assigned = parseObject(context.combyneAssignedIssues);
-  const assignedBody = asString(assigned.body, "").trim();
-  if (assignedBody.length > 0) {
-    preambleSegments.push(`# Your current task queue\n\n${assignedBody}`);
+  const digestBody = asString(assigned.digestBody, "").trim();
+  const legacyBody = asString(assigned.body, "").trim();
+  const queueBody = focusDirectiveBody.length > 0 ? digestBody : legacyBody;
+  if (queueBody.length > 0) {
+    preambleSegments.push(`# Your current task queue\n\n${queueBody}`);
   }
   const gitState = parseObject(context.combyneGitState);
   const gitSummary = asString(gitState.summary, "").trim();

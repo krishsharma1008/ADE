@@ -2,7 +2,7 @@ import { Router, type Request } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@combyne/db";
-import { agents as agentsTable, companies, heartbeatRuns } from "@combyne/db";
+import { agents as agentsTable, companies, heartbeatRuns, transcriptSummaries } from "@combyne/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
   createAgentKeySchema,
@@ -33,6 +33,7 @@ import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { findServerAdapter, listAdapterModels } from "../adapters/index.js";
 import { redactEventPayload } from "../redaction.js";
+import { loadRunTranscript } from "../services/agent-transcripts.js";
 import { runClaudeLogin } from "@combyne/adapter-claude-local/server";
 import {
   DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
@@ -601,6 +602,64 @@ export function agentRoutes(db: Db) {
 
     const state = await heartbeat.getRuntimeState(id);
     res.json(state);
+  });
+
+  router.get("/agents/:id/context-budget", async (req, res) => {
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+    const limitParam = req.query.limit as string | undefined;
+    const limit = limitParam ? Math.max(1, Math.min(100, parseInt(limitParam, 10) || 20)) : 20;
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        invocationSource: heartbeatRuns.invocationSource,
+        startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+        createdAt: heartbeatRuns.createdAt,
+        promptBudgetJson: heartbeatRuns.promptBudgetJson,
+        issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, id))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(limit);
+    res.json(rows);
+  });
+
+  router.get("/agents/:id/summaries", async (req, res) => {
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+    const limitParam = req.query.limit as string | undefined;
+    const limit = limitParam ? Math.max(1, Math.min(100, parseInt(limitParam, 10) || 20)) : 20;
+    const rows = await db
+      .select({
+        id: transcriptSummaries.id,
+        scopeKind: transcriptSummaries.scopeKind,
+        scopeId: transcriptSummaries.scopeId,
+        cutoffSeq: transcriptSummaries.cutoffSeq,
+        sourceInputTokens: transcriptSummaries.sourceInputTokens,
+        sourceTurnCount: transcriptSummaries.sourceTurnCount,
+        summarizerModel: transcriptSummaries.summarizerModel,
+        inputTokens: transcriptSummaries.inputTokens,
+        outputTokens: transcriptSummaries.outputTokens,
+        createdAt: transcriptSummaries.createdAt,
+      })
+      .from(transcriptSummaries)
+      .where(eq(transcriptSummaries.agentId, id))
+      .orderBy(desc(transcriptSummaries.createdAt))
+      .limit(limit);
+    res.json(rows);
   });
 
   router.get("/agents/:id/task-sessions", async (req, res) => {
@@ -1401,6 +1460,30 @@ export function agentRoutes(db: Db) {
       payload: redactEventPayload(event.payload),
     }));
     res.json(redactedEvents);
+  });
+
+  router.get("/heartbeat-runs/:runId/transcript", async (req, res) => {
+    const runId = req.params.runId as string;
+    const run = await heartbeat.getRun(runId);
+    if (!run) {
+      res.status(404).json({ error: "Heartbeat run not found" });
+      return;
+    }
+    assertCompanyAccess(req, run.companyId);
+
+    const rows = await loadRunTranscript(db, runId);
+    const entries = rows.map((row) => ({
+      id: row.id,
+      seq: row.seq,
+      ordinal: Number(row.ordinal),
+      role: row.role,
+      contentKind: row.contentKind,
+      content: redactEventPayload(row.content as Record<string, unknown>) ?? row.content,
+      issueId: row.issueId,
+      terminalSessionId: row.terminalSessionId,
+      createdAt: row.createdAt,
+    }));
+    res.json({ runId, entries });
   });
 
   router.get("/heartbeat-runs/:runId/log", async (req, res) => {

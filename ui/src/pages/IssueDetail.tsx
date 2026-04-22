@@ -419,6 +419,18 @@ export function IssueDetail() {
     },
   });
 
+  // Round 3 Phase 8 — operator force-unlock for stuck issues. Visible only
+  // when executionRunId is non-null AND no heartbeat is currently alive for
+  // the issue (or the lock is old). Posts to POST /issues/:id/force-unlock
+  // which is guarded user-only on the server.
+  const forceUnlock = useMutation({
+    mutationFn: () => issuesApi.forceUnlock(issueId!),
+    onSuccess: () => {
+      invalidateIssue();
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(issueId!) });
+    },
+  });
+
   const addComment = useMutation({
     mutationFn: ({ body, reopen }: { body: string; reopen?: boolean }) =>
       issuesApi.addComment(issueId!, body, reopen),
@@ -934,6 +946,24 @@ export function IssueDetail() {
               Live
             </span>
           )}
+          {issue.executionRunId &&
+            (!hasLiveRuns ||
+              (issue.executionLockedAt != null &&
+                Date.now() - new Date(issue.executionLockedAt).getTime() > 15 * 60 * 1000)) && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (window.confirm("Force-unlock this issue? Clears execution lock even if a run is still marked live.")) {
+                    forceUnlock.mutate();
+                  }
+                }}
+                disabled={forceUnlock.isPending}
+                className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400 shrink-0 hover:bg-amber-500/20 disabled:opacity-50"
+                title="Clear executionRunId so this issue can be picked up again"
+              >
+                {forceUnlock.isPending ? "Unlocking…" : "Unblock"}
+              </button>
+            )}
 
           {issue.projectId ? (
             <Link

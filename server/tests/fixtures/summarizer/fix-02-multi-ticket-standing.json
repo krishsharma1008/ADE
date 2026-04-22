@@ -1,0 +1,55 @@
+{
+  "id": "fix-02-multi-ticket-standing",
+  "description": "Three tickets touched by one agent over several wakes. Exercises cross-ticket knowledge and user preferences the summarizer must carry into standing knowledge.",
+  "scope": "standing",
+  "issueId": null,
+  "summaryCutoffOrdinal": 16,
+  "transcript": [
+    { "ordinal": 1, "role": "user", "content": "Please always open PRs with titles in imperative mood, no trailing period." },
+    { "ordinal": 2, "role": "assistant", "content": "Acknowledged. PR titles: imperative, no trailing period." },
+    { "ordinal": 3, "role": "user", "content": "BUK-10: the login page mis-reports error copy. Pick it up when you have cycles." },
+    { "ordinal": 4, "role": "assistant", "content": "Starting BUK-10. The error copy lives in ui/src/pages/Login.tsx." },
+    { "ordinal": 5, "role": "tool_result", "content": "Found the copy string at Login.tsx line 142. Server returns 401 but UI shows 'server error' — mapping is wrong." },
+    { "ordinal": 6, "role": "assistant", "content": "Fixed: when status is 401 UI now shows 'Invalid credentials'. PR opened: Fix login error mapping." },
+    { "ordinal": 7, "role": "user", "content": "BUK-14: the agent list is slow. Look at the query." },
+    { "ordinal": 8, "role": "assistant", "content": "BUK-14: agent list query does N+1 for avatar URLs. Adding a join." },
+    { "ordinal": 9, "role": "tool_result", "content": "Query now uses LEFT JOIN on agent_avatars. P95 dropped from 840ms to 90ms in dev." },
+    { "ordinal": 10, "role": "user", "content": "Keep individual PRs small please — one ticket per PR." },
+    { "ordinal": 11, "role": "assistant", "content": "Noted. One ticket per PR." },
+    { "ordinal": 12, "role": "assistant", "content": "PR opened for BUK-14: Reduce agent list N+1 queries." },
+    { "ordinal": 13, "role": "user", "content": "BUK-21: routine-generated issues clutter the inbox. Add a filter pill." },
+    { "ordinal": 14, "role": "assistant", "content": "BUK-21: starting UI work for the origin filter pill on IssuesList." },
+    { "ordinal": 15, "role": "tool_result", "content": "Drafted the pill component; wired it to the listing filter. Needs a backend query param." },
+    { "ordinal": 16, "role": "assistant", "content": "Pausing BUK-21 — blocked on a server-side originKind filter in GET /issues. Will ship the server change first, then the UI." },
+    { "ordinal": 17, "role": "user", "content": "Where are we on everything?" },
+    { "ordinal": 18, "role": "assistant", "content": "BUK-10 merged. BUK-14 in review. BUK-21 paused on server-side filter." },
+    { "ordinal": 19, "role": "user", "content": "Thanks, remember to unpause BUK-21 once the server-side filter lands." },
+    { "ordinal": 20, "role": "assistant", "content": "Will do — will resume BUK-21 the moment GET /issues accepts originKind." }
+  ],
+  "questions": [
+    {
+      "id": "q1",
+      "question": "What are the user's preferences for PR titles?",
+      "oracleAnswer": "Imperative mood, no trailing period.",
+      "keyFacts": ["imperative", "no trailing period"]
+    },
+    {
+      "id": "q2",
+      "question": "How should the agent split work across PRs?",
+      "oracleAnswer": "One ticket per PR.",
+      "keyFacts": ["one ticket per PR"]
+    },
+    {
+      "id": "q3",
+      "question": "Which ticket is currently paused and why?",
+      "oracleAnswer": "BUK-21 is paused because the UI change needs a server-side originKind filter on GET /issues that doesn't exist yet.",
+      "keyFacts": ["BUK-21", "originKind", "server-side"]
+    },
+    {
+      "id": "q4",
+      "question": "What is the status of BUK-14?",
+      "oracleAnswer": "BUK-14 is in review. The agent reduced the N+1 on agent avatars with a LEFT JOIN.",
+      "keyFacts": ["BUK-14", "review"]
+    }
+  ]
+}

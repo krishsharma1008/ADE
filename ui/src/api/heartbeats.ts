@@ -33,6 +33,21 @@ export const heartbeatsApi = {
     api.get<HeartbeatRunEvent[]>(
       `/heartbeat-runs/${runId}/events?afterSeq=${encodeURIComponent(String(afterSeq))}&limit=${encodeURIComponent(String(limit))}`,
     ),
+  transcript: (runId: string) =>
+    api.get<{
+      runId: string;
+      entries: Array<{
+        id: string;
+        seq: number;
+        ordinal: number;
+        role: string;
+        contentKind: string | null;
+        content: Record<string, unknown>;
+        issueId: string | null;
+        terminalSessionId: string | null;
+        createdAt: string;
+      }>;
+    }>(`/heartbeat-runs/${runId}/transcript`),
   log: (runId: string, offset = 0, limitBytes = 256000) =>
     api.get<{ runId: string; store: string; logRef: string; content: string; nextOffset?: number }>(
       `/heartbeat-runs/${runId}/log?offset=${encodeURIComponent(String(offset))}&limitBytes=${encodeURIComponent(String(limitBytes))}`,
