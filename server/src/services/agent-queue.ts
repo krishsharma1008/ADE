@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { issues } from "@combyne/db";
+import { OPEN_ISSUE_STATUSES } from "@combyne/shared";
 
 export interface AssignedIssueSummary {
   id: string;
@@ -21,10 +22,13 @@ export interface AssignedQueueResult {
   body: string;
 }
 
-// Statuses we consider "still on the agent's plate". `done`, `cancelled`,
-// and `hidden` issues are not part of the live queue.
-const OPEN_STATUSES = ["backlog", "in_progress", "awaiting_user", "blocked", "review"] as const;
+// Canonical "open" statuses come from @combyne/shared. Prior to Round 3 this
+// file hard-coded a list that (a) invented a `review` status that never
+// existed and (b) silently excluded `todo`, so todo/in_review issues never
+// surfaced in the queue preamble. Keeping a local alias for test introspection.
+const OPEN_STATUSES = OPEN_ISSUE_STATUSES;
 const PRIORITY_ORDER: Record<string, number> = {
+  critical: 0,
   urgent: 0,
   high: 1,
   medium: 2,

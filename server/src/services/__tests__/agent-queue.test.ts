@@ -32,8 +32,10 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
     agentId = a.id;
     otherAgentId = b.id;
 
-    // Five issues: 3 assigned open (one awaiting, one in_progress, one backlog),
-    // one done (should NOT appear), one assigned to a different agent.
+    // Seven issues: 5 assigned open covering every OPEN_ISSUE_STATUS
+    // (backlog, todo, in_progress, in_review, awaiting_user), one done
+    // (should NOT appear), one assigned to a different agent.
+    // Round 3 adds todo + in_review coverage to catch the OPEN_STATUSES drift.
     await handle.db.insert(issues).values([
       {
         companyId,
@@ -54,6 +56,20 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
         title: "still in backlog",
         status: "backlog",
         priority: "low",
+        assigneeAgentId: agentId,
+      },
+      {
+        companyId,
+        title: "todo item",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+      {
+        companyId,
+        title: "awaiting review",
+        status: "in_review",
+        priority: "medium",
         assigneeAgentId: agentId,
       },
       {
@@ -80,15 +96,26 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
   it("returns only open issues assigned to this agent", async () => {
     const result = await loadAssignedIssueQueue(handle.db, { companyId, agentId });
     expect(result.items.map((i) => i.title).sort()).toEqual([
+      "awaiting review",
       "awaiting user input",
       "open high-priority",
       "still in backlog",
+      "todo item",
     ]);
     expect(result.awaitingCount).toBe(1);
     expect(result.body).toMatch(/open high-priority/);
     expect(result.body).toMatch(/awaiting user input/);
     expect(result.body).not.toMatch(/already shipped/);
     expect(result.body).not.toMatch(/someone else's/);
+  });
+
+  it("surfaces todo and in_review statuses (Round 3 OPEN_STATUSES fix)", async () => {
+    const result = await loadAssignedIssueQueue(handle.db, { companyId, agentId });
+    const statuses = result.items.map((i) => i.status).sort();
+    expect(statuses).toContain("todo");
+    expect(statuses).toContain("in_review");
+    expect(result.body).toMatch(/todo item/);
+    expect(result.body).toMatch(/awaiting review/);
   });
 
   it("marks the currently-woken issue and surfaces it first", async () => {
