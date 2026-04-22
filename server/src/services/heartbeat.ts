@@ -21,6 +21,13 @@ import { loadRecentMemory, summarizeRunAndPersist } from "./agent-memory.js";
 import { getPendingHandoffBrief, markHandoffConsumed } from "./agent-handoff.js";
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
 import { loadAssignedIssueQueue } from "./agent-queue.js";
+import {
+  estimatePromptBudget,
+  persistRunBudget,
+  recordCalibrationSample,
+  shouldAlertDivergence,
+  type BudgetSnapshot,
+} from "./context-budget-telemetry.js";
 import { inspectGitStateForIssue } from "./git-state.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
 import { extractAndPostQuestions } from "./agent-question-extract.js";
@@ -34,7 +41,7 @@ import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec } from "../adapters/index.js";
 import { createLocalAgentJwt, ensureLocalAgentJwtSecretAtRuntime } from "../agent-auth-jwt.js";
-import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import { parseObject, asBoolean, asNumber, asString, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 
@@ -1560,12 +1567,38 @@ export function heartbeatService(db: Db) {
         agent.companyId,
         mergedConfig,
       );
+      // Round 3 Phase 3 — prompt-budget snapshot captured on the FIRST
+      // adapter.invoke of the run. Telemetry-only for now: the composer
+      // phase will consume this to decide truncation.
+      const promptBudgetRef: { snapshot: BudgetSnapshot | null } = { snapshot: null };
+
       const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
         if (meta.env && secretKeys.size > 0) {
           for (const key of secretKeys) {
             if (key in meta.env) meta.env[key] = "***REDACTED***";
           }
         }
+
+        if (!promptBudgetRef.snapshot && typeof meta.prompt === "string" && meta.prompt.length > 0) {
+          const modelName = asString(
+            (resolvedConfig as Record<string, unknown>).model,
+            agent.adapterType,
+          );
+          const snapshot = estimatePromptBudget(meta.prompt, modelName);
+          promptBudgetRef.snapshot = snapshot;
+          await persistRunBudget(db, currentRun.id, snapshot);
+          logger.debug(
+            {
+              runId: currentRun.id,
+              agentId: agent.id,
+              estimatedInputTokens: snapshot.estimatedInputTokens,
+              family: snapshot.tokenizerFamily,
+              promptChars: snapshot.promptChars,
+            },
+            "context_budget.estimated",
+          );
+        }
+
         await appendRunEvent(currentRun, seq++, {
           eventType: "adapter.invoke",
           stream: "system",
@@ -1685,6 +1718,36 @@ export function heartbeatService(db: Db) {
               ...(adapterResult.billingType ? { billingType: adapterResult.billingType } : {}),
             } as Record<string, unknown>)
           : null;
+
+      // Round 3 Phase 3 — close the calibration loop. Compares our
+      // pre-run estimate with the adapter-reported actual usage.inputTokens
+      // so the composer phase can trust family-specific ratios.
+      try {
+        const actualInput = adapterResult.usage?.inputTokens ?? 0;
+        const snapshot = promptBudgetRef.snapshot;
+        if (snapshot && actualInput > 0) {
+          await recordCalibrationSample(db, {
+            runId: run.id,
+            family: snapshot.tokenizerFamily,
+            estimatedTokens: snapshot.estimatedInputTokens,
+            actualTokens: actualInput,
+          });
+          if (shouldAlertDivergence(snapshot.estimatedInputTokens, actualInput)) {
+            logger.warn(
+              {
+                runId: run.id,
+                agentId: agent.id,
+                estimated: snapshot.estimatedInputTokens,
+                actual: actualInput,
+                family: snapshot.tokenizerFamily,
+              },
+              "tokenizer.calibration_diverged",
+            );
+          }
+        }
+      } catch (err) {
+        logger.debug({ err, runId: run.id }, "context_budget.calibration_hook_failed");
+      }
 
       await setRunStatus(run.id, status, {
         finishedAt: new Date(),
