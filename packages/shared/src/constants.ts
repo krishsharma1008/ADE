@@ -137,6 +137,18 @@ export const INBOX_MINE_ISSUE_STATUSES = [
 ] as const;
 export const INBOX_MINE_ISSUE_STATUS_FILTER = INBOX_MINE_ISSUE_STATUSES.join(",");
 
+// Statuses considered "still on the agent's plate" for queue/preamble rendering.
+// Terminal statuses (done, cancelled) are excluded.
+export const OPEN_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "awaiting_user",
+  "blocked",
+] as const;
+export type OpenIssueStatus = (typeof OPEN_ISSUE_STATUSES)[number];
+
 export const ISSUE_PRIORITIES = ["critical", "high", "medium", "low"] as const;
 export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
 
