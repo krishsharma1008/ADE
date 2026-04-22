@@ -14,11 +14,14 @@ import {
 } from "@combyne/db";
 import {
   clampRatio,
+  composeBudgetedPreamble,
   countTokens,
   DEFAULT_WINDOW_DAYS,
   MIN_SAMPLES,
   resolveModel,
+  type ComposedPreamble,
   type ModelFamily,
+  type PreambleSection,
 } from "@combyne/context-budget";
 import { logger } from "../middleware/logger.js";
 
@@ -170,3 +173,202 @@ export async function countRecentDivergences(
 
 // Convenience alias matching the import shape used by heartbeat.ts.
 export { sql };
+
+// ---------------------------------------------------------------------------
+// Round 3 Phase 4 — shadow-mode composer.
+//
+// Gathers the combyne* context fields populated by heartbeat.ts into
+// typed PreambleSections and runs the composer. Output is logged but
+// NOT fed back to the adapter — the byte caps still decide what the
+// adapter sees. Phase 5 flips the switch.
+// ---------------------------------------------------------------------------
+
+function readString(v: unknown): string | null {
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+function readObject(v: unknown): Record<string, unknown> | null {
+  return v && typeof v === "object" ? (v as Record<string, unknown>) : null;
+}
+
+// Rough per-adapter input-token budgets. These match the table in the
+// Round 3 plan; the precise numbers are tunable via env in Phase 5. For
+// shadow mode they just need to be in the right ballpark.
+const ADAPTER_BUDGETS: Record<string, number> = {
+  "claude-local": 160_000,
+  "codex-local": 320_000,
+  "cursor-local": 160_000,
+  "gemini-local": 800_000,
+  "opencode-local": 100_000,
+  "pi-local": 24_000,
+  "browser-use": 100_000,
+  "openclaw-gateway": 160_000,
+};
+
+export function resolveContextBudgetTokens(
+  adapterType: string,
+  adapterConfig: Record<string, unknown> | null | undefined,
+): number {
+  const fromConfig = adapterConfig?.contextBudgetTokens;
+  if (typeof fromConfig === "number" && Number.isFinite(fromConfig) && fromConfig > 0) {
+    return Math.floor(fromConfig);
+  }
+  const envKey = `COMBYNE_${adapterType.toUpperCase().replace(/-/g, "_")}_CONTEXT_BUDGET_TOKENS`;
+  const fromEnv = process.env[envKey];
+  if (fromEnv) {
+    const parsed = Number(fromEnv);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+  }
+  return ADAPTER_BUDGETS[adapterType] ?? 160_000;
+}
+
+// Pull textual sections out of the heartbeat `context` object. Each
+// section corresponds 1:1 to a combyne* field populated earlier in
+// runHeartbeatForAgent. Missing fields are skipped silently.
+export function buildPreambleSectionsFromContext(
+  context: Record<string, unknown>,
+): PreambleSection[] {
+  const out: PreambleSection[] = [];
+
+  const bootstrap = readObject(context.combyneBootstrapAnalysis);
+  const bootstrapBody = readString(bootstrap?.preamble);
+  if (bootstrapBody) {
+    out.push({
+      name: "bootstrap",
+      content: bootstrapBody,
+      priority: 0,
+      cacheStable: true,
+      truncationStrategy: "tail",
+      maxTokens: 4_000,
+    });
+  }
+
+  const handoff = readObject(context.combyneHandoffBrief);
+  const handoffBrief = readString(handoff?.brief);
+  if (handoffBrief) {
+    out.push({
+      name: "handoff",
+      content: handoffBrief,
+      priority: 1,
+      cacheStable: true,
+      truncationStrategy: "tail",
+      maxTokens: 2_000,
+    });
+  }
+
+  const memory = readObject(context.combyneMemoryPreamble);
+  const memoryBody = readString(memory?.body);
+  if (memoryBody) {
+    out.push({
+      name: "memory",
+      content: memoryBody,
+      priority: 3,
+      cacheStable: true,
+      truncationStrategy: "tail",
+      maxTokens: 4_000,
+    });
+  }
+
+  const hire = readObject(context.combyneHirePlaybook);
+  const hireBody = readString(hire?.body);
+  if (hireBody) {
+    // Shares the "system"-esque slot — not cache-stable because it's
+    // gated on per-issue intent detection, which varies wake-to-wake.
+    out.push({
+      name: "bootstrap",
+      content: hireBody,
+      priority: 1,
+      cacheStable: false,
+      truncationStrategy: "tail",
+      maxTokens: 4_000,
+    });
+  }
+
+  const focus = readObject(context.combyneFocusDirective);
+  const focusBody = readString(focus?.body);
+  if (focusBody) {
+    out.push({
+      name: "focus",
+      content: focusBody,
+      priority: 0,
+      cacheStable: false,
+      truncationStrategy: "preserve",
+    });
+  }
+
+  const assigned = readObject(context.combyneAssignedIssues);
+  const digestBody = readString(assigned?.digestBody) ?? readString(assigned?.body);
+  if (digestBody) {
+    out.push({
+      name: "queue",
+      content: digestBody,
+      priority: 3,
+      cacheStable: false,
+      truncationStrategy: "tail",
+      maxTokens: 2_000,
+    });
+  }
+
+  const projects = readObject(context.combyneCompanyProjects);
+  if (projects) {
+    // Stringify once — cheap for the telemetry path.
+    const projectsBody = safeStringify(projects);
+    if (projectsBody) {
+      out.push({
+        name: "projects",
+        content: projectsBody,
+        priority: 2,
+        cacheStable: true,
+        truncationStrategy: "tail",
+        maxTokens: 4_000,
+      });
+    }
+  }
+
+  return out;
+}
+
+function safeStringify(v: unknown): string {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return "";
+  }
+}
+
+export interface ShadowCompareResult {
+  composed: ComposedPreamble;
+  actualPromptTokens: number;
+  bytesSaved: number;
+  deltaPct: number;
+}
+
+export function runShadowComposer(opts: {
+  context: Record<string, unknown>;
+  adapterType: string;
+  adapterConfig: Record<string, unknown> | null;
+  actualPrompt: string;
+  model: string;
+  calibrationRatio?: number | null;
+}): ShadowCompareResult | null {
+  try {
+    const sections = buildPreambleSectionsFromContext(opts.context);
+    if (sections.length === 0) return null;
+    const budget = resolveContextBudgetTokens(opts.adapterType, opts.adapterConfig);
+    const composed = composeBudgetedPreamble(sections, {
+      budget,
+      model: opts.model,
+      calibrationRatio: opts.calibrationRatio ?? undefined,
+    });
+    const actualPromptTokens = countTokens(opts.actualPrompt, opts.model);
+    const bytesSaved = opts.actualPrompt.length - composed.body.length;
+    const deltaPct =
+      actualPromptTokens > 0
+        ? (composed.totalTokens - actualPromptTokens) / actualPromptTokens
+        : 0;
+    return { composed, actualPromptTokens, bytesSaved, deltaPct };
+  } catch (err) {
+    logger.debug({ err }, "context_budget.shadow_compose_failed");
+    return null;
+  }
+}
