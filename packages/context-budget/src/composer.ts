@@ -19,7 +19,9 @@ export type SectionName =
   | "toolResults"
   | "bootstrap"
   | "handoff"
-  | "workspace";
+  | "workspace"
+  | "standing"
+  | "working";
 
 export type TruncationStrategy = "head" | "tail" | "middle" | "preserve";
 
@@ -148,8 +150,22 @@ export function composeBudgetedPreamble(
   for (const s of sections) byName.set(s.name, s);
   const uniqueSections = Array.from(byName.values());
 
-  const stableOrder = ["system", "bootstrap", "handoff", "skills", "projects", "memory", "workspace"];
-  const varyOrder = ["focus", "recentTurns", "queue", "toolResults"];
+  // Round 3 Phase 6 — "standing" sits between memory and workspace in the
+  // stable tier. It's rewritten occasionally (cooldown ~10 min) but the
+  // stable-tier placement buys us cache hits on the ~90%+ of wakes where the
+  // summary is unchanged. "working" stays in vary since it tracks ticket
+  // progression and changes per-issue between wakes.
+  const stableOrder = [
+    "system",
+    "bootstrap",
+    "handoff",
+    "skills",
+    "projects",
+    "memory",
+    "standing",
+    "workspace",
+  ];
+  const varyOrder = ["focus", "working", "recentTurns", "queue", "toolResults"];
 
   const stable = uniqueSections
     .filter((s) => s.cacheStable && s.content.length > 0)

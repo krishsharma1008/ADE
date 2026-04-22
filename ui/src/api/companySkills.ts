@@ -59,4 +59,19 @@ export const companySkillsApi = {
       `/companies/${companyId}/skills/${skillId}/install-update`,
       {},
     ),
+
+  getScopes: (companyId: string, skillId: string) =>
+    api.get<{ projectIds: string[]; agentIds: string[] }>(
+      `/companies/${companyId}/skills/${skillId}/scopes`,
+    ),
+
+  setScopes: (
+    companyId: string,
+    skillId: string,
+    scopes: { projectIds?: string[]; agentIds?: string[] },
+  ) =>
+    api.put<{ projectIds: string[]; agentIds: string[] }>(
+      `/companies/${companyId}/skills/${skillId}/scopes`,
+      scopes,
+    ),
 };

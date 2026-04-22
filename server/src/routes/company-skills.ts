@@ -250,6 +250,56 @@ export function companySkillRoutes(db: Db) {
     res.json(result);
   });
 
+  router.get("/companies/:companyId/skills/:skillId/scopes", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const skillId = req.params.skillId as string;
+    assertCompanyAccess(req, companyId);
+    const detail = await svc.detail(companyId, skillId);
+    if (!detail) {
+      res.status(404).json({ error: "Skill not found" });
+      return;
+    }
+    const scopes = await svc.listScopes(skillId);
+    res.json(scopes);
+  });
+
+  router.put("/companies/:companyId/skills/:skillId/scopes", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const skillId = req.params.skillId as string;
+    await assertCanMutateCompanySkills(req, companyId);
+    const detail = await svc.detail(companyId, skillId);
+    if (!detail) {
+      res.status(404).json({ error: "Skill not found" });
+      return;
+    }
+    const body = req.body as { projectIds?: string[]; agentIds?: string[] };
+    const projectIds = Array.isArray(body?.projectIds)
+      ? body.projectIds.filter((v): v is string => typeof v === "string")
+      : undefined;
+    const agentIds = Array.isArray(body?.agentIds)
+      ? body.agentIds.filter((v): v is string => typeof v === "string")
+      : undefined;
+    const updated = await svc.setScopes(skillId, { projectIds, agentIds });
+
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "company.skill_scopes_updated",
+      entityType: "company_skill",
+      entityId: skillId,
+      details: {
+        projectIds: updated.projectIds,
+        agentIds: updated.agentIds,
+      },
+    });
+
+    res.json(updated);
+  });
+
   router.post("/companies/:companyId/skills/:skillId/install-update", async (req, res) => {
     const companyId = req.params.companyId as string;
     const skillId = req.params.skillId as string;

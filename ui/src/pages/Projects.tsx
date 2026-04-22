@@ -1,5 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import type { Project } from "@combyne/shared";
 import { projectsApi } from "../api/projects";
 import { useCompany } from "../context/CompanyContext";
 import { useDialog } from "../context/DialogContext";
@@ -9,9 +10,10 @@ import { EntityRow } from "../components/EntityRow";
 import { StatusBadge } from "../components/StatusBadge";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { DeleteProjectDialog } from "../components/DeleteProjectDialog";
 import { formatDate, projectUrl } from "../lib/utils";
 import { Button } from "@/components/ui/button";
-import { Hexagon, Plus } from "lucide-react";
+import { Hexagon, Plus, Trash2 } from "lucide-react";
 
 export function Projects() {
   const { selectedCompanyId } = useCompany();
@@ -27,6 +29,8 @@ export function Projects() {
     queryFn: () => projectsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+
+  const [deletingProject, setDeletingProject] = useState<Project | null>(null);
 
   if (!selectedCompanyId) {
     return <EmptyState icon={Hexagon} message="Select a company to view projects." />;
@@ -56,6 +60,15 @@ export function Projects() {
         />
       )}
 
+      {deletingProject && selectedCompanyId && (
+        <DeleteProjectDialog
+          project={deletingProject}
+          companyId={selectedCompanyId}
+          open={Boolean(deletingProject)}
+          onOpenChange={(open) => { if (!open) setDeletingProject(null); }}
+        />
+      )}
+
       {projects && projects.length > 0 && (
         <div className="border border-border">
           {projects.map((project) => (
@@ -72,6 +85,18 @@ export function Projects() {
                     </span>
                   )}
                   <StatusBadge status={project.status} />
+                  <button
+                    type="button"
+                    className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-destructive"
+                    title="Delete project"
+                    onClick={(ev) => {
+                      ev.preventDefault();
+                      ev.stopPropagation();
+                      setDeletingProject(project);
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
                 </div>
               }
             />

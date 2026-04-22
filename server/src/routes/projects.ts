@@ -83,7 +83,7 @@ export function projectRoutes(db: Db) {
     if (workspace) {
       const createdWorkspace = await svc.createWorkspace(project.id, workspace);
       if (!createdWorkspace) {
-        await svc.remove(project.id);
+        await svc.remove(project.id, { force: true });
         res.status(422).json({ error: "Invalid project workspace payload" });
         return;
       }
@@ -266,24 +266,37 @@ export function projectRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, existing.companyId);
-    const project = await svc.remove(id);
-    if (!project) {
+    const force = req.query.force === "true";
+    const result = await svc.remove(id, { force });
+
+    if (result.kind === "not_found") {
       res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    if (result.kind === "conflict") {
+      res.status(409).json({
+        error: "project_has_issues",
+        issueCount: result.issueCount,
+        openCount: result.openCount,
+      });
       return;
     }
 
     const actor = getActorInfo(req);
     await logActivity(db, {
-      companyId: project.companyId,
+      companyId: result.project.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
-      action: "project.deleted",
+      action: force && result.unlinkedIssueCount > 0 ? "project.force_deleted" : "project.deleted",
       entityType: "project",
-      entityId: project.id,
+      entityId: result.project.id,
+      details: {
+        unlinkedIssueCount: result.unlinkedIssueCount,
+      },
     });
 
-    res.json(project);
+    res.json(result.project);
   });
 
   return router;

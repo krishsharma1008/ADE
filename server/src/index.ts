@@ -27,7 +27,9 @@ import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { setupTerminalWebSocketServer } from "./realtime/terminal-ws.js";
-import { heartbeatService } from "./services/index.js";
+import { heartbeatService, routineService } from "./services/index.js";
+import { SummarizerQueue, setSummarizerQueue } from "./services/summarizer-queue.js";
+import { makeAnthropicSummarizerDriver } from "./services/summarizer-driver-anthropic.js";
 import { createPersonasRouter } from "./routes/personas.js";
 import { syncPersonas } from "./services/personas.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -666,14 +668,46 @@ export async function startServer(): Promise<StartedServer> {
     resolveSessionFromHeaders,
   });
   
+  // Round 3 Phase 6 PR 6.3 — wire the summarizer queue + driver singleton
+  // before heartbeats start executing. Opt-in via COMBYNE_SUMMARIZER_ENABLED
+  // (default off while we finish PR 6.4–6.6). When disabled or when no
+  // Anthropic key is available, the post-run hook no-ops silently.
+  {
+    const flag = process.env.COMBYNE_SUMMARIZER_ENABLED;
+    const summarizerEnabled = flag === "1" || flag === "true";
+    const hasKey =
+      !!(process.env.COMBYNE_SUMMARIZER_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY);
+    if (summarizerEnabled && hasKey) {
+      setSummarizerQueue(
+        new SummarizerQueue({ driver: makeAnthropicSummarizerDriver() }),
+      );
+      logger.info("summarizer queue enabled (Anthropic driver)");
+    } else if (summarizerEnabled && !hasKey) {
+      logger.warn(
+        "COMBYNE_SUMMARIZER_ENABLED set but no ANTHROPIC_API_KEY available — summarizer disabled",
+      );
+    }
+  }
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any);
-  
+    const routines = routineService(db as any);
+
     // Reap orphaned runs at startup (no threshold -- runningProcesses is empty)
     void heartbeat.reapOrphanedRuns().catch((err) => {
       logger.error({ err }, "startup reap of orphaned heartbeat runs failed");
     });
-  
+    // Also sweep issue-side lock leaks at startup — runs that finalized
+    // but whose issue rows never released the executionRunId pointer.
+    void heartbeat.reapOrphanedIssueLocks().catch((err) => {
+      logger.error({ err }, "startup reap of orphaned issue locks failed");
+    });
+
+    // Round 3 Phase 12 — run auto-close sweep on a slower cadence. 15-min
+    // tick is enough: thresholds are user-configured in hours/days.
+    let lastRoutineAutoCloseAt = 0;
+    const ROUTINE_AUTO_CLOSE_INTERVAL_MS = 15 * 60 * 1000;
+
     setInterval(() => {
       void heartbeat
         .tickTimers(new Date())
@@ -685,13 +719,37 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "heartbeat timer tick failed");
         });
-  
+
       // Periodically reap orphaned runs (5-min staleness threshold)
       void heartbeat
         .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
         .catch((err) => {
           logger.error({ err }, "periodic reap of orphaned heartbeat runs failed");
         });
+
+      // Round 3 Phase 8 — companion issue-side sweep. Cheap LEFT JOIN on
+      // issues with non-null execution_run_id; catches the lock-leak mode
+      // described in docs/plans/round3/07-stuck-locks.md.
+      void heartbeat
+        .reapOrphanedIssueLocks()
+        .catch((err) => {
+          logger.error({ err }, "periodic reap of orphaned issue locks failed");
+        });
+
+      const now = Date.now();
+      if (now - lastRoutineAutoCloseAt >= ROUTINE_AUTO_CLOSE_INTERVAL_MS) {
+        lastRoutineAutoCloseAt = now;
+        void routines
+          .autoCloseExpiredRoutineIssues(new Date(now))
+          .then((result) => {
+            if (result.closed > 0) {
+              logger.info({ closed: result.closed }, "routine auto-close tick closed expired issues");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "routine auto-close tick failed");
+          });
+      }
     }, config.heartbeatSchedulerIntervalMs);
   }
   

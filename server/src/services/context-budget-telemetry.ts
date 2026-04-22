@@ -26,19 +26,63 @@ import {
 } from "@combyne/context-budget";
 import { logger } from "../middleware/logger.js";
 
+export interface BudgetSnapshotComposer {
+  applied: boolean;
+  totalTokens: number;
+  stableTokens: number;
+  varyTokens: number;
+  cachePrefixHash: string;
+  dropped: string[];
+  truncated: string[];
+  warnings: string[];
+  sections: Array<{ name: string; tokens: number; truncated: boolean; dropped: boolean }>;
+}
+
 export interface BudgetSnapshot {
   estimatedInputTokens: number;
   tokenizerFamily: ModelFamily;
   tokenizerLabel: string;
   promptChars: number;
   calibrationRatio: number | null;
+  composer?: BudgetSnapshotComposer;
+  cacheHit?: boolean;
+  previousCachePrefixHash?: string | null;
+  pruningMode?: "additive" | "aggressive";
 }
 
-export function estimatePromptBudget(prompt: string, model: string): BudgetSnapshot {
+export function summarizeComposed(
+  composed: ComposedPreamble,
+  applied: boolean,
+): BudgetSnapshotComposer {
+  return {
+    applied,
+    totalTokens: composed.totalTokens,
+    stableTokens: composed.stableTokens,
+    varyTokens: composed.varyTokens,
+    cachePrefixHash: composed.cachePrefixHash,
+    dropped: [...composed.dropped],
+    truncated: [...composed.truncated],
+    warnings: [...composed.warnings],
+    sections: composed.sections.map((s) => ({
+      name: s.name,
+      tokens: s.tokens,
+      truncated: s.truncated,
+      dropped: s.dropped,
+    })),
+  };
+}
+
+export function estimatePromptBudget(
+  prompt: string,
+  model: string,
+  opts?: { calibrationRatio?: number | null },
+): BudgetSnapshot {
   const descriptor = resolveModel(model);
   let estimatedInputTokens = 0;
   try {
-    estimatedInputTokens = countTokens(prompt, model);
+    estimatedInputTokens = countTokens(prompt, model, {
+      calibrationRatio: opts?.calibrationRatio ?? null,
+    });
   } catch (err) {
     logger.warn({ err, model }, "tokenizer.panic");
     estimatedInputTokens = Math.max(1, Math.ceil(prompt.length / 3.5));
@@ -48,7 +92,7 @@ export function estimatePromptBudget(prompt: string, model: string): BudgetSnaps
     tokenizerFamily: descriptor.family,
     tokenizerLabel: descriptor.label,
     promptChars: prompt.length,
-    calibrationRatio: null,
+    calibrationRatio: opts?.calibrationRatio ?? null,
   };
 }
 
@@ -174,6 +218,62 @@ export async function countRecentDivergences(
 
 // Convenience alias matching the import shape used by heartbeat.ts.
 export { sql };
+
+// ---------------------------------------------------------------------------
+// Round 3 Phase 6 PR 6.4 — per-run calibration snapshot + cache-hit tracker.
+//
+// Goals:
+//   1. Compute the rolling-median ratio ONCE at run start and reuse it
+//      across the composer, shadow composer, summarizer triggers, and any
+//      summarizer driver invocation. Running the DB query per-call was
+//      wasteful and left each call-site free to pick a slightly different
+//      ratio — breaking the cache-prefix stability invariant.
+//   2. Observe whether the composer's cachePrefixHash matches the prior
+//      run's for the same agent. If so the model's prompt cache should
+//      hit; if not we've busted it and should investigate upstream state
+//      changes. In-memory only — restart resets the tracker which just
+//      means a single "miss" log until the next wake, no incorrect state.
+// ---------------------------------------------------------------------------
+
+export async function snapshotCalibrationRatio(
+  db: Db,
+  family: ModelFamily,
+): Promise<number | null> {
+  try {
+    return await rollingMedianRatio(db, family);
+  } catch (err) {
+    logger.debug({ err, family }, "context_budget.ratio_snapshot_failed");
+    return null;
+  }
+}
+
+const lastCachePrefixByAgent = new Map<string, string>();
+
+export interface CacheTrackerResult {
+  hit: boolean;
+  previousHash: string | null;
+}
+
+// Reset helper — test-only, kept exported so vitest can guarantee isolation
+// between suites sharing the process.
+export function _resetCacheTracker(): void {
+  lastCachePrefixByAgent.clear();
+}
+
+export function trackCachePrefixHit(
+  agentId: string,
+  currentHash: string | null | undefined,
+): CacheTrackerResult {
+  const normalized = typeof currentHash === "string" && currentHash.length > 0 ? currentHash : null;
+  const previous = lastCachePrefixByAgent.get(agentId) ?? null;
+  if (normalized) {
+    lastCachePrefixByAgent.set(agentId, normalized);
+  }
+  return {
+    hit: previous != null && normalized != null && previous === normalized,
+    previousHash: previous,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Round 3 Phase 4 — shadow-mode composer.
@@ -326,6 +426,70 @@ export function buildPreambleSectionsFromContext(
     }
   }
 
+  // Round 3 Phase 6 PR 6.1 — summarizer + recent-turns surfaces.
+  //
+  // Standing summary: cross-ticket facts (user prefs, repo conventions). Lives
+  // in the cache-stable tier because it refreshes at most every ~10 min, so
+  // stable placement pays off on the ~90%+ of wakes where it's unchanged.
+  const standing = readObject(context.combyneStandingSummary);
+  const standingBody = readString(standing?.body);
+  if (standingBody) {
+    out.push({
+      name: "standing",
+      content: standingBody,
+      priority: 3,
+      cacheStable: true,
+      truncationStrategy: "tail",
+      maxTokens: 3_000,
+    });
+  }
+
+  // Working summary: per-ticket scoped state (attempts, files, next-step).
+  // Vary because it tracks ticket progression and changes between wakes.
+  const working = readObject(context.combyneWorkingSummary);
+  const workingBody = readString(working?.body);
+  if (workingBody) {
+    out.push({
+      name: "working",
+      content: workingBody,
+      priority: 2,
+      cacheStable: false,
+      truncationStrategy: "tail",
+      maxTokens: 6_000,
+    });
+  }
+
+  // Recent raw turns, joined with role headers by the caller.
+  const recentTurns = readObject(context.combyneRecentTurns);
+  const recentTurnsBody = readString(recentTurns?.body);
+  if (recentTurnsBody) {
+    out.push({
+      name: "recentTurns",
+      content: recentTurnsBody,
+      priority: 2,
+      cacheStable: false,
+      // Drop oldest first when over budget — the most recent tail carries the
+      // active thread the agent is mid-way through.
+      truncationStrategy: "head",
+    });
+  }
+
+  // Tool results budget independently — a single `file_read` can swamp the
+  // prompt. Keep head + tail, middle-truncate with an omission marker.
+  const toolResults = readObject(context.combyneToolResults);
+  const toolResultsBody = readString(toolResults?.body);
+  if (toolResultsBody) {
+    out.push({
+      name: "toolResults",
+      content: toolResultsBody,
+      priority: 4,
+      cacheStable: false,
+      truncationStrategy: "middle",
+      // Caller should still set maxTokens ≈ floor(budget * 0.2) from
+      // heartbeat.ts where the actual budget is known.
+    });
+  }
+
   return out;
 }
 
@@ -349,6 +513,24 @@ export interface ShadowCompareResult {
 export function contextBudgetComposerEnabled(): boolean {
   const v = process.env.COMBYNE_CONTEXT_BUDGET_ENABLED;
   return v === "1" || v === "true";
+}
+
+// Round 3 Phase 7 (PR 6.5) — aggressive pruning A/B.
+//
+// Additive (default): preamble includes BOTH the summary row AND the raw
+// transcript tail (without a sinceOrdinal cutoff). Redundant but safe.
+// Aggressive: preamble includes the summary and ONLY raw turns whose
+// ordinal is strictly greater than the summary's cutoffSeq. Smaller prompt,
+// but leans entirely on the summarizer for anything pre-cutoff.
+//
+// Flip COMBYNE_CONTEXT_BUDGET_AGGRESSIVE_PRUNING=1 to enable aggressive.
+// Mode is recorded on each run via heartbeat_runs.promptBudgetJson.pruningMode
+// so we can A/B task-completion rate post-flip.
+export type PruningMode = "additive" | "aggressive";
+
+export function resolvePruningMode(): PruningMode {
+  const v = process.env.COMBYNE_CONTEXT_BUDGET_AGGRESSIVE_PRUNING;
+  return v === "1" || v === "true" ? "aggressive" : "additive";
 }
 
 // ---------------------------------------------------------------------------

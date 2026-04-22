@@ -52,6 +52,12 @@ export const issuesApi = {
       expectedStatuses: ["todo", "backlog", "blocked"],
     }),
   release: (id: string) => api.post<Issue>(`/issues/${id}/release`, {}),
+  forceUnlock: (id: string) =>
+    api.post<{
+      cleared: boolean;
+      previousRunId: string | null;
+      previousRunStatus: string | null;
+    }>(`/issues/${id}/force-unlock`, {}),
   listComments: (id: string) => api.get<IssueComment[]>(`/issues/${id}/comments`),
   addComment: (id: string, body: string, reopen?: boolean, interrupt?: boolean) =>
     api.post<IssueComment>(

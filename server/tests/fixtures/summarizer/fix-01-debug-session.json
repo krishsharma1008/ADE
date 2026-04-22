@@ -1,0 +1,47 @@
+{
+  "id": "fix-01-debug-session",
+  "description": "A single-ticket debugging session: agent investigates BUK-23, finds stale cache as the root cause, patches one file.",
+  "scope": "working",
+  "issueId": "00000000-0000-0000-0000-000000000023",
+  "summaryCutoffOrdinal": 14,
+  "transcript": [
+    { "ordinal": 1, "role": "user", "content": "BUK-23: the Inbox shows stale issue counts for 5-10 minutes after a status change. Investigate and fix." },
+    { "ordinal": 2, "role": "assistant", "content": "Starting investigation of BUK-23. I'll look at the inbox count query first." },
+    { "ordinal": 3, "role": "tool_result", "content": "Read server/src/routes/inbox.ts: the count query runs against a view named inbox_counts_v." },
+    { "ordinal": 4, "role": "assistant", "content": "Checking how inbox_counts_v is populated. Looks like a materialized view in packages/db/src/schema/inbox.ts." },
+    { "ordinal": 5, "role": "tool_result", "content": "Confirmed: inbox_counts_v is a MATERIALIZED VIEW. A refresh job runs every 15 minutes via a cron at server/src/scheduler/inbox-refresh.ts." },
+    { "ordinal": 6, "role": "assistant", "content": "Root cause hypothesis: materialized view stale between refresh ticks. Need to refresh on status-change events instead of (or in addition to) the timer." },
+    { "ordinal": 7, "role": "tool_result", "content": "Grep found the status change handler at server/src/services/issues.ts:842 (changeStatus function)." },
+    { "ordinal": 8, "role": "assistant", "content": "Going to add a call to refreshInboxCounts() in the changeStatus transaction's after-commit hook." },
+    { "ordinal": 9, "role": "tool_result", "content": "Edit applied to server/src/services/issues.ts: added afterCommit hook calling refreshInboxCounts()." },
+    { "ordinal": 10, "role": "assistant", "content": "Running the issues-service test suite to confirm no regression." },
+    { "ordinal": 11, "role": "tool_result", "content": "pnpm vitest run issues.test.ts — 47 tests passed, 0 failed." },
+    { "ordinal": 12, "role": "assistant", "content": "Also adding a manual refresh endpoint at POST /admin/inbox/refresh for operator use." },
+    { "ordinal": 13, "role": "tool_result", "content": "Created server/src/routes/admin-inbox.ts with the refresh endpoint. Added route wiring in server/src/index.ts." },
+    { "ordinal": 14, "role": "assistant", "content": "Ready for commit. Fix: refresh inbox_counts_v after every status change + manual admin endpoint. Files modified: server/src/services/issues.ts, server/src/routes/admin-inbox.ts, server/src/index.ts." },
+    { "ordinal": 15, "role": "user", "content": "Did you add a test that the refresh actually fires on status change?" },
+    { "ordinal": 16, "role": "assistant", "content": "Not yet. Adding an integration test that changes issue status and asserts inbox_counts_v reflects the change within the same request." },
+    { "ordinal": 17, "role": "tool_result", "content": "Added test at server/src/services/__tests__/issues-inbox-refresh.test.ts. It passes." },
+    { "ordinal": 18, "role": "assistant", "content": "All green. Ready to commit." }
+  ],
+  "questions": [
+    {
+      "id": "q1",
+      "question": "What was the root cause of BUK-23?",
+      "oracleAnswer": "The inbox_counts_v materialized view was only refreshed every 15 minutes by a cron, so counts were stale between refreshes.",
+      "keyFacts": ["inbox_counts_v", "materialized view", "15 minutes"]
+    },
+    {
+      "id": "q2",
+      "question": "Which files were modified to fix BUK-23?",
+      "oracleAnswer": "server/src/services/issues.ts, server/src/routes/admin-inbox.ts, and server/src/index.ts.",
+      "keyFacts": ["issues.ts", "admin-inbox.ts", "index.ts"]
+    },
+    {
+      "id": "q3",
+      "question": "Is there a test covering the inbox refresh on status change?",
+      "oracleAnswer": "Yes — issues-inbox-refresh.test.ts was added and passes.",
+      "keyFacts": ["issues-inbox-refresh.test.ts"]
+    }
+  ]
+}

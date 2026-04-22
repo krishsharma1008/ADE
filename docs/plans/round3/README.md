@@ -18,8 +18,8 @@ the sub-plans carved out of it for implementation.
 - **Phase 9** — Transcript UI (Item #3).
 - **Phase 10** — Skills scoping (Item #4).
 - **Phase 11** — Project delete UI (Item #5).
-- **Phase 12** — Routine filter + optional auto-close (Item #8).
-- **Phase 13** — Docs + final integration.
+- **Phase 12** — Routine filter + optional auto-close (Item #8). ✅
+- **Phase 13** — Docs + final integration. ✅
 
 ## Sub-plan files
 

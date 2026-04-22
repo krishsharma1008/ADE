@@ -46,6 +46,51 @@ describe("buildPreambleSectionsFromContext", () => {
     const queue = sections.find((s) => s.name === "queue");
     expect(queue?.content).toBe("NEW_DIGEST");
   });
+
+  it("emits standing (cache-stable) and working (vary) from summarizer fields", () => {
+    const sections = buildPreambleSectionsFromContext({
+      combyneStandingSummary: { body: "STANDING_BODY", cutoffOrdinal: 42 },
+      combyneWorkingSummary: {
+        body: "WORKING_BODY",
+        cutoffOrdinal: 40,
+        issueId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      },
+    });
+    const standing = sections.find((s) => s.name === "standing");
+    const working = sections.find((s) => s.name === "working");
+    expect(standing).toBeDefined();
+    expect(standing!.cacheStable).toBe(true);
+    expect(standing!.maxTokens).toBe(3_000);
+    expect(working).toBeDefined();
+    expect(working!.cacheStable).toBe(false);
+    expect(working!.truncationStrategy).toBe("tail");
+  });
+
+  it("emits recentTurns (head-truncated) and toolResults (middle-truncated) when populated", () => {
+    const sections = buildPreambleSectionsFromContext({
+      combyneRecentTurns: { body: "TURN_1\nTURN_2", count: 2 },
+      combyneToolResults: { body: "RESULT_BLOB" },
+    });
+    const turns = sections.find((s) => s.name === "recentTurns");
+    const tools = sections.find((s) => s.name === "toolResults");
+    expect(turns?.truncationStrategy).toBe("head");
+    expect(turns?.cacheStable).toBe(false);
+    expect(tools?.truncationStrategy).toBe("middle");
+    expect(tools?.cacheStable).toBe(false);
+  });
+
+  it("skips summarizer/turns sections when bodies are empty strings", () => {
+    const sections = buildPreambleSectionsFromContext({
+      combyneStandingSummary: { body: "" },
+      combyneWorkingSummary: { body: "" },
+      combyneRecentTurns: { body: "" },
+      combyneToolResults: { body: "" },
+    });
+    expect(sections.find((s) => s.name === "standing")).toBeUndefined();
+    expect(sections.find((s) => s.name === "working")).toBeUndefined();
+    expect(sections.find((s) => s.name === "recentTurns")).toBeUndefined();
+    expect(sections.find((s) => s.name === "toolResults")).toBeUndefined();
+  });
 });
 
 describe("resolveContextBudgetTokens", () => {

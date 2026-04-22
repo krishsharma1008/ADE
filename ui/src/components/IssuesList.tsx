@@ -43,6 +43,7 @@ export type IssueViewState = {
   groupBy: "status" | "priority" | "assignee" | "none";
   viewMode: "list" | "board";
   collapsedGroups: string[];
+  includeRoutineRuns: boolean;
 };
 
 const defaultViewState: IssueViewState = {
@@ -55,6 +56,7 @@ const defaultViewState: IssueViewState = {
   groupBy: "none",
   viewMode: "list",
   collapsedGroups: [],
+  includeRoutineRuns: false,
 };
 
 const quickFilterPresets = [
@@ -89,6 +91,9 @@ function toggleInArray(arr: string[], value: string): string[] {
 
 function applyFilters(issues: Issue[], state: IssueViewState): Issue[] {
   let result = issues;
+  if (!state.includeRoutineRuns) {
+    result = result.filter((i) => i.originKind !== "routine_execution");
+  }
   if (state.statuses.length > 0) result = result.filter((i) => state.statuses.includes(i.status));
   if (state.priorities.length > 0) result = result.filter((i) => state.priorities.includes(i.priority));
   if (state.assignees.length > 0) result = result.filter((i) => i.assigneeAgentId != null && state.assignees.includes(i.assigneeAgentId));
@@ -374,6 +379,22 @@ export function IssuesList({
                       );
                     })}
                   </div>
+                </div>
+
+                {/* Origin toggle — Round 3 Phase 12 */}
+                <div className="space-y-1.5">
+                  <span className="text-xs text-muted-foreground">Origin</span>
+                  <button
+                    className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
+                      viewState.includeRoutineRuns
+                        ? "bg-primary text-primary-foreground border-primary"
+                        : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/30"
+                    }`}
+                    onClick={() => updateView({ includeRoutineRuns: !viewState.includeRoutineRuns })}
+                    title="Toggle routine-generated issues"
+                  >
+                    {viewState.includeRoutineRuns ? "Including routine runs" : "Hiding routine runs"}
+                  </button>
                 </div>
 
                 <div className="border-t border-border" />

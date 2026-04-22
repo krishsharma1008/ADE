@@ -44,6 +44,7 @@ export { companySkills } from "./company_skills.js";
 export { skillProjects } from "./skill_projects.js";
 export { skillAgents } from "./skill_agents.js";
 export { transcriptSummaries } from "./transcript_summaries.js";
+export { summarizerFailures } from "./summarizer_failures.js";
 export { tokenizerCalibration } from "./tokenizer_calibration.js";
 export { companyLogos } from "./company_logos.js";
 export { documents } from "./documents.js";

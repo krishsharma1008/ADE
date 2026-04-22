@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@combyne/db";
-import { projects, projectGoals, goals, projectWorkspaces } from "@combyne/db";
+import { projects, projectGoals, goals, projectWorkspaces, issues } from "@combyne/db";
+import { sql } from "drizzle-orm";
 import {
   PROJECT_COLORS,
   deriveProjectUrlKey,
@@ -385,16 +386,90 @@ export function projectService(db: Db) {
       return enriched ?? null;
     },
 
-    remove: (id: string) =>
-      db
-        .delete(projects)
+    // Round 3 Phase 11 — guarded delete.
+    //
+    // Returns either the deleted project or { error: "project_has_issues", ... }
+    // when issues still reference the project and force !== true. When force
+    // is passed, the issues are unlinked (project_id = null) and their
+    // current projectName is archived to `archived_project_name` so search /
+    // audit can still see where they used to live.
+    //
+    // Callers that previously relied on `.remove(id)` returning the deleted
+    // row can continue to ignore the error branch — the route handles it.
+    countIssues: async (projectId: string) => {
+      const [{ count }] = await db
+        .select({ count: sql<number>`cast(count(*) as int)` })
+        .from(issues)
+        .where(eq(issues.projectId, projectId));
+      const [{ count: openCount }] = await db
+        .select({ count: sql<number>`cast(count(*) as int)` })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.projectId, projectId),
+            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "awaiting_user", "blocked"] as const),
+          ),
+        );
+      return { total: Number(count), open: Number(openCount) };
+    },
+
+    remove: async (id: string, options: { force?: boolean } = {}) => {
+      const existing = await db
+        .select()
+        .from(projects)
         .where(eq(projects.id, id))
-        .returning()
-        .then((rows) => {
-          const row = rows[0] ?? null;
-          if (!row) return null;
-          return { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) };
-        }),
+        .then((rows) => rows[0] ?? null);
+      if (!existing) return { kind: "not_found" as const };
+
+      const [{ count }] = await db
+        .select({ count: sql<number>`cast(count(*) as int)` })
+        .from(issues)
+        .where(eq(issues.projectId, id));
+      const issueCount = Number(count);
+
+      if (issueCount > 0 && !options.force) {
+        const [{ count: openCount }] = await db
+          .select({ count: sql<number>`cast(count(*) as int)` })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.projectId, id),
+              inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "awaiting_user", "blocked"] as const),
+            ),
+          );
+        return {
+          kind: "conflict" as const,
+          issueCount,
+          openCount: Number(openCount),
+        };
+      }
+
+      return await db.transaction(async (tx) => {
+        if (issueCount > 0) {
+          // Archive the project name on each issue and null the FK so the
+          // project row can be deleted cleanly. ON DELETE SET NULL added in
+          // migration 0036 is a backstop; we do this explicitly for the
+          // archived_project_name capture.
+          await tx
+            .update(issues)
+            .set({
+              archivedProjectName: existing.name,
+              projectId: null,
+            })
+            .where(eq(issues.projectId, id));
+        }
+        const [deleted] = await tx
+          .delete(projects)
+          .where(eq(projects.id, id))
+          .returning();
+        if (!deleted) return { kind: "not_found" as const };
+        return {
+          kind: "deleted" as const,
+          project: { ...deleted, urlKey: deriveProjectUrlKey(deleted.name, deleted.id) },
+          unlinkedIssueCount: issueCount,
+        };
+      });
+    },
 
     listWorkspaces: async (projectId: string): Promise<ProjectWorkspace[]> => {
       const rows = await db

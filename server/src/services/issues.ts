@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   agents,
@@ -71,6 +71,8 @@ export interface IssueFilters {
   unreadForUserId?: string;
   projectId?: string;
   labelId?: string;
+  originKind?: string;
+  excludeOriginKind?: string;
   q?: string;
 }
 
@@ -475,6 +477,25 @@ export function issueService(db: Db) {
         conditions.push(unreadForUserCondition(companyId, unreadForUserId));
       }
       if (filters?.projectId) conditions.push(eq(issues.projectId, filters.projectId));
+      if (filters?.originKind) {
+        const kinds = filters.originKind.split(",").map((s) => s.trim()).filter(Boolean);
+        if (kinds.length === 1) {
+          conditions.push(eq(issues.originKind, kinds[0]));
+        } else if (kinds.length > 1) {
+          conditions.push(inArray(issues.originKind, kinds));
+        }
+      }
+      if (filters?.excludeOriginKind) {
+        const kinds = filters.excludeOriginKind
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        for (const kind of kinds) {
+          conditions.push(
+            or(ne(issues.originKind, kind), isNull(issues.originKind))!,
+          );
+        }
+      }
       if (filters?.labelId) {
         const labeledIssueIds = await db
           .select({ issueId: issueLabels.issueId })

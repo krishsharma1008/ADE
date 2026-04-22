@@ -1237,6 +1237,45 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
       return { triggered };
     },
 
+    // Round 3 Phase 12 — auto-close routine-origin issues whose parent routine
+    // has a non-null autoCloseAfterMs and the issue is older than the
+    // threshold. Only closes still-open issues (excludes terminal statuses).
+    // Returns `{ closed }` to surface in scheduler logs.
+    autoCloseExpiredRoutineIssues: async (now: Date = new Date()) => {
+      const dueRoutines = await db
+        .select({
+          id: routines.id,
+          autoCloseAfterMs: routines.autoCloseAfterMs,
+        })
+        .from(routines)
+        .where(isNotNull(routines.autoCloseAfterMs));
+      if (dueRoutines.length === 0) return { closed: 0 };
+
+      let closed = 0;
+      for (const row of dueRoutines) {
+        if (row.autoCloseAfterMs == null || row.autoCloseAfterMs <= 0) continue;
+        const cutoff = new Date(now.getTime() - Number(row.autoCloseAfterMs));
+        const rows = await db
+          .update(issues)
+          .set({
+            status: "done",
+            completedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.originKind, "routine_execution"),
+              eq(issues.originId, row.id),
+              inArray(issues.status, OPEN_ISSUE_STATUSES),
+              lte(issues.createdAt, cutoff),
+            ),
+          )
+          .returning({ id: issues.id });
+        closed += rows.length;
+      }
+      return { closed };
+    },
+
     syncRunStatusForIssue: async (issueId: string) => {
       const issue = await db
         .select({

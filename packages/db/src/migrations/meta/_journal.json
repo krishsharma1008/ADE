@@ -274,6 +274,13 @@
       "when": 1776369745900,
       "tag": "0038_routine_autoclose",
       "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1776369746100,
+      "tag": "0039_summarizer_ordinal_and_failures",
+      "breakpoints": true
     }
   ]
 }

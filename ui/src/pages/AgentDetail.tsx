@@ -64,6 +64,7 @@ import { isUuidLike, type Agent, type HeartbeatRun, type HeartbeatRunEvent, type
 import { agentRouteRef } from "../lib/utils";
 import { FileActions } from "../components/FileActions";
 import { AgentTerminalTab } from "../components/AgentTerminalTab";
+import { AgentContextBudgetCard } from "../components/AgentContextBudgetCard";
 
 const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string }> = {
   succeeded: { icon: CheckCircle2, color: "text-green-600 dark:text-green-400" },
@@ -864,6 +865,9 @@ function AgentOverview({
           <SuccessRateChart runs={runs} />
         </ChartCard>
       </div>
+
+      {/* Context budget + summarizer settings */}
+      <AgentContextBudgetCard agent={agent} companyId={agent.companyId} />
 
       {/* Recent Issues */}
       <div className="space-y-3">
@@ -2495,6 +2499,95 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
               );
             })}
           </div>
+        </div>
+      )}
+
+      <PersistedTranscriptSection runId={run.id} />
+    </div>
+  );
+}
+
+/* ---- Persisted Transcript Section ---- */
+
+const TRANSCRIPT_ROLE_STYLE: Record<string, string> = {
+  user: "text-neutral-500 dark:text-neutral-400",
+  assistant: "text-green-700 dark:text-green-300",
+  system: "text-blue-700 dark:text-blue-300",
+  tool_call: "text-yellow-700 dark:text-yellow-300",
+  tool_result: "text-purple-700 dark:text-purple-300",
+  stderr: "text-red-700 dark:text-red-300",
+  lifecycle: "text-cyan-700 dark:text-cyan-300",
+};
+
+function PersistedTranscriptSection({ runId }: { runId: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const [expandedEntries, setExpandedEntries] = useState<Record<string, boolean>>({});
+
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["run-transcript", runId],
+    queryFn: () => heartbeatsApi.transcript(runId),
+    enabled: expanded,
+  });
+
+  const entries = data?.entries ?? [];
+
+  return (
+    <div className="rounded-lg border border-border bg-background/60 p-3 space-y-2">
+      <button
+        type="button"
+        className="flex w-full items-center justify-between text-xs font-medium text-muted-foreground hover:text-foreground"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="flex items-center gap-1">
+          {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+          Persisted transcript {data ? `(${entries.length})` : ""}
+        </span>
+        <span className="text-[10px] text-muted-foreground">agent_transcripts</span>
+      </button>
+      {expanded && isLoading && (
+        <p className="text-xs text-muted-foreground">Loading transcript...</p>
+      )}
+      {expanded && error && (
+        <p className="text-xs text-red-600 dark:text-red-400">
+          {error instanceof Error ? error.message : "Failed to load transcript"}
+        </p>
+      )}
+      {expanded && data && entries.length === 0 && (
+        <p className="text-xs text-muted-foreground">No persisted transcript entries for this run.</p>
+      )}
+      {expanded && entries.length > 0 && (
+        <div className="space-y-1 font-mono text-xs">
+          {entries.map((entry) => {
+            const isJsonExpanded = !!expandedEntries[entry.id];
+            const roleColor = TRANSCRIPT_ROLE_STYLE[entry.role] ?? "text-foreground";
+            const ts = new Date(entry.createdAt).toLocaleTimeString("en-US", { hour12: false });
+            const kind = entry.contentKind ? `:${entry.contentKind}` : "";
+            return (
+              <div key={entry.id} className="grid grid-cols-[auto_auto_1fr] gap-x-2 items-baseline py-0.5">
+                <span className="text-neutral-400 dark:text-neutral-600 select-none w-16 text-[10px]">{ts}</span>
+                <span className={cn("w-28 text-[10px]", roleColor)}>
+                  {entry.role}
+                  {kind}
+                </span>
+                <div className="min-w-0">
+                  <button
+                    type="button"
+                    className="text-[10px] text-muted-foreground hover:text-foreground"
+                    onClick={() =>
+                      setExpandedEntries((prev) => ({ ...prev, [entry.id]: !prev[entry.id] }))
+                    }
+                  >
+                    {isJsonExpanded ? "hide JSON" : "show JSON"}
+                  </button>
+                  {isJsonExpanded && (
+                    <pre className="mt-1 bg-neutral-100 dark:bg-neutral-950 rounded p-2 text-[11px] overflow-x-auto whitespace-pre-wrap text-neutral-700 dark:text-neutral-300">
+                      {JSON.stringify(entry.content, null, 2)}
+                    </pre>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
