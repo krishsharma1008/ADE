@@ -23,6 +23,8 @@ import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstr
 import { loadAssignedIssueQueue } from "./agent-queue.js";
 import {
   estimatePromptBudget,
+  runShadowComposer,
+  resolveContextBudgetTokens,
   persistRunBudget,
   recordCalibrationSample,
   shouldAlertDivergence,
@@ -1597,6 +1599,41 @@ export function heartbeatService(db: Db) {
             },
             "context_budget.estimated",
           );
+
+          // Phase 4 shadow composer — compose from the section context
+          // fields and compare against the adapter's actual prompt. No
+          // behavior change; logged for measurement only.
+          const shadow = runShadowComposer({
+            context,
+            adapterType: agent.adapterType,
+            adapterConfig: (agent.adapterConfig ?? {}) as Record<string, unknown>,
+            actualPrompt: meta.prompt,
+            model: modelName,
+          });
+          if (shadow) {
+            logger.info(
+              {
+                runId: currentRun.id,
+                agentId: agent.id,
+                budget: resolveContextBudgetTokens(
+                  agent.adapterType,
+                  (agent.adapterConfig ?? {}) as Record<string, unknown>,
+                ),
+                composedTokens: shadow.composed.totalTokens,
+                stableTokens: shadow.composed.stableTokens,
+                varyTokens: shadow.composed.varyTokens,
+                actualPromptTokens: shadow.actualPromptTokens,
+                deltaPct: Number((shadow.deltaPct * 100).toFixed(1)),
+                bytesSaved: shadow.bytesSaved,
+                dropped: shadow.composed.dropped,
+                truncated: shadow.composed.truncated,
+                warnings: shadow.composed.warnings,
+                cachePrefixHash: shadow.composed.cachePrefixHash.slice(0, 12),
+                sectionUsage: shadow.composed.usage,
+              },
+              "context_budget.shadow_composition",
+            );
+          }
         }
 
         await appendRunEvent(currentRun, seq++, {

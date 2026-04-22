@@ -61,3 +61,12 @@ export interface TokenizerInfo extends ModelDescriptor {
 export function tokenizerInfo(model: string): TokenizerInfo {
   return resolveModel(model);
 }
+
+export {
+  composeBudgetedPreamble,
+  type ComposeOptions,
+  type ComposedPreamble,
+  type PreambleSection,
+  type SectionName,
+  type TruncationStrategy,
+} from "./composer.js";
