@@ -20,12 +20,13 @@ export interface AssignedQueueResult {
   totalOpen: number;
   awaitingCount: number;
   body: string;
+  focusBody: string;
+  digestBody: string;
+  directive: string | null;
+  focusItem: AssignedIssueSummary | null;
+  currentIssueMissing: boolean;
 }
 
-// Canonical "open" statuses come from @combyne/shared. Prior to Round 3 this
-// file hard-coded a list that (a) invented a `review` status that never
-// existed and (b) silently excluded `todo`, so todo/in_review issues never
-// surfaced in the queue preamble. Keeping a local alias for test introspection.
 const OPEN_STATUSES = OPEN_ISSUE_STATUSES;
 const PRIORITY_ORDER: Record<string, number> = {
   critical: 0,
@@ -35,11 +36,59 @@ const PRIORITY_ORDER: Record<string, number> = {
   low: 3,
 };
 
+const FOCUS_DIRECTIVE =
+  "Respond only to the current focus issue. Other items below are context for " +
+  "awareness only — do not work on them unless explicitly reassigned.";
+
 export interface LoadAssignedQueueOptions {
   companyId: string;
   agentId: string;
   currentIssueId?: string | null;
+  currentIssueBody?: string | null;
   limit?: number;
+  focusMode?: boolean;
+}
+
+const FOCUS_BODY_TRUNCATE = 512;
+
+function renderDigestLine(item: AssignedIssueSummary): string {
+  const ident = item.identifier ? `${item.identifier} — ` : "";
+  const markers: string[] = [];
+  if (item.awaiting) markers.push("awaiting user");
+  if (item.priority === "urgent" || item.priority === "critical" || item.priority === "high") {
+    markers.push(item.priority);
+  }
+  const tail = markers.length > 0 ? ` _(${markers.join(", ")})_` : "";
+  return `- [${item.status}] ${ident}${item.title}${tail}`;
+}
+
+function renderFocusSection(
+  item: AssignedIssueSummary,
+  body: string | null,
+  directive: string,
+): string {
+  const ident = item.identifier ? `${item.identifier} — ` : "";
+  const lines: string[] = [];
+  lines.push(`## 🎯 Current focus: ${ident}${item.title}`);
+  lines.push(`> ${directive}`);
+  lines.push("");
+  lines.push(`- Status: \`${item.status}\``);
+  lines.push(`- Priority: \`${item.priority}\``);
+  if (item.awaiting) lines.push("- Awaiting user");
+  if (item.updatedAt) lines.push(`- Updated: ${item.updatedAt}`);
+  if (body) {
+    const trimmed = body.trim();
+    if (trimmed.length > 0) {
+      const capped =
+        trimmed.length > FOCUS_BODY_TRUNCATE
+          ? `${trimmed.slice(0, FOCUS_BODY_TRUNCATE)}…`
+          : trimmed;
+      lines.push("");
+      lines.push("Issue description:");
+      lines.push(capped);
+    }
+  }
+  return lines.join("\n");
 }
 
 export async function loadAssignedIssueQueue(
@@ -47,6 +96,7 @@ export async function loadAssignedIssueQueue(
   opts: LoadAssignedQueueOptions,
 ): Promise<AssignedQueueResult> {
   const limit = Math.min(Math.max(opts.limit ?? 25, 1), 100);
+  const focusMode = opts.focusMode ?? true;
   const rows = await db
     .select({
       id: issues.id,
@@ -70,7 +120,6 @@ export async function loadAssignedIssueQueue(
 
   const currentId = opts.currentIssueId ?? null;
   const sorted = [...rows].sort((a, b) => {
-    // Currently-woken issue first, then priority, then awaiting_user, then recency.
     if (currentId && a.id === currentId && b.id !== currentId) return -1;
     if (currentId && b.id === currentId && a.id !== currentId) return 1;
     const pa = PRIORITY_ORDER[a.priority] ?? 99;
@@ -89,7 +138,9 @@ export async function loadAssignedIssueQueue(
     title: row.title,
     status: row.status,
     priority: row.priority,
-    awaitingUserSince: row.awaitingUserSince ? new Date(row.awaitingUserSince).toISOString() : null,
+    awaitingUserSince: row.awaitingUserSince
+      ? new Date(row.awaitingUserSince).toISOString()
+      : null,
     awaiting: row.status === "awaiting_user",
     isCurrent: Boolean(currentId && row.id === currentId),
     updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : null,
@@ -97,26 +148,49 @@ export async function loadAssignedIssueQueue(
 
   const awaitingCount = items.filter((i) => i.awaiting).length;
 
-  const lines: string[] = [];
-  if (items.length === 0) {
-    lines.push("_No open issues assigned to you right now._");
-  } else {
-    for (const item of items) {
-      const ident = item.identifier ? `${item.identifier} — ` : "";
-      const markers: string[] = [];
-      if (item.isCurrent) markers.push("**current**");
-      if (item.awaiting) markers.push("awaiting user");
-      if (item.priority === "urgent" || item.priority === "high") markers.push(item.priority);
-      const tail = markers.length > 0 ? ` _(${markers.join(", ")})_` : "";
-      lines.push(`- [${item.status}] ${ident}${item.title}${tail}`);
-    }
+  const focusItem = currentId ? items.find((i) => i.id === currentId) ?? null : null;
+  const currentIssueMissing = Boolean(currentId) && focusItem === null;
+  const otherItems = focusItem ? items.filter((i) => i.id !== focusItem.id) : items;
+
+  // Focus block — only present when focusMode is on AND a real focus issue resolved.
+  let focusBody = "";
+  let directive: string | null = null;
+  if (focusMode && focusItem) {
+    directive = FOCUS_DIRECTIVE;
+    focusBody = renderFocusSection(focusItem, opts.currentIssueBody ?? null, directive);
   }
 
-  // Keep body bounded so it can't bloat the prompt on agents with huge backlogs.
-  const MAX_BODY_BYTES = 8_000;
-  let body = lines.join("\n");
-  if (body.length > MAX_BODY_BYTES) {
-    body = `${body.slice(0, MAX_BODY_BYTES)}\n…(truncated)`;
+  // Digest block — one line per other open issue (labelled only when focus is on).
+  const digestLines: string[] = [];
+  if (otherItems.length === 0 && !focusItem) {
+    digestLines.push("_No open issues assigned to you right now._");
+  } else if (otherItems.length > 0) {
+    if (focusMode && focusItem) {
+      digestLines.push(
+        "## Other open issues (do not work on these unless explicitly reassigned)",
+      );
+    }
+    for (const item of otherItems) {
+      digestLines.push(renderDigestLine(item));
+    }
+  }
+  let digestBody = digestLines.join("\n");
+
+  const MAX_DIGEST_BYTES = 8_000;
+  if (digestBody.length > MAX_DIGEST_BYTES) {
+    digestBody = `${digestBody.slice(0, MAX_DIGEST_BYTES)}\n…(truncated)`;
+  }
+
+  // Backward-compatible combined body: focus-first when present, otherwise digest.
+  // Existing consumers that read `body` keep working; new consumers prefer
+  // `focusBody`/`digestBody` explicitly and handle the ordering themselves.
+  let body = "";
+  if (focusBody && digestBody) {
+    body = `${focusBody}\n\n${digestBody}`;
+  } else if (focusBody) {
+    body = focusBody;
+  } else {
+    body = digestBody;
   }
 
   return {
@@ -124,12 +198,16 @@ export async function loadAssignedIssueQueue(
     totalOpen: rows.length > limit ? limit : rows.length,
     awaitingCount,
     body,
+    focusBody,
+    digestBody,
+    directive,
+    focusItem,
+    currentIssueMissing,
   };
 }
 
-// Exposed for testing so we don't accidentally accept "done"/"cancelled" into
-// the live queue if the constants change.
 export const __internals = {
   OPEN_STATUSES,
   PRIORITY_ORDER,
+  FOCUS_DIRECTIVE,
 };

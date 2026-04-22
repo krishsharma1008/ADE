@@ -137,6 +137,77 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
     expect(result.items[0]?.id).toBe(currentId);
   });
 
+  it("renders a focus block with directive and excludes current issue from digest (Round 3 #2)", async () => {
+    const rows = await handle.db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eqTitle("open high-priority"));
+    const currentId = rows[0]?.id;
+    expect(currentId).toBeDefined();
+
+    const result = await loadAssignedIssueQueue(handle.db, {
+      companyId,
+      agentId,
+      currentIssueId: currentId,
+      currentIssueBody: "Fix the thing that Anurag flagged.",
+      focusMode: true,
+    });
+
+    // Focus block present and loud.
+    expect(result.focusBody).toMatch(/🎯 Current focus/);
+    expect(result.focusBody).toMatch(/open high-priority/);
+    expect(result.directive).toMatch(/only to the current focus issue/i);
+
+    // Digest block labels itself and lists OTHERS — never the focus issue.
+    expect(result.digestBody).toMatch(/Other open issues/);
+    expect(result.digestBody).toMatch(/awaiting user input/);
+    expect(result.digestBody).toMatch(/todo item/);
+    expect(result.digestBody).not.toMatch(/open high-priority/);
+
+    // Combined body leads with the focus section so a consumer that only
+    // reads `.body` still gets correct ordering.
+    expect(result.body.indexOf("🎯 Current focus")).toBeLessThan(
+      result.body.indexOf("Other open issues"),
+    );
+
+    // currentIssueMissing is false when we find it.
+    expect(result.currentIssueMissing).toBe(false);
+  });
+
+  it("flags currentIssueMissing when the id does not resolve to an open row", async () => {
+    const result = await loadAssignedIssueQueue(handle.db, {
+      companyId,
+      agentId,
+      currentIssueId: "00000000-0000-0000-0000-000000000000",
+      focusMode: true,
+    });
+    expect(result.currentIssueMissing).toBe(true);
+    expect(result.focusBody).toBe("");
+    expect(result.directive).toBeNull();
+    // Digest still renders all open items.
+    expect(result.digestBody).toMatch(/open high-priority/);
+  });
+
+  it("falls back to legacy body when focusMode is disabled", async () => {
+    const rows = await handle.db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eqTitle("open high-priority"));
+    const currentId = rows[0]?.id;
+    expect(currentId).toBeDefined();
+
+    const result = await loadAssignedIssueQueue(handle.db, {
+      companyId,
+      agentId,
+      currentIssueId: currentId,
+      focusMode: false,
+    });
+    expect(result.focusBody).toBe("");
+    expect(result.directive).toBeNull();
+    // No "Other open issues" heading when focus is off.
+    expect(result.digestBody).not.toMatch(/Other open issues/);
+  });
+
   it("emits a helpful empty-queue body when the agent has nothing assigned", async () => {
     // Use the *other* agent which only has one in_progress issue owned by them.
     // Close that one manually so the queue is empty.
