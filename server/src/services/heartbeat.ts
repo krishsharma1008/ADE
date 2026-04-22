@@ -22,6 +22,8 @@ import { getPendingHandoffBrief, markHandoffConsumed } from "./agent-handoff.js"
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
 import { loadAssignedIssueQueue } from "./agent-queue.js";
 import {
+  composeAndApplyBudget,
+  contextBudgetComposerEnabled,
   estimatePromptBudget,
   runShadowComposer,
   resolveContextBudgetTokens,
@@ -1569,6 +1571,47 @@ export function heartbeatService(db: Db) {
         agent.companyId,
         mergedConfig,
       );
+
+      // Round 3 Phase 5 — composer-enabled mode. Opt-in via
+      // COMBYNE_CONTEXT_BUDGET_ENABLED=1. When on, the composer runs
+      // BEFORE the adapter builds its prompt and writes per-section
+      // token-budgeted content back into the context.combyne* fields.
+      // The existing byte caps in agent-queue / memory / adapter-utils
+      // stay in place as a defence-in-depth lower bound.
+      if (contextBudgetComposerEnabled()) {
+        try {
+          const modelName = asString(
+            (resolvedConfig as Record<string, unknown>).model,
+            agent.adapterType,
+          );
+          const result = composeAndApplyBudget(context, {
+            adapterType: agent.adapterType,
+            adapterConfig: (agent.adapterConfig ?? {}) as Record<string, unknown>,
+            model: modelName,
+          });
+          if (result) {
+            logger.info(
+              {
+                runId: run.id,
+                agentId: agent.id,
+                applied: result.applied,
+                skippedReason: result.skippedReason,
+                totalTokens: result.composed.totalTokens,
+                stableTokens: result.composed.stableTokens,
+                varyTokens: result.composed.varyTokens,
+                dropped: result.composed.dropped,
+                truncated: result.composed.truncated,
+                warnings: result.composed.warnings,
+                cachePrefixHash: result.composed.cachePrefixHash.slice(0, 12),
+              },
+              "context_budget.composer_applied",
+            );
+          }
+        } catch (err) {
+          logger.warn({ err, agentId: agent.id, runId }, "context_budget.fallback");
+        }
+      }
+
       // Round 3 Phase 3 — prompt-budget snapshot captured on the FIRST
       // adapter.invoke of the run. Telemetry-only for now: the composer
       // phase will consume this to decide truncation.

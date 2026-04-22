@@ -40,6 +40,24 @@ Three layers, dark-launched via feature flags:
 
 Override precedence: `adapterConfig.contextBudgetTokens` > `COMBYNE_<ADAPTER>_CONTEXT_BUDGET_TOKENS` env > default.
 
+## Shipping status (updated per phase)
+
+- Phase 3 (Tokenizer): **shipped** via `round3/phase3-tokenizer`. Telemetry-only. `@combyne/context-budget` exposes `countTokens`, `tokenizerInfo`, calibration store. heartbeat.ts persists `heartbeat_runs.prompt_budget_json` + writes to `tokenizer_calibration` after each run.
+- Phase 4 (Composer shadow): **shipped** via `round3/phase4-composer`. Greedy composer with per-section truncation + cache-prefix hashing. heartbeat.ts logs `context_budget.shadow_composition` with composed-vs-actual comparison on every run. No adapter behavior change.
+- Phase 5 (Composer enabled): **shipped** via `round3/phase5-composer-enabled`. Feature-gated by `COMBYNE_CONTEXT_BUDGET_ENABLED=1`. When on, `composeAndApplyBudget` writes token-budgeted content back into `context.combyne*` fields before the adapter assembles its prompt. Byte caps (16k memory, 8k queue, 32k stdout) remain as a hard floor.
+
+## Env flags (ops reference)
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `COMBYNE_CONTEXT_BUDGET_ENABLED` | unset (false) | Enable composer-applied budgeting. Telemetry always on. |
+| `COMBYNE_CLAUDE_LOCAL_CONTEXT_BUDGET_TOKENS` | 160000 | Override per-adapter budget. |
+| `COMBYNE_CODEX_LOCAL_CONTEXT_BUDGET_TOKENS` | 320000 | Same. |
+| `COMBYNE_PI_LOCAL_CONTEXT_BUDGET_TOKENS` | 24000 | Same. |
+| `COMBYNE_GEMINI_LOCAL_CONTEXT_BUDGET_TOKENS` | 800000 | Same. |
+
+Per-agent override: set `adapterConfig.contextBudgetTokens` on the agent row.
+
 ## Quality harness
 
 `scripts/eval-summaries.ts` — 10 canonical transcript fixtures, summarize → feed `summary + last_5_turns` to model → ask 5 canonical questions → judge vs oracle. Accuracy must stay ≥ 0.75 (additive mode) and ≥ 0.72 (aggressive mode).
