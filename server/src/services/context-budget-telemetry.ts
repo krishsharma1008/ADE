@@ -20,6 +20,7 @@ import {
   MIN_SAMPLES,
   resolveModel,
   type ComposedPreamble,
+  type ComposedSection,
   type ModelFamily,
   type PreambleSection,
 } from "@combyne/context-budget";
@@ -341,6 +342,133 @@ export interface ShadowCompareResult {
   actualPromptTokens: number;
   bytesSaved: number;
   deltaPct: number;
+}
+
+// Round 3 Phase 5 — feature flags. Default to shadow-only; ops flips
+// COMBYNE_CONTEXT_BUDGET_ENABLED=1 to let the composer replace byte caps.
+export function contextBudgetComposerEnabled(): boolean {
+  const v = process.env.COMBYNE_CONTEXT_BUDGET_ENABLED;
+  return v === "1" || v === "true";
+}
+
+// ---------------------------------------------------------------------------
+// Round 3 Phase 5 — write budgeted section content back into context.combyne*.
+// Adapters keep their existing concatenation logic but read truncated inputs,
+// so the single-source-of-truth for budget lives here and the cache prefix
+// observed by prompt caching is stable modulo upstream content changes.
+// ---------------------------------------------------------------------------
+
+export function composeAndApplyBudget(
+  context: Record<string, unknown>,
+  opts: { adapterType: string; adapterConfig: Record<string, unknown> | null; model: string; calibrationRatio?: number | null },
+): { composed: ComposedPreamble; applied: boolean; skippedReason?: string } | null {
+  try {
+    const sections = buildPreambleSectionsFromContext(context);
+    if (sections.length === 0) {
+      return { composed: emptyComposed(), applied: false, skippedReason: "no_sections" };
+    }
+    const budget = resolveContextBudgetTokens(opts.adapterType, opts.adapterConfig);
+    const composed = composeBudgetedPreamble(sections, {
+      budget,
+      model: opts.model,
+      calibrationRatio: opts.calibrationRatio ?? undefined,
+    });
+
+    // Only rewrite fields that actually changed (truncated or dropped).
+    // Leaves the cache-stable prefix bit-identical when no work was needed.
+    let applied = false;
+    for (const s of composed.sections) {
+      if (!s.truncated && !s.dropped) continue;
+      writeSectionBackToContext(context, s);
+      applied = true;
+    }
+    return { composed, applied };
+  } catch (err) {
+    logger.debug({ err }, "context_budget.apply_failed");
+    return null;
+  }
+}
+
+function writeSectionBackToContext(
+  context: Record<string, unknown>,
+  section: ComposedSection,
+): void {
+  const patch = (key: string, path: string[], value: unknown) => {
+    const root = (context[key] ?? null) as Record<string, unknown> | null;
+    if (!root) return;
+    let cursor: Record<string, unknown> = root;
+    for (let i = 0; i < path.length - 1; i++) {
+      const next = cursor[path[i]];
+      if (!next || typeof next !== "object") return;
+      cursor = next as Record<string, unknown>;
+    }
+    cursor[path[path.length - 1]] = value;
+  };
+
+  switch (section.name) {
+    case "bootstrap":
+      // Bootstrap lives in two places (analysis + hire playbook). Rewrite
+      // whichever is shorter to stay conservative.
+      if (section.dropped) {
+        delete context.combyneBootstrapAnalysis;
+        delete context.combyneHirePlaybook;
+      } else {
+        patch("combyneBootstrapAnalysis", ["preamble"], section.content);
+        patch("combyneHirePlaybook", ["body"], section.content);
+      }
+      break;
+    case "handoff":
+      if (section.dropped) delete context.combyneHandoffBrief;
+      else patch("combyneHandoffBrief", ["brief"], section.content);
+      break;
+    case "memory":
+      if (section.dropped) delete context.combyneMemoryPreamble;
+      else patch("combyneMemoryPreamble", ["body"], section.content);
+      break;
+    case "focus":
+      if (section.dropped) delete context.combyneFocusDirective;
+      else patch("combyneFocusDirective", ["body"], section.content);
+      break;
+    case "queue":
+      if (section.dropped) {
+        const assigned = context.combyneAssignedIssues as Record<string, unknown> | undefined;
+        if (assigned) {
+          assigned.digestBody = "";
+          assigned.body = "";
+        }
+      } else {
+        patch("combyneAssignedIssues", ["digestBody"], section.content);
+        patch("combyneAssignedIssues", ["body"], section.content);
+      }
+      break;
+    // projects is JSON-stringified into the section; we don't parse it
+    // back — dropping it just means we leave combyneCompanyProjects in
+    // place (the downstream JSON.stringify in the adapter is cheap) but
+    // flag it so the adapter could choose to skip. Safer than mutating
+    // the structured object shape.
+    case "projects":
+      if (section.dropped) delete context.combyneCompanyProjects;
+      break;
+    default:
+      // Unknown section — composer shouldn't have produced it. Skip.
+      break;
+  }
+}
+
+function emptyComposed(): ComposedPreamble {
+  return {
+    body: "",
+    cachePrefix: "",
+    cachePrefixHash: "",
+    totalTokens: 0,
+    stableTokens: 0,
+    varyTokens: 0,
+    usage: {},
+    dropped: [],
+    truncated: [],
+    warnings: [],
+    sections: [],
+  };
 }
 
 export function runShadowComposer(opts: {

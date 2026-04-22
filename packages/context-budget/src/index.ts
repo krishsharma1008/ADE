@@ -66,6 +66,7 @@ export {
   composeBudgetedPreamble,
   type ComposeOptions,
   type ComposedPreamble,
+  type ComposedSection,
   type PreambleSection,
   type SectionName,
   type TruncationStrategy,

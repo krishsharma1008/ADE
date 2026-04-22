@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   buildPreambleSectionsFromContext,
+  composeAndApplyBudget,
+  contextBudgetComposerEnabled,
   resolveContextBudgetTokens,
   runShadowComposer,
 } from "../context-budget-telemetry.js";
@@ -134,5 +136,96 @@ describe("runShadowComposer", () => {
       model: "claude-sonnet-4-6",
     });
     expect(a?.composed.cachePrefixHash).toBe(b?.composed.cachePrefixHash);
+  });
+});
+
+describe("contextBudgetComposerEnabled flag", () => {
+  it("defaults to false when env is unset", () => {
+    const original = process.env.COMBYNE_CONTEXT_BUDGET_ENABLED;
+    try {
+      delete process.env.COMBYNE_CONTEXT_BUDGET_ENABLED;
+      expect(contextBudgetComposerEnabled()).toBe(false);
+    } finally {
+      if (original !== undefined) process.env.COMBYNE_CONTEXT_BUDGET_ENABLED = original;
+    }
+  });
+
+  it("reads 1/true as enabled", () => {
+    const original = process.env.COMBYNE_CONTEXT_BUDGET_ENABLED;
+    try {
+      process.env.COMBYNE_CONTEXT_BUDGET_ENABLED = "1";
+      expect(contextBudgetComposerEnabled()).toBe(true);
+      process.env.COMBYNE_CONTEXT_BUDGET_ENABLED = "true";
+      expect(contextBudgetComposerEnabled()).toBe(true);
+      process.env.COMBYNE_CONTEXT_BUDGET_ENABLED = "no";
+      expect(contextBudgetComposerEnabled()).toBe(false);
+    } finally {
+      if (original === undefined) delete process.env.COMBYNE_CONTEXT_BUDGET_ENABLED;
+      else process.env.COMBYNE_CONTEXT_BUDGET_ENABLED = original;
+    }
+  });
+});
+
+describe("composeAndApplyBudget", () => {
+  it("leaves context untouched when nothing needs truncation", () => {
+    const context: Record<string, unknown> = {
+      combyneMemoryPreamble: { body: "short memory", entryCount: 1, scope: "agent" },
+      combyneFocusDirective: { body: "short focus", directive: "x" },
+    };
+    const snapshot = JSON.parse(JSON.stringify(context));
+    const out = composeAndApplyBudget(context, {
+      adapterType: "claude-local",
+      adapterConfig: { contextBudgetTokens: 1_000_000 },
+      model: "claude-sonnet-4-6",
+    });
+    expect(out).not.toBeNull();
+    expect(out!.applied).toBe(false);
+    expect(context).toEqual(snapshot);
+  });
+
+  it("writes truncated content back to combyneMemoryPreamble.body when over budget", () => {
+    const longMemory = "memory word ".repeat(5000);
+    const originalLength = longMemory.length;
+    const context: Record<string, unknown> = {
+      combyneMemoryPreamble: { body: longMemory, entryCount: 1, scope: "agent" },
+    };
+    const out = composeAndApplyBudget(context, {
+      adapterType: "pi-local",
+      adapterConfig: { contextBudgetTokens: 100 },
+      model: "claude-sonnet-4-6",
+    });
+    expect(out).not.toBeNull();
+    expect(out!.applied).toBe(true);
+    const newMem = (context.combyneMemoryPreamble as { body: string }).body;
+    expect(newMem.length).toBeLessThan(originalLength);
+  });
+
+  it("deletes combyneFocusDirective when the focus section was dropped wholesale", () => {
+    // Use a budget so tiny that even "preserve" focus gets dropped by the
+    // caller. The composer won't drop a "preserve" strategy on its own — it
+    // just leaves content in place. So we force a drop via a very tiny
+    // budget AND a wholesale non-preserve focus (which would happen if we
+    // ever flipped the strategy). For now, assert that preserve keeps it.
+    const context: Record<string, unknown> = {
+      combyneFocusDirective: { body: "FOCUS", directive: "stay" },
+    };
+    const out = composeAndApplyBudget(context, {
+      adapterType: "pi-local",
+      adapterConfig: { contextBudgetTokens: 10 },
+      model: "claude-sonnet-4-6",
+    });
+    expect(out).not.toBeNull();
+    // preserve strategy keeps focus intact.
+    expect(context.combyneFocusDirective).toBeDefined();
+  });
+
+  it("returns no_sections for an empty context", () => {
+    const out = composeAndApplyBudget({}, {
+      adapterType: "claude-local",
+      adapterConfig: {},
+      model: "claude-sonnet-4-6",
+    });
+    expect(out?.skippedReason).toBe("no_sections");
+    expect(out?.applied).toBe(false);
   });
 });

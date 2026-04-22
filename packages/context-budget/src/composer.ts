@@ -32,6 +32,14 @@ export interface PreambleSection {
   truncationStrategy: TruncationStrategy;
 }
 
+export interface ComposedSection {
+  name: string;
+  content: string;
+  tokens: number;
+  truncated: boolean;
+  dropped: boolean;
+}
+
 export interface ComposedPreamble {
   body: string;
   cachePrefix: string;
@@ -43,6 +51,7 @@ export interface ComposedPreamble {
   dropped: string[];
   truncated: string[];
   warnings: string[];
+  sections: ComposedSection[];
 }
 
 export interface ComposeOptions {
@@ -275,6 +284,14 @@ export function composeBudgetedPreamble(
 
   const body = cachePrefix && varyBody ? `${cachePrefix}${separator}${varyBody}` : cachePrefix || varyBody;
 
+  const composedSections: ComposedSection[] = [...renderedStable, ...renderedVary].map((r) => ({
+    name: String(r.section.name),
+    content: r.content,
+    tokens: r.tokens,
+    truncated: r.truncated,
+    dropped: r.dropped,
+  }));
+
   return {
     body,
     cachePrefix,
@@ -286,5 +303,6 @@ export function composeBudgetedPreamble(
     dropped,
     truncated,
     warnings,
+    sections: composedSections,
   };
 }
