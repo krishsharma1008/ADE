@@ -1308,12 +1308,58 @@ export function heartbeatService(db: Db) {
     // visibility into the rest of the queue — which is exactly what Chris saw
     // as "no tasks to run" in the test pilot. Capped inside the service.
     try {
+      // Focus mode — defaults ON. When enabled the queue service emits a loud
+      // "## 🎯 Current focus" block + directive so the model stops bleeding
+      // attention across sibling issues (Round 3 item #2).
+      const adapterCfgRaw = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+      const focusMode = adapterCfgRaw.focusMode !== false;
+
+      // Pull a short description body for the focus-block preview. Bounded
+      // inside renderFocusSection; we only fetch when a focus issue exists.
+      let focusIssueBody: string | null = null;
+      if (memoryIssueId && focusMode) {
+        const focusRow = await db
+          .select({ description: issues.description })
+          .from(issues)
+          .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        focusIssueBody = focusRow?.description ?? null;
+      }
+
       const queue = await loadAssignedIssueQueue(db, {
         companyId: agent.companyId,
         agentId: agent.id,
         currentIssueId: memoryIssueId ?? null,
+        currentIssueBody: focusIssueBody,
+        focusMode,
       });
       context.combyneAssignedIssues = queue;
+
+      if (queue.focusBody && queue.directive) {
+        context.combyneFocusDirective = {
+          body: queue.focusBody,
+          directive: queue.directive,
+          issueId: memoryIssueId,
+        };
+      }
+
+      if (queue.currentIssueMissing) {
+        logger.warn(
+          { agentId: agent.id, runId, currentIssueId: memoryIssueId },
+          "agent_queue.current_issue_missing",
+        );
+      }
+      if (queue.focusItem) {
+        logger.debug(
+          {
+            agentId: agent.id,
+            runId,
+            issueId: queue.focusItem.id,
+            bodyChars: queue.focusBody.length,
+          },
+          "agent_queue.focus_section_rendered",
+        );
+      }
     } catch (err) {
       logger.debug({ err, agentId: agent.id, runId }, "failed to load assigned issue queue");
     }
