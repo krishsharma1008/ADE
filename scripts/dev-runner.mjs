@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { readFileSync, statSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const mode = process.argv[2] === "watch" ? "watch" : "dev";
 const cliArgs = process.argv.slice(3);
@@ -43,6 +46,68 @@ if (tailscaleAuth) {
 }
 
 const pnpmBin = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+
+// Preflight: detect stale workspace installs. When a teammate pulls code that
+// introduces a new workspace package (e.g. @combyne/context-budget) and runs
+// `pnpm dev` without first running `pnpm install`, node fails with a cryptic
+// `ERR_MODULE_NOT_FOUND`. Scan the server's workspace:* deps against the
+// linked node_modules and auto-heal if anything is missing or outdated.
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+function collectMissingWorkspaceLinks() {
+  const pkgPath = resolve(repoRoot, "server/package.json");
+  let pkg;
+  try {
+    pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  } catch {
+    return [];
+  }
+  const allDeps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+  const missing = [];
+  for (const [name, spec] of Object.entries(allDeps)) {
+    if (typeof spec !== "string" || !spec.startsWith("workspace:")) continue;
+    const linkPath = resolve(repoRoot, "server/node_modules", name);
+    try {
+      statSync(linkPath);
+    } catch {
+      missing.push(name);
+    }
+  }
+  return missing;
+}
+
+function lockfileNewerThanInstall() {
+  try {
+    const lock = statSync(resolve(repoRoot, "pnpm-lock.yaml")).mtimeMs;
+    const marker = statSync(resolve(repoRoot, "node_modules/.modules.yaml")).mtimeMs;
+    return lock > marker + 1000;
+  } catch {
+    return false;
+  }
+}
+
+const missingLinks = collectMissingWorkspaceLinks();
+const staleInstall = lockfileNewerThanInstall();
+
+if (missingLinks.length > 0 || staleInstall) {
+  if (missingLinks.length > 0) {
+    console.log(
+      `[combyne] missing workspace deps: ${missingLinks.join(", ")} — running pnpm install…`,
+    );
+  } else {
+    console.log("[combyne] pnpm-lock.yaml changed since last install — running pnpm install…");
+  }
+  const install = spawnSync(pnpmBin, ["install"], {
+    cwd: repoRoot,
+    stdio: "inherit",
+    shell: process.platform === "win32",
+  });
+  if (install.status !== 0) {
+    console.error("[combyne] pnpm install failed — aborting dev start.");
+    process.exit(install.status ?? 1);
+  }
+}
+
 const serverScript = mode === "watch" ? "dev:watch" : "dev";
 const child = spawn(
   pnpmBin,
@@ -57,4 +122,3 @@ child.on("exit", (code, signal) => {
   }
   process.exit(code ?? 0);
 });
-
