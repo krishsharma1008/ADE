@@ -29,6 +29,7 @@ export { workProductService } from "./work-products.js";
 export { logActivity, type LogActivityInput } from "./activity-log.js";
 export { notifyHireApproved, type NotifyHireApprovedInput } from "./hire-hook.js";
 export { integrationService } from "./integrations.js";
+export { memoryService, type MemoryService, embedText, cosineSimilarity, rankEntries } from "./memory.js";
 export { createJiraClient } from "./jira.js";
 export { createConfluentClient } from "./confluent.js";
 export { createGitHubClient } from "./github.js";

@@ -216,6 +216,26 @@ export type {
   WorkspaceOperationStatus,
   WorkspaceOperation,
 } from "./workspace-operation.js";
+export {
+  MEMORY_LAYERS,
+  MEMORY_KINDS,
+  MEMORY_STATUSES,
+  MEMORY_OWNER_TYPES,
+  MEMORY_PROMOTION_STATES,
+} from "./memory.js";
+export type {
+  MemoryLayer,
+  MemoryKind,
+  MemoryStatus,
+  MemoryOwnerType,
+  MemoryPromotionState,
+  MemoryEntry,
+  MemoryManifestItem,
+  MemoryQueryResult,
+  MemoryManifest,
+  MemoryCoreContext,
+  MemoryPromotion,
+} from "./memory.js";
 export type {
   ExecutionWorkspaceStrategyType,
   ProjectExecutionWorkspaceDefaultMode,
