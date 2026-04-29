@@ -328,3 +328,22 @@ export {
   type SetPluginState,
   type ListPluginState,
 } from "./plugin.js";
+
+export {
+  createMemoryEntrySchema,
+  updateMemoryEntrySchema,
+  memoryQuerySchema,
+  memoryManifestQuerySchema,
+  memoryCoreBuildSchema,
+  memoryRecordUsageSchema,
+  memoryProposePromotionSchema,
+  memoryDecidePromotionSchema,
+  type CreateMemoryEntry,
+  type UpdateMemoryEntry,
+  type MemoryQuery,
+  type MemoryManifestQuery,
+  type MemoryCoreBuild,
+  type MemoryRecordUsage,
+  type MemoryProposePromotion,
+  type MemoryDecidePromotion,
+} from "./memory.js";

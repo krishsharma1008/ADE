@@ -67,3 +67,4 @@ export { pluginLogs } from "./plugin_logs.js";
 export { pluginCompanySettings } from "./plugin_company_settings.js";
 export { issuePlans } from "./issue_plans.js";
 export { routines, routineTriggers, routineRuns } from "./routines.js";
+export { memoryEntries, memoryPromotions, memoryUsage } from "./memory_layers.js";

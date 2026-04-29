@@ -193,6 +193,17 @@ export type {
   WorkspaceOperation,
   WorkspaceOperationPhase,
   WorkspaceOperationStatus,
+  MemoryLayer,
+  MemoryKind,
+  MemoryStatus,
+  MemoryOwnerType,
+  MemoryPromotionState,
+  MemoryEntry,
+  MemoryManifestItem,
+  MemoryQueryResult,
+  MemoryManifest,
+  MemoryCoreContext,
+  MemoryPromotion,
   WorkspaceRuntimeDesiredState,
   ExecutionWorkspaceStrategyType,
   ExecutionWorkspaceMode,
@@ -334,6 +345,14 @@ export type {
   SonarQubeIssue,
   SonarQubeMetric,
 } from "./types/index.js";
+
+export {
+  MEMORY_LAYERS,
+  MEMORY_KINDS,
+  MEMORY_STATUSES,
+  MEMORY_OWNER_TYPES,
+  MEMORY_PROMOTION_STATES,
+} from "./types/memory.js";
 
 export {
   instanceGeneralSettingsSchema,
@@ -600,6 +619,22 @@ export {
   type GitHubCreateComment,
   type SonarQubeListIssues,
   type SonarQubeGetMetrics,
+  createMemoryEntrySchema,
+  updateMemoryEntrySchema,
+  memoryQuerySchema,
+  memoryManifestQuerySchema,
+  memoryCoreBuildSchema,
+  memoryRecordUsageSchema,
+  memoryProposePromotionSchema,
+  memoryDecidePromotionSchema,
+  type CreateMemoryEntry,
+  type UpdateMemoryEntry,
+  type MemoryQuery,
+  type MemoryManifestQuery,
+  type MemoryCoreBuild,
+  type MemoryRecordUsage,
+  type MemoryProposePromotion,
+  type MemoryDecidePromotion,
 } from "./validators/index.js";
 
 export { API_PREFIX, API } from "./api.js";

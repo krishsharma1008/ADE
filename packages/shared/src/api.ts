@@ -25,4 +25,5 @@ export const API = {
   budgets: `${API_PREFIX}/budgets`,
   documents: `${API_PREFIX}/documents`,
   finance: `${API_PREFIX}/finance`,
+  memory: `${API_PREFIX}/memory`,
 } as const;
