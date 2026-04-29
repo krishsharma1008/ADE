@@ -17,6 +17,7 @@ import { useProjectOrder } from "../hooks/useProjectOrder";
 import { relativeTime, cn, formatTokens } from "../lib/utils";
 import { InlineEditor } from "../components/InlineEditor";
 import { CommentThread } from "../components/CommentThread";
+import { PromptHistoryDrawer } from "../components/PromptHistoryDrawer";
 import { IssueProperties } from "../components/IssueProperties";
 import { LiveRunWidget } from "../components/LiveRunWidget";
 import type { MentionOption } from "../components/MarkdownEditor";
@@ -156,7 +157,7 @@ function ActorIdentity({ evt, agentMap }: { evt: ActivityEvent; agentMap: Map<st
 }
 
 export function IssueDetail() {
-  const { issueId } = useParams<{ issueId: string }>();
+  const { issueId, companyPrefix } = useParams<{ issueId: string; companyPrefix: string }>();
   const { selectedCompanyId } = useCompany();
   const { openPanel, closePanel, panelVisible, setPanelVisible } = usePanel();
   const { setBreadcrumbs } = useBreadcrumbs();
@@ -170,6 +171,7 @@ export function IssueDetail() {
     cost: false,
   });
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [promptHistoryRunId, setPromptHistoryRunId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastMarkedReadIssueIdRef = useRef<string | null>(null);
 
@@ -769,13 +771,26 @@ export function IssueDetail() {
         </div>
       )}
 
-      {openQuestions.length > 0 && (
+      {openQuestions.length > 0 &&
+        issue.status !== "done" &&
+        issue.status !== "cancelled" && (
         <div className="flex flex-col gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-sm text-amber-800 dark:text-amber-200">
-          <div className="flex items-center gap-2 font-medium">
-            <HelpCircle className="h-4 w-4 shrink-0" />
-            {openQuestions.length === 1
-              ? "Agent has a question for you"
-              : `Agent has ${openQuestions.length} questions for you`}
+          <div className="flex items-center justify-between gap-2 font-medium">
+            <div className="flex items-center gap-2">
+              <HelpCircle className="h-4 w-4 shrink-0" />
+              {openQuestions.length === 1
+                ? "Agent has a question for you"
+                : `Agent has ${openQuestions.length} questions for you`}
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => updateIssue.mutate({ status: "done" })}
+              disabled={updateIssue.isPending}
+              className="text-amber-900 hover:bg-amber-500/20 dark:text-amber-100"
+            >
+              {updateIssue.isPending ? "Closing…" : "Close ticket"}
+            </Button>
           </div>
           {openQuestions.map((q) => (
             <QuestionAnswerCard
@@ -886,6 +901,12 @@ export function IssueDetail() {
                 reopen: closedStatuses.includes(issue.status),
               });
             }}
+            onClose={
+              issue.status === "done" || issue.status === "cancelled"
+                ? undefined
+                : () => updateIssue.mutate({ status: "done" })
+            }
+            closing={updateIssue.isPending}
           />
         )}
       {issue.originKind === "terminal_session" &&
@@ -1192,6 +1213,7 @@ export function IssueDetail() {
               await uploadAttachment.mutateAsync(file);
             }}
             liveRunSlot={<LiveRunWidget issueId={issueId!} companyId={issue.companyId} />}
+            onOpenPromptHistory={(runId) => setPromptHistoryRunId(runId)}
           />
         </TabsContent>
 
@@ -1339,6 +1361,11 @@ export function IssueDetail() {
           </ScrollArea>
         </SheetContent>
       </Sheet>
+      <PromptHistoryDrawer
+        runId={promptHistoryRunId}
+        companyPrefix={companyPrefix ?? ""}
+        onClose={() => setPromptHistoryRunId(null)}
+      />
       <ScrollToBottom />
     </div>
   );
@@ -1350,12 +1377,16 @@ function ReplyAndWakeCard({
   extractedQuestions,
   latestRunText,
   onSubmit,
+  onClose,
+  closing,
 }: {
   issueStatus: string;
   pending: boolean;
   extractedQuestions: string[];
   latestRunText?: string;
   onSubmit: (body: string) => Promise<void>;
+  onClose?: () => void;
+  closing?: boolean;
 }) {
   const [freeText, setFreeText] = useState("");
   const [answers, setAnswers] = useState<Record<number, string>>({});
@@ -1475,9 +1506,22 @@ function ReplyAndWakeCard({
       />
       <div className="flex items-center justify-between gap-2">
         <span className="text-[11px] text-muted-foreground">⌘/Ctrl+Enter to send</span>
-        <Button size="sm" disabled={pending || !body} onClick={() => void submit()}>
-          {pending ? "Sending…" : buttonLabel}
-        </Button>
+        <div className="flex items-center gap-2">
+          {onClose && (
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={pending || closing}
+              onClick={onClose}
+              className="text-amber-900 hover:bg-amber-500/20 dark:text-amber-100"
+            >
+              {closing ? "Closing…" : "Close ticket"}
+            </Button>
+          )}
+          <Button size="sm" disabled={pending || !body} onClick={() => void submit()}>
+            {pending ? "Sending…" : buttonLabel}
+          </Button>
+        </div>
       </div>
     </div>
   );

@@ -71,6 +71,49 @@ ${Array.from({ length: 20 }, (_, i) => `- Q${i + 1}: Is item ${i + 1} important?
       const out = extractQuestionsFromText(text);
       expect(out).toEqual(["This is a proper question?"]);
     });
+
+    it("drops trailing pleasantries that look like questions", () => {
+      const text = `
+Migration finished. Tests pass.
+
+- Want me to do anything else?
+- Should I continue with the second phase?
+- Anything else you need?
+      `;
+      const out = extractQuestionsFromText(text);
+      expect(out).toEqual([]);
+    });
+
+    it("does not extract bare prose lines that happen to end in '?'", () => {
+      // Pre-fix: this prose-only "Should I continue?" leaked through and
+      // forced the issue into awaiting_user. After the fix Pass 2 requires
+      // an explicit bullet, so a bare line is ignored.
+      const text = `
+I finished the migration.
+Should I continue with the second phase?
+      `;
+      const out = extractQuestionsFromText(text);
+      expect(out).toEqual([]);
+    });
+
+    it("filters pleasantries even inside a dedicated Open questions section", () => {
+      const text = `
+## Open questions
+- Want me to do anything else?
+- Should we adopt the new payment provider?
+      `;
+      const out = extractQuestionsFromText(text);
+      expect(out).toEqual(["Should we adopt the new payment provider?"]);
+    });
+
+    it("still accepts a bare-line question inside a dedicated section", () => {
+      const text = `
+## Open questions
+Should we adopt the new payment provider?
+      `;
+      const out = extractQuestionsFromText(text);
+      expect(out).toEqual(["Should we adopt the new payment provider?"]);
+    });
   });
 
   describe("extractAndPostQuestions (DB integration)", () => {
@@ -166,6 +209,54 @@ That's all for now.
       });
       expect(result.posted).toBe(1); // only the new one
       expect(result.skippedExisting).toBe(1);
+    });
+
+    it("does not rebound a closed issue to awaiting_user", async () => {
+      // User closes the ticket while the agent run is still in flight.
+      // When the run finishes and the extractor runs, it must NOT post
+      // new question rows or flip the closed issue back to awaiting_user.
+      const [closedIssue] = await handle.db
+        .insert(issues)
+        .values({
+          companyId,
+          title: "Closed-mid-run ticket",
+          status: "done",
+          completedAt: new Date(),
+          priority: "low",
+          assigneeAgentId: agentId,
+        })
+        .returning();
+
+      const sourceText = `
+## Open questions
+1. A genuine clarifying question that should normally post?
+2. Another genuine clarifying question that should normally post?
+      `;
+      const result = await extractAndPostQuestions(handle.db, {
+        companyId,
+        agentId,
+        issueId: closedIssue.id,
+        sourceText,
+      });
+      expect(result.posted).toBe(0);
+      expect(result.statusTransitioned).toBe(false);
+
+      const questions = await handle.db
+        .select()
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, closedIssue.id),
+            eq(issueComments.kind, "question"),
+          ),
+        );
+      expect(questions).toHaveLength(0);
+
+      const [refreshed] = await handle.db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, closedIssue.id));
+      expect(refreshed.status).toBe("done");
     });
   });
 });

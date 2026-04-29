@@ -27,7 +27,7 @@ import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { setupTerminalWebSocketServer } from "./realtime/terminal-ws.js";
-import { heartbeatService, routineService } from "./services/index.js";
+import { heartbeatService, issueService, routineService } from "./services/index.js";
 import { SummarizerQueue, setSummarizerQueue } from "./services/summarizer-queue.js";
 import { makeAnthropicSummarizerDriver } from "./services/summarizer-driver-anthropic.js";
 import { createPersonasRouter } from "./routes/personas.js";
@@ -692,6 +692,19 @@ export async function startServer(): Promise<StartedServer> {
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any);
     const routines = routineService(db as any);
+    const issuesSvc = issueService(db as any);
+
+    // Awaiting-user backstop sweeper. Closes tickets stuck in
+    // awaiting_user past the configured threshold so they never
+    // become permanently stale. 0 disables the sweep entirely.
+    const AWAITING_USER_AUTOCLOSE_DAYS = Math.max(
+      0,
+      Number(process.env.AWAITING_USER_AUTOCLOSE_DAYS ?? "7") || 0,
+    );
+    const AWAITING_USER_AUTOCLOSE_MS =
+      AWAITING_USER_AUTOCLOSE_DAYS * 24 * 60 * 60 * 1000;
+    const AWAITING_USER_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
+    let lastAwaitingUserSweepAt = 0;
 
     // Reap orphaned runs at startup (no threshold -- runningProcesses is empty)
     void heartbeat.reapOrphanedRuns().catch((err) => {
@@ -748,6 +761,26 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "routine auto-close tick failed");
+          });
+      }
+
+      if (
+        AWAITING_USER_AUTOCLOSE_MS > 0 &&
+        now - lastAwaitingUserSweepAt >= AWAITING_USER_SWEEP_INTERVAL_MS
+      ) {
+        lastAwaitingUserSweepAt = now;
+        void issuesSvc
+          .autoCloseStaleAwaitingUserIssues(new Date(now), AWAITING_USER_AUTOCLOSE_MS)
+          .then((result) => {
+            if (result.closed > 0) {
+              logger.info(
+                { closed: result.closed, thresholdDays: AWAITING_USER_AUTOCLOSE_DAYS },
+                "awaiting_user sweeper closed stale issues",
+              );
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "awaiting_user sweeper tick failed");
           });
       }
     }, config.heartbeatSchedulerIntervalMs);

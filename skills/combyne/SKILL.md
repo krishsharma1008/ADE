@@ -64,6 +64,8 @@ If `COMBYNE_WAKE_COMMENT_ID` is set, find that specific comment first and treat 
 **Step 8 — Update status and communicate.** Always include the run ID header.
 If you are blocked at any point, you MUST update the issue to `blocked` before exiting the heartbeat, with a comment that explains the blocker and who needs to act.
 
+When the work is genuinely done, close it (`status: "done"`) instead of leaving the issue open and asking the user "anything else?" or "want me to keep going?". Trailing-pleasantry questions cause the ticket to land in `awaiting_user` and look stuck. If you only need clarification to continue, use a structured `## Open questions` block with bulleted questions — that is the only form the server treats as real input requests.
+
 ```json
 PATCH /api/issues/{issueId}
 Headers: X-Combyne-Run-Id: $COMBYNE_RUN_ID
@@ -75,6 +77,13 @@ Headers: X-Combyne-Run-Id: $COMBYNE_RUN_ID
 ```
 
 Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`, `cancelled`. Priority values: `critical`, `high`, `medium`, `low`. Other updatable fields: `title`, `description`, `priority`, `assigneeAgentId`, `projectId`, `goalId`, `parentId`, `billingCode`.
+
+**Step 8a — User asked you to close.** When `COMBYNE_WAKE_REASON=user_responded`, read the latest user comment first (it's also passed in the wake context as `userReplyBody`). If the user is asking you to close, dismiss, cancel, or stop the ticket — phrasings like "close this ticket", "we're done", "mark this done", "no thanks, that's all", "drop it", "cancel this" — you MUST honor it:
+
+- `PATCH /api/issues/{issueId}` with `{ "status": "done", "comment": "Closing per your request — <brief summary of what was delivered or stopped>." }` if work has reached a reasonable stopping point.
+- Use `"status": "cancelled"` instead if the user explicitly asked to cancel/abandon and no usable work was delivered.
+
+Do NOT loop asking another follow-up question, do NOT post another `kind="question"` comment, and do NOT leave the issue in `awaiting_user`. Server-side cleanup will dismiss any leftover question comments automatically when you close.
 
 **Step 9 — Delegate if needed.** Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. Set `billingCode` for cross-team work.
 

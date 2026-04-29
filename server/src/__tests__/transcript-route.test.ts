@@ -62,7 +62,20 @@ describe("GET /heartbeat-runs/:runId/transcript", () => {
             terminalSessionId: row.terminalSessionId,
             createdAt: row.createdAt,
           }));
-          res.json({ runId: id, entries });
+          const summary = {
+            id: run.id,
+            agentId: run.agentId,
+            companyId: run.companyId,
+            status: run.status,
+            invocationSource: run.invocationSource,
+            triggerDetail: run.triggerDetail,
+            startedAt: run.startedAt,
+            finishedAt: run.finishedAt,
+            errorCode: run.errorCode,
+            error: run.error,
+            contextSnapshot: run.contextSnapshot ?? null,
+          };
+          res.json({ runId: id, run: summary, entries });
         } catch (err) {
           next(err);
         }
@@ -90,7 +103,20 @@ describe("GET /heartbeat-runs/:runId/transcript", () => {
     agentId = agent.id;
     const [run] = await handle.db
       .insert(heartbeatRuns)
-      .values({ companyId, agentId, status: "succeeded", invocationSource: "on_demand" })
+      .values({
+        companyId,
+        agentId,
+        status: "succeeded",
+        invocationSource: "on_demand",
+        triggerDetail: "system",
+        contextSnapshot: {
+          wakeReason: "user_responded",
+          wakeSource: "automation",
+          userReplyBody: "close this ticket please",
+          issueId: "issue-abc-123",
+          commentId: "comment-xyz",
+        },
+      })
       .returning();
     runId = run.id;
     // Three turns to exercise multi-turn ordering.
@@ -145,6 +171,33 @@ describe("GET /heartbeat-runs/:runId/transcript", () => {
     expect(seqs).toEqual([0, 1, 2]);
     expect(res.body.entries[0].contentKind).toBe("bootstrap_preamble");
     expect(res.body.entries[2].contentKind).toBe("adapter.invoke");
+  });
+
+  it("includes a run summary block with wake context for the drawer", async () => {
+    const app = makeApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+    });
+
+    const res = await request(app).get(`/heartbeat-runs/${runId}/transcript`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.run).toMatchObject({
+      id: runId,
+      agentId,
+      companyId,
+      status: "succeeded",
+      invocationSource: "on_demand",
+      triggerDetail: "system",
+    });
+    expect(res.body.run.contextSnapshot).toMatchObject({
+      wakeReason: "user_responded",
+      wakeSource: "automation",
+      userReplyBody: "close this ticket please",
+    });
+    expect(Array.isArray(res.body.entries)).toBe(true);
   });
 
   it("returns 404 for an unknown run", async () => {

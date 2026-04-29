@@ -1483,7 +1483,27 @@ export function agentRoutes(db: Db) {
       terminalSessionId: row.terminalSessionId,
       createdAt: row.createdAt,
     }));
-    res.json({ runId, entries });
+
+    // Surface the run's wake context alongside the transcript so the
+    // issue-page drawer can render in a single request. Snapshot is
+    // redacted using the same path as event payloads.
+    const contextSnapshot = run.contextSnapshot
+      ? redactEventPayload(run.contextSnapshot as Record<string, unknown>) ?? run.contextSnapshot
+      : null;
+    const summary = {
+      id: run.id,
+      agentId: run.agentId,
+      companyId: run.companyId,
+      status: run.status,
+      invocationSource: run.invocationSource,
+      triggerDetail: run.triggerDetail,
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt,
+      errorCode: run.errorCode,
+      error: run.error,
+      contextSnapshot,
+    };
+    res.json({ runId, run: summary, entries });
   });
 
   router.get("/heartbeat-runs/:runId/log", async (req, res) => {

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   agents,
@@ -756,6 +756,11 @@ export function issueService(db: Db) {
         patch.checkoutRunId = null;
       }
 
+      const closingToTerminal =
+        !!issueData.status &&
+        (issueData.status === "done" || issueData.status === "cancelled") &&
+        existing.status !== issueData.status;
+
       const result = await db.transaction(async (tx) => {
         const updated = await tx
           .update(issues)
@@ -766,6 +771,22 @@ export function issueService(db: Db) {
         if (!updated) return null;
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
+        }
+        // Closing the ticket should dismiss any unanswered question
+        // comments so the QuestionAnswerCard doesn't linger after close.
+        // Stamping answeredAt is the cheapest signal — the existing
+        // openQuestions filter already keys off it.
+        if (closingToTerminal) {
+          await tx
+            .update(issueComments)
+            .set({ answeredAt: new Date() })
+            .where(
+              and(
+                eq(issueComments.issueId, id),
+                eq(issueComments.kind, "question"),
+                isNull(issueComments.answeredAt),
+              ),
+            );
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
@@ -786,6 +807,83 @@ export function issueService(db: Db) {
       }
 
       return result;
+    },
+
+    /**
+     * Backstop sweeper for tickets that get stuck in awaiting_user with no
+     * user reply. Closes them to "done" after `staleAfterMs`, dismisses any
+     * leftover question comments, and posts a system note. Skips
+     * routine_execution and terminal_session origins — those have their own
+     * dedicated auto-close paths.
+     */
+    autoCloseStaleAwaitingUserIssues: async (
+      now: Date,
+      staleAfterMs: number,
+    ): Promise<{ closed: number }> => {
+      const cutoff = new Date(now.getTime() - staleAfterMs);
+      const stale = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.status, "awaiting_user"),
+            isNotNull(issues.awaitingUserSince),
+            lt(issues.awaitingUserSince, cutoff),
+            or(
+              isNull(issues.originKind),
+              and(
+                ne(issues.originKind, "terminal_session"),
+                ne(issues.originKind, "routine_execution"),
+              ),
+            ),
+          ),
+        );
+
+      if (stale.length === 0) return { closed: 0 };
+
+      let closed = 0;
+      for (const row of stale) {
+        try {
+          await db.transaction(async (tx) => {
+            await tx
+              .update(issues)
+              .set({
+                status: "done",
+                completedAt: now,
+                awaitingUserSince: null,
+                checkoutRunId: null,
+                updatedAt: now,
+              })
+              .where(and(eq(issues.id, row.id), eq(issues.status, "awaiting_user")));
+            await tx
+              .update(issueComments)
+              .set({ answeredAt: now })
+              .where(
+                and(
+                  eq(issueComments.issueId, row.id),
+                  eq(issueComments.kind, "question"),
+                  isNull(issueComments.answeredAt),
+                ),
+              );
+            await tx.insert(issueComments).values({
+              companyId: row.companyId,
+              issueId: row.id,
+              authorAgentId: null,
+              authorUserId: null,
+              body: "Auto-closed: no user response after extended wait. Reopen any time.",
+              kind: "system",
+            });
+          });
+          closed++;
+        } catch (_err) {
+          // Soft-fail per row so one bad issue doesn't kill the sweep.
+        }
+      }
+      return { closed };
     },
 
     remove: (id: string) =>

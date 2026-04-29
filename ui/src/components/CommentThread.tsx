@@ -44,6 +44,7 @@ interface CommentThreadProps {
   reassignOptions?: InlineEntityOption[];
   currentAssigneeValue?: string;
   mentions?: MentionOption[];
+  onOpenPromptHistory?: (runId: string) => void;
 }
 
 const CLOSED_STATUSES = new Set(["done", "cancelled"]);
@@ -119,10 +120,12 @@ const TimelineList = memo(function TimelineList({
   timeline,
   agentMap,
   highlightCommentId,
+  onOpenPromptHistory,
 }: {
   timeline: TimelineItem[];
   agentMap?: Map<string, Agent>;
   highlightCommentId?: string | null;
+  onOpenPromptHistory?: (runId: string) => void;
 }) {
   if (timeline.length === 0) {
     return <p className="text-sm text-muted-foreground">No comments or runs yet.</p>;
@@ -155,6 +158,16 @@ const TimelineList = memo(function TimelineList({
                   {run.runId.slice(0, 8)}
                 </Link>
                 <StatusBadge status={run.status} />
+                {onOpenPromptHistory && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenPromptHistory(run.runId)}
+                    className="ml-auto rounded border border-border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent/60 hover:text-foreground transition-colors"
+                    title="See prompts and tool turns for this run"
+                  >
+                    View prompt history
+                  </button>
+                )}
               </div>
             </div>
           );
@@ -227,6 +240,7 @@ export function CommentThread({
   reassignOptions = [],
   currentAssigneeValue = "",
   mentions: providedMentions,
+  onOpenPromptHistory,
 }: CommentThreadProps) {
   const [body, setBody] = useState("");
   const [reopen, setReopen] = useState(true);
@@ -352,7 +366,12 @@ export function CommentThread({
     <div className="space-y-4">
       <h3 className="text-sm font-semibold">Comments &amp; Runs ({timeline.length})</h3>
 
-      <TimelineList timeline={timeline} agentMap={agentMap} highlightCommentId={highlightCommentId} />
+      <TimelineList
+        timeline={timeline}
+        agentMap={agentMap}
+        highlightCommentId={highlightCommentId}
+        onOpenPromptHistory={onOpenPromptHistory}
+      />
 
       {liveRunSlot}
 

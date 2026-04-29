@@ -21,6 +21,7 @@ import type { TranscriptEntry } from "../adapters";
 import { StatusBadge } from "../components/StatusBadge";
 import { agentStatusDot, agentStatusDotDefault } from "../lib/status-colors";
 import { MarkdownBody } from "../components/MarkdownBody";
+import { TranscriptTurnRow } from "../components/TranscriptTurnRow";
 import { CopyText } from "../components/CopyText";
 import { EntityRow } from "../components/EntityRow";
 import { Identity } from "../components/Identity";
@@ -2509,16 +2510,6 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
 
 /* ---- Persisted Transcript Section ---- */
 
-const TRANSCRIPT_ROLE_STYLE: Record<string, string> = {
-  user: "text-neutral-500 dark:text-neutral-400",
-  assistant: "text-green-700 dark:text-green-300",
-  system: "text-blue-700 dark:text-blue-300",
-  tool_call: "text-yellow-700 dark:text-yellow-300",
-  tool_result: "text-purple-700 dark:text-purple-300",
-  stderr: "text-red-700 dark:text-red-300",
-  lifecycle: "text-cyan-700 dark:text-cyan-300",
-};
-
 function PersistedTranscriptSection({ runId }: { runId: string }) {
   const [expanded, setExpanded] = useState(false);
   const [expandedEntries, setExpandedEntries] = useState<Record<string, boolean>>({});
@@ -2557,37 +2548,16 @@ function PersistedTranscriptSection({ runId }: { runId: string }) {
       )}
       {expanded && entries.length > 0 && (
         <div className="space-y-1 font-mono text-xs">
-          {entries.map((entry) => {
-            const isJsonExpanded = !!expandedEntries[entry.id];
-            const roleColor = TRANSCRIPT_ROLE_STYLE[entry.role] ?? "text-foreground";
-            const ts = new Date(entry.createdAt).toLocaleTimeString("en-US", { hour12: false });
-            const kind = entry.contentKind ? `:${entry.contentKind}` : "";
-            return (
-              <div key={entry.id} className="grid grid-cols-[auto_auto_1fr] gap-x-2 items-baseline py-0.5">
-                <span className="text-neutral-400 dark:text-neutral-600 select-none w-16 text-[10px]">{ts}</span>
-                <span className={cn("w-28 text-[10px]", roleColor)}>
-                  {entry.role}
-                  {kind}
-                </span>
-                <div className="min-w-0">
-                  <button
-                    type="button"
-                    className="text-[10px] text-muted-foreground hover:text-foreground"
-                    onClick={() =>
-                      setExpandedEntries((prev) => ({ ...prev, [entry.id]: !prev[entry.id] }))
-                    }
-                  >
-                    {isJsonExpanded ? "hide JSON" : "show JSON"}
-                  </button>
-                  {isJsonExpanded && (
-                    <pre className="mt-1 bg-neutral-100 dark:bg-neutral-950 rounded p-2 text-[11px] overflow-x-auto whitespace-pre-wrap text-neutral-700 dark:text-neutral-300">
-                      {JSON.stringify(entry.content, null, 2)}
-                    </pre>
-                  )}
-                </div>
-              </div>
-            );
-          })}
+          {entries.map((entry) => (
+            <TranscriptTurnRow
+              key={entry.id}
+              entry={entry}
+              expanded={!!expandedEntries[entry.id]}
+              onToggle={() =>
+                setExpandedEntries((prev) => ({ ...prev, [entry.id]: !prev[entry.id] }))
+              }
+            />
+          ))}
         </div>
       )}
     </div>

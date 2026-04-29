@@ -1,4 +1,4 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { issueComments, issues } from "@combyne/db";
 import { logger } from "../middleware/logger.js";
@@ -32,6 +32,17 @@ const QUESTION_SECTION_HEADERS = [
   /^#{1,6}\s+questions?\s+pending\b/i,
   /^\*\*open\s+questions?\*\*/i,
 ];
+
+// Trailing pleasantries / permission-seekers that look like questions but
+// don't actually want input — e.g. "Want me to do anything else?". These
+// were causing tickets to land in awaiting_user when the work was done.
+const PLEASANTRY_PATTERNS: RegExp[] = [
+  /^(?:do you (?:want|need)|would you like|want me to|shall i|should i (?:also )?(?:do|continue|proceed|keep|move|go))\b/i,
+  /^(?:is there|anything (?:else|more)|need anything|let me know|sound good|sounds good|make sense|does that (?:work|make sense)|ok with you|good with you|happy with)\b/i,
+  /^(?:can i (?:help|assist|do)|may i (?:help|assist)|how (?:does|do) that (?:look|sound))\b/i,
+];
+
+const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
 
 /**
  * Pull numbered / bulleted questions out of agent-produced text. An agent
@@ -68,12 +79,16 @@ export function extractQuestionsFromText(
       continue;
     }
     if (!insideSection) continue;
-    const item = stripBullet(line);
+    // Inside a dedicated section we trust the agent's intent — accept
+    // either a bulleted line or a bare line ending in "?".
+    const item = stripBullet(line) || (line.endsWith("?") ? line.replace(/^\*\*|\*\*$/g, "").trim() : "");
     if (item && item.endsWith("?")) sectionItems.push(item);
   }
 
-  // Pass 2 — if no dedicated section, harvest any bulleted/numbered question
-  // from the full text. This catches agents that bury questions inline.
+  // Pass 2 — if no dedicated section, harvest only bulleted/numbered
+  // questions from the full text. We do NOT accept bare prose lines
+  // ending in "?" here — those are usually trailing pleasantries
+  // ("Want me to do anything else?") rather than real blocking questions.
   const fallbackItems: string[] = [];
   if (sectionItems.length === 0) {
     for (const rawLine of lines) {
@@ -89,6 +104,7 @@ export function extractQuestionsFromText(
   for (const candidate of candidates) {
     if (candidate.length < MIN_QUESTION_LENGTH) continue;
     if (candidate.length > MAX_QUESTION_LENGTH) continue;
+    if (isPleasantryQuestion(candidate)) continue;
     const key = candidate.toLowerCase().replace(/\s+/g, " ");
     if (seen.has(key)) continue;
     seen.add(key);
@@ -98,18 +114,24 @@ export function extractQuestionsFromText(
   return out;
 }
 
+function isPleasantryQuestion(candidate: string): boolean {
+  const trimmed = candidate.trim().replace(/^\*+\s*/, "").replace(/\s*\*+$/, "");
+  return PLEASANTRY_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
 /**
  * Strip common markdown bullet prefixes: `-`, `*`, `1.`, `1)`, `(1)`,
  * `Q1:`, `Q.1`. Returns the question body, or an empty string if the line
- * isn't a list item.
+ * isn't a list item. We deliberately do NOT accept bare prose lines that
+ * happen to end in "?" — that catches trailing pleasantries like "Want me
+ * to do anything else?" and causes tickets to land in awaiting_user when
+ * the work is actually finished.
  */
 function stripBullet(line: string): string {
   const bulletMatch = line.match(
     /^(?:[-*+]\s+|\(\d+\)\s*|\d+[.)]\s+|Q\d+[:.)]\s*)(.*)$/i,
   );
   if (bulletMatch) return bulletMatch[1]!.trim().replace(/^\*\*|\*\*$/g, "").trim();
-  // Accept a trailing-`?` line too — not every agent bullets.
-  if (line.endsWith("?")) return line.replace(/^\*\*|\*\*$/g, "").trim();
   return "";
 }
 
@@ -130,6 +152,21 @@ export async function extractAndPostQuestions(
   const max = input.maxQuestions ?? DEFAULT_MAX_QUESTIONS;
   const extracted = extractQuestionsFromText(input.sourceText, max);
   if (extracted.length === 0) {
+    return { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false };
+  }
+
+  // If the user (or a scheduler) already closed the issue mid-run, do not
+  // post questions or rebound to awaiting_user — that's how the close
+  // appeared "not to work". The run can still complete normally.
+  const currentIssue = await db
+    .select({ status: issues.status })
+    .from(issues)
+    .where(eq(issues.id, input.issueId))
+    .then((rows) => rows[0] ?? null);
+  if (
+    currentIssue &&
+    (TERMINAL_ISSUE_STATUSES as readonly string[]).includes(currentIssue.status)
+  ) {
     return { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false };
   }
 
@@ -179,11 +216,19 @@ export async function extractAndPostQuestions(
   let statusTransitioned = false;
   if (posted > 0) {
     try {
-      await db
+      // Guard against a race where the user closes the ticket between
+      // our pre-check and this update — never resurrect a closed issue.
+      const updated = await db
         .update(issues)
         .set({ status: "awaiting_user", awaitingUserSince: new Date(), updatedAt: new Date() })
-        .where(eq(issues.id, input.issueId));
-      statusTransitioned = true;
+        .where(
+          and(
+            eq(issues.id, input.issueId),
+            notInArray(issues.status, [...TERMINAL_ISSUE_STATUSES] as string[]),
+          ),
+        )
+        .returning({ id: issues.id });
+      statusTransitioned = updated.length > 0;
     } catch (err) {
       logger.warn(
         { err, issueId: input.issueId },

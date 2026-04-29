@@ -36,6 +36,19 @@ export const heartbeatsApi = {
   transcript: (runId: string) =>
     api.get<{
       runId: string;
+      run: {
+        id: string;
+        agentId: string;
+        companyId: string;
+        status: string;
+        invocationSource: string;
+        triggerDetail: string | null;
+        startedAt: string | null;
+        finishedAt: string | null;
+        errorCode: string | null;
+        error: string | null;
+        contextSnapshot: Record<string, unknown> | null;
+      };
       entries: Array<{
         id: string;
         seq: number;

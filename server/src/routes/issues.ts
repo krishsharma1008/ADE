@@ -523,6 +523,23 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
 
+    // If this update closed the ticket while a heartbeat run was in
+    // flight, cancel it. Prevents the run from finishing and rebounding
+    // status to awaiting_user via the question extractor.
+    const closedToTerminal =
+      (issue.status === "done" || issue.status === "cancelled") &&
+      existing.status !== issue.status;
+    if (closedToTerminal && existing.executionRunId) {
+      heartbeat
+        .cancelRun(existing.executionRunId)
+        .catch((err) =>
+          logger.warn(
+            { err, issueId: id, runId: existing.executionRunId },
+            "failed to cancel in-flight run on issue close",
+          ),
+        );
+    }
+
     // Build activity details with previous values for changed fields
     const previous: Record<string, unknown> = {};
     for (const key of Object.keys(updateFields)) {
@@ -1199,6 +1216,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
       const skipWake = selfComment || isClosed;
       if (assigneeId && resumedFromAwaitingUser) {
+        const replySnippet = comment.body.slice(0, 1000);
         wakeups.set(assigneeId, {
           source: "automation",
           triggerDetail: "system",
@@ -1207,6 +1225,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
             issueId: currentIssue.id,
             commentId: comment.id,
             mutation: "awaiting_user_response",
+            userReplyBody: replySnippet,
           },
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
@@ -1216,6 +1235,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
             commentId: comment.id,
             source: "issue.comment.awaiting_user_response",
             wakeReason: "user_responded",
+            userReplyBody: replySnippet,
           },
         });
       }
