@@ -26,6 +26,7 @@ import type { Issue } from "@combyne/shared";
 
 const statusOrder = ["in_progress", "todo", "backlog", "in_review", "blocked", "done", "cancelled"];
 const priorityOrder = ["critical", "high", "medium", "low"];
+const operationalOriginKinds = new Set(["routine_execution", "terminal_session"]);
 
 function statusLabel(status: string): string {
   return status.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -92,7 +93,7 @@ function toggleInArray(arr: string[], value: string): string[] {
 function applyFilters(issues: Issue[], state: IssueViewState): Issue[] {
   let result = issues;
   if (!state.includeRoutineRuns) {
-    result = result.filter((i) => i.originKind !== "routine_execution");
+    result = result.filter((i) => !i.originKind || !operationalOriginKinds.has(i.originKind));
   }
   if (state.statuses.length > 0) result = result.filter((i) => state.statuses.includes(i.status));
   if (state.priorities.length > 0) result = result.filter((i) => state.priorities.includes(i.priority));
@@ -391,9 +392,9 @@ export function IssuesList({
                         : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/30"
                     }`}
                     onClick={() => updateView({ includeRoutineRuns: !viewState.includeRoutineRuns })}
-                    title="Toggle routine-generated issues"
+                    title="Toggle routine and terminal invocation records"
                   >
-                    {viewState.includeRoutineRuns ? "Including routine runs" : "Hiding routine runs"}
+                    {viewState.includeRoutineRuns ? "Including operational runs" : "Hiding operational runs"}
                   </button>
                 </div>
 

@@ -622,6 +622,18 @@ export function IssueDetail() {
     },
   });
 
+  const closeTerminal = useMutation({
+    mutationFn: () => {
+      if (!issue?.companyId || !issue?.assigneeAgentId) {
+        throw new Error("Issue missing company/agent — cannot close terminal session");
+      }
+      return terminalApi.closeSession(issue.companyId, issue.assigneeAgentId, issue.originId);
+    },
+    onSuccess: () => {
+      invalidateIssue();
+    },
+  });
+
   useEffect(() => {
     const titleLabel = issue?.title ?? issueId ?? "Issue";
     setBreadcrumbs([
@@ -915,19 +927,31 @@ export function IssueDetail() {
         issue.status !== "done" && (
           <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
             <span>This issue is backed by a live terminal session.</span>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                const sessionId = issue.originId ?? "";
-                const qs = sessionId ? `?tab=terminal&session=${encodeURIComponent(sessionId)}` : "?tab=terminal";
-                navigate(`/agents/${issue.assigneeAgentId}${qs}`);
-              }}
-              className="shrink-0 gap-1"
-            >
-              <PlayCircle className="h-4 w-4" />
-              Open terminal
-            </Button>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  const sessionId = issue.originId ?? "";
+                  const qs = sessionId ? `?tab=terminal&session=${encodeURIComponent(sessionId)}` : "?tab=terminal";
+                  navigate(`/agents/${issue.assigneeAgentId}${qs}`);
+                }}
+                className="gap-1"
+              >
+                <PlayCircle className="h-4 w-4" />
+                Open terminal
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={closeTerminal.isPending}
+                onClick={() => closeTerminal.mutate()}
+                className="gap-1 text-destructive hover:text-destructive"
+              >
+                <XCircle className="h-4 w-4" />
+                {closeTerminal.isPending ? "Closing..." : "Close session"}
+              </Button>
+            </div>
           </div>
         )}
       {issue.status === "done" && issue.originKind === "terminal_session" && issue.assigneeAgentId && (

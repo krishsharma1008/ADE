@@ -40,9 +40,19 @@ export const terminalApi = {
       body,
     ),
 
-  closeSession: (companyId: string, agentId: string) =>
-    fetch(`/api/companies/${companyId}/agents/${agentId}/terminal/session`, {
+  closeSession: (companyId: string, agentId: string, sessionId?: string | null) =>
+    fetch(
+      `/api/companies/${companyId}/agents/${agentId}/terminal/session${
+        sessionId ? `/${encodeURIComponent(sessionId)}` : ""
+      }`,
+      {
       method: "DELETE",
       credentials: "include",
-    }).then(() => undefined),
+      },
+    ).then(async (res) => {
+      if (!res.ok) {
+        const errorBody = await res.json().catch(() => null);
+        throw new Error((errorBody as { error?: string } | null)?.error ?? `Request failed: ${res.status}`);
+      }
+    }),
 };
