@@ -19,6 +19,7 @@ import { InlineEditor } from "../components/InlineEditor";
 import { CommentThread } from "../components/CommentThread";
 import { PromptHistoryDrawer } from "../components/PromptHistoryDrawer";
 import { IssueProperties } from "../components/IssueProperties";
+import { QaIssuePanel } from "../components/QaIssuePanel";
 import { LiveRunWidget } from "../components/LiveRunWidget";
 import type { MentionOption } from "../components/MarkdownEditor";
 import { ScrollToBottom } from "../components/ScrollToBottom";
@@ -1453,6 +1454,8 @@ export function IssueDetail() {
           </div>
         </div>
       )}
+
+      <QaIssuePanel issue={issue} />
 
       {linkedApprovals && linkedApprovals.length > 0 && (
         <Collapsible

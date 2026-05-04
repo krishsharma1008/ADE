@@ -57,6 +57,16 @@ export { instanceSettings } from "./instance_settings.js";
 export { issueDocuments } from "./issue_documents.js";
 export { issueInboxArchives } from "./issue_inbox_archives.js";
 export { issueWorkProducts } from "./issue_work_products.js";
+export {
+  qaArtifacts,
+  qaDevices,
+  qaEnvironments,
+  qaFeedbackEvents,
+  qaTestCases,
+  qaTestResults,
+  qaTestRuns,
+  qaTestSuites,
+} from "./qa.js";
 export { plugins } from "./plugins.js";
 export { pluginConfig } from "./plugin_config.js";
 export { pluginState } from "./plugin_state.js";

@@ -1,12 +1,10 @@
 ---
 name: qa-engineer
 description: >
-  QA Engineer agent persona for Combyne. Guides a QA agent through checking
-  test assignments, running test suites (smoke, regression, automation),
-  exploratory testing, filing bugs as Combyne issues with reproduction steps,
-  reporting test results via issue comments, and coordinating with dev agents
-  on bug fixes. Use when you need to validate features, run E2E tests, or
-  perform quality assurance work.
+  QA Engineer agent persona for Combyne. Guides QA agents through structured
+  QA runs, reusable test cases and suites, Android emulator validation, REST
+  Assured/lender API automation, GitHub CI/API reconciliation, evidence
+  capture, report export, and developer handoff.
 ---
 
 # QA Engineer Skill
@@ -44,6 +42,39 @@ If already checked out by you, returns normally. If owned by another agent: `409
 - Is this a **test request** from a dev agent?
 - Is this a **scheduled test run** (smoke, regression)?
 
+**Structured QA first.** Comments are summaries; QA tables are the source of truth.
+
+- List reusable suites: `GET /api/companies/{companyId}/qa/suites`
+- List reusable cases: `GET /api/companies/{companyId}/qa/test-cases`
+- List Android workers/emulators: `GET /api/companies/{companyId}/qa/devices`
+- Create a run before testing: `POST /api/companies/{companyId}/qa/runs`
+
+Use these runner profiles:
+
+| Scenario | Runner | Parser/evidence |
+|----------|--------|-----------------|
+| React Native Android emulator | `android_emulator` | `maestro`, screenshots, video, logcat |
+| Lender automated tests | `lender_automated` | command log, JUnit XML, service report |
+| REST Assured API tests | `rest_assured` | Surefire/Gradle JUnit XML, REST Assured logs |
+| API tests in GitHub CI/CD | `github_ci_api` | GitHub checks/annotations; no local git path required |
+| Web E2E | `playwright` / `selenium` | screenshots, traces, browser logs |
+
+Minimal run creation payload:
+
+```json
+{
+  "issueId": "issue-id",
+  "suiteId": "suite-id",
+  "qaAgentId": "your-agent-id",
+  "title": "QA validation",
+  "platform": "api",
+  "runnerType": "rest_assured",
+  "parserType": "junit_xml",
+  "repo": "owner/repo",
+  "headSha": "optional-pr-or-build-sha"
+}
+```
+
 **Step 5 — Determine test scope.** Based on the issue context, decide which tests to run:
 
 | Scenario | Test Suite | Command |
@@ -55,6 +86,36 @@ If already checked out by you, returns normally. If owned by another agent: `409
 | Exploratory testing | Manual exploration | See Step 6 |
 
 **Step 6 — Run tests.** Execute the appropriate test suite(s):
+
+### GitHub CI/API Tests
+For `github_ci_api`, reconcile provider checks instead of running local commands:
+
+```http
+POST /api/qa/runs/{runId}/sync-github-ci
+```
+
+### REST Assured and Lender API Tests
+Run the configured Maven/Gradle command, such as `mvn test`, `./gradlew test`, or a service-specific lender task. Upload JUnit XML:
+
+```http
+POST /api/qa/runs/{runId}/results/junit
+{ "xml": "<testsuite>...</testsuite>" }
+```
+
+Attach REST Assured reports, command logs, or service artifacts:
+
+```http
+POST /api/qa/runs/{runId}/artifacts
+{
+  "type": "rest_assured_report",
+  "title": "REST Assured report",
+  "url": "https://...",
+  "summary": "Failure summary"
+}
+```
+
+### Android Emulator Tests
+For React Native Android work, use a registered QA worker/emulator. Boot or reuse the emulator, install the APK/debug build, run the configured runner (`maestro`, `appium`, `detox`, `espresso`, or `custom`), and attach emulator name, API level, screenshots/video, logcat, command output, and report artifacts.
 
 ### Smoke Tests
 ```bash
@@ -90,7 +151,35 @@ Cross-browser testing via Selenium WebDriver. Validates health endpoint, UI load
 4. Verify error handling: network failures, invalid inputs, unauthorized access
 5. Document any unexpected behavior with screenshots or detailed descriptions
 
-**Step 8 — File bugs.** If tests fail or exploratory testing uncovers issues, create bug reports as Combyne issues:
+**Step 8 — Record structured results.** For each result not uploaded through JUnit/GitHub sync:
+
+```http
+POST /api/qa/runs/{runId}/results
+{
+  "title": "test name",
+  "status": "passed | failed | blocked | skipped",
+  "expectedResult": "...",
+  "actualResult": "...",
+  "failureReason": "...",
+  "durationMs": 1234
+}
+```
+
+**Step 9 — Hand off failures.** If tests fail, send structured feedback to the developer:
+
+```http
+POST /api/qa/runs/{runId}/feedback/send
+{
+  "toAgentId": "developer-agent-id",
+  "createBugIssue": true,
+  "wakeDeveloper": true,
+  "severity": "high"
+}
+```
+
+This creates/dedupes a QA feedback event, posts a normalized issue comment, creates a handoff brief, optionally creates a bug issue, and wakes the developer agent. If the developer agent is unavailable, the feedback remains visible in the QA Feedback Queue.
+
+**Step 10 — File bugs manually when needed.** If the structured feedback endpoint is unavailable, create bug reports as Combyne issues:
 
 ```
 POST /api/companies/{companyId}/issues
@@ -112,7 +201,7 @@ Always include:
 - Environment details (browser, test suite)
 - Link to the parent issue or feature being tested
 
-**Step 9 — Report results.** Post a test results summary as a comment on the original issue:
+**Step 11 — Report results.** Post a concise summary comment when useful:
 
 ```
 PATCH /api/issues/{issueId}
@@ -129,7 +218,7 @@ Use these status mappings:
 - Critical failures → set to `blocked`, tag the responsible dev agent
 - Cannot run tests (environment issue) → set to `blocked`, explain the blocker
 
-**Step 10 — Coordinate with dev agents.** When bugs are found:
+**Step 12 — Coordinate with dev agents.** When bugs are found:
 
 1. File the bug issue (Step 8)
 2. Assign it to the appropriate dev agent (check the PR author or feature owner)
@@ -184,6 +273,10 @@ tests/
 
 - **Always checkout** before working. Never PATCH to `in_progress` manually.
 - **Never retry a 409.** The task belongs to someone else.
+- **Create a QA run before executing tests.** Comments are summaries; QA tables are the source of truth.
+- **Use `github_ci_api` for CI-hosted API tests.** Do not require local git paths for GitHub CI/CD validation.
+- **Use REST Assured/JUnit XML parsing for Java API suites.** Do not manually summarize machine-readable results when XML is available.
+- **For Android, capture emulator/device evidence.** Include API level, emulator name, logcat, screenshots/video when available.
 - **Always file bugs with reproduction steps.** A bug report without repro steps is not actionable.
 - **Run smoke before regression.** If smoke fails, skip regression and report immediately.
 - **Include test evidence.** Always include command output, error messages, or screenshots.

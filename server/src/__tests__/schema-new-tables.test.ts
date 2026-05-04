@@ -59,6 +59,16 @@ describe("New schema table exports", () => {
     expect(schema.routines).toBeDefined();
     expect(schema.routineTriggers).toBeDefined();
     expect(schema.routineRuns).toBeDefined();
+
+    // QA
+    expect(schema.qaTestCases).toBeDefined();
+    expect(schema.qaTestSuites).toBeDefined();
+    expect(schema.qaTestRuns).toBeDefined();
+    expect(schema.qaTestResults).toBeDefined();
+    expect(schema.qaArtifacts).toBeDefined();
+    expect(schema.qaFeedbackEvents).toBeDefined();
+    expect(schema.qaEnvironments).toBeDefined();
+    expect(schema.qaDevices).toBeDefined();
   });
 
   it("all new tables have an 'id' column", async () => {
@@ -93,6 +103,14 @@ describe("New schema table exports", () => {
       schema.routines,
       schema.routineTriggers,
       schema.routineRuns,
+      schema.qaTestCases,
+      schema.qaTestSuites,
+      schema.qaTestRuns,
+      schema.qaTestResults,
+      schema.qaArtifacts,
+      schema.qaFeedbackEvents,
+      schema.qaEnvironments,
+      schema.qaDevices,
     ];
 
     for (const table of newTables) {

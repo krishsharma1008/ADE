@@ -35,6 +35,9 @@ describe("License Gate — New Routes", () => {
       "/api/companies/test/budgets/incidents",
       "/api/issues/test/documents",
       "/api/issues/test/work-products",
+      "/api/companies/test/qa/runs",
+      "/api/companies/test/qa/test-cases",
+      "/api/qa/runs/test/export",
     ];
     for (const p of newPaths) {
       app.all(p, (_req, res) => res.json({ ok: true }));

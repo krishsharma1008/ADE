@@ -85,6 +85,16 @@ export const queryKeys = {
     entries: (companyId: string, layer?: string) => ["memory", companyId, "entries", layer ?? "all"] as const,
     acceptedWork: (companyId: string) => ["memory", companyId, "accepted-work"] as const,
   },
+  qa: {
+    summary: (companyId: string) => ["qa", companyId, "summary"] as const,
+    cases: (companyId: string) => ["qa", companyId, "cases"] as const,
+    suites: (companyId: string) => ["qa", companyId, "suites"] as const,
+    environments: (companyId: string) => ["qa", companyId, "environments"] as const,
+    devices: (companyId: string) => ["qa", companyId, "devices"] as const,
+    runs: (companyId: string, issueId?: string) => ["qa", companyId, "runs", issueId ?? "all"] as const,
+    run: (runId: string) => ["qa", "run", runId] as const,
+    feedback: (companyId: string) => ["qa", companyId, "feedback"] as const,
+  },
   routines: {
     list: (companyId: string) => ["routines", companyId] as const,
     detail: (id: string) => ["routines", "detail", id] as const,

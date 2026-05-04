@@ -309,6 +309,13 @@
       "when": 1777830598725,
       "tag": "0043_premium_wonder_man",
       "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1777888800137,
+      "tag": "0044_strange_gertrude_yorkes",
+      "breakpoints": true
     }
   ]
 }
