@@ -58,12 +58,20 @@ export function Layout() {
     if (!companyPrefix || companiesLoading || companies.length === 0) return;
 
     const requestedPrefix = companyPrefix.toUpperCase();
-    const matched = companies.find((company) => company.issuePrefix.toUpperCase() === requestedPrefix);
+    const activeCompanies = companies.filter((company) => company.status !== "archived");
+    const matched = activeCompanies.find((company) => company.issuePrefix.toUpperCase() === requestedPrefix);
 
     if (!matched) {
       const fallback =
-        (selectedCompanyId ? companies.find((company) => company.id === selectedCompanyId) : null)
-        ?? companies[0]!;
+        (selectedCompanyId
+          ? activeCompanies.find((company) => company.id === selectedCompanyId)
+          : null)
+        ?? activeCompanies[0]
+        ?? null;
+      if (!fallback) {
+        navigate("/", { replace: true });
+        return;
+      }
       navigate(`/${fallback.issuePrefix}/dashboard`, { replace: true });
       return;
     }

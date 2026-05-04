@@ -177,7 +177,11 @@ function CompanyRootRedirect() {
     return <NoCompaniesStartPage autoOpen={false} />;
   }
 
-  const targetCompany = selectedCompany ?? companies[0] ?? null;
+  const activeCompanies = companies.filter((company) => company.status !== "archived");
+  const targetCompany =
+    selectedCompany && selectedCompany.status !== "archived"
+      ? selectedCompany
+      : activeCompanies[0] ?? null;
   if (!targetCompany) {
     return <NoCompaniesStartPage />;
   }
@@ -193,7 +197,11 @@ function UnprefixedBoardRedirect() {
     return <div className="mx-auto max-w-xl py-10 text-sm text-muted-foreground">Loading...</div>;
   }
 
-  const targetCompany = selectedCompany ?? companies[0] ?? null;
+  const activeCompanies = companies.filter((company) => company.status !== "archived");
+  const targetCompany =
+    selectedCompany && selectedCompany.status !== "archived"
+      ? selectedCompany
+      : activeCompanies[0] ?? null;
   if (!targetCompany) {
     return <NoCompaniesStartPage />;
   }

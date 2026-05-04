@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@/lib/router";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { companiesApi } from "../api/companies";
@@ -29,6 +30,7 @@ export function CompanySettings() {
   } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
 
   // General settings local state
   const [companyName, setCompanyName] = useState("");
@@ -137,15 +139,20 @@ export function CompanySettings() {
   const archiveMutation = useMutation({
     mutationFn: ({
       companyId,
-      nextCompanyId
+      nextCompanyId,
+      nextCompanyPrefix
     }: {
       companyId: string;
       nextCompanyId: string | null;
-    }) => companiesApi.archive(companyId).then(() => ({ nextCompanyId })),
-    onSuccess: async ({ nextCompanyId }) => {
+      nextCompanyPrefix: string | null;
+    }) => companiesApi.archive(companyId).then(() => ({ nextCompanyId, nextCompanyPrefix })),
+    onSuccess: async ({ nextCompanyId, nextCompanyPrefix }) => {
       if (nextCompanyId) {
         setSelectedCompanyId(nextCompanyId);
       }
+      navigate(nextCompanyPrefix ? `/${nextCompanyPrefix}/dashboard` : "/", {
+        replace: true
+      });
       await queryClient.invalidateQueries({
         queryKey: queryKeys.companies.all
       });
@@ -403,15 +410,16 @@ export function CompanySettings() {
                   `Archive company "${selectedCompany.name}"? It will be hidden from the sidebar.`
                 );
                 if (!confirmed) return;
-                const nextCompanyId =
+                const nextCompany =
                   companies.find(
                     (company) =>
                       company.id !== selectedCompanyId &&
                       company.status !== "archived"
-                  )?.id ?? null;
+                  ) ?? null;
                 archiveMutation.mutate({
                   companyId: selectedCompanyId,
-                  nextCompanyId
+                  nextCompanyId: nextCompany?.id ?? null,
+                  nextCompanyPrefix: nextCompany?.issuePrefix ?? null
                 });
               }}
             >
