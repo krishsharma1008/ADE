@@ -192,30 +192,40 @@ curl -s -H "Authorization: Bearer $COMBYNE_API_KEY" \
 
 If the quality gate **fails**: fix the issues in your branch, commit, and push again. Do NOT merge with a failing quality gate. If you cannot fix the issue, set the Combyne task to `blocked` with a comment explaining the quality gate failure.
 
-If the quality gate **passes**: proceed to merge.
+If the quality gate **passes**: move the issue to review and wait for dashboard merge. Do not merge it yourself.
 
-### Merging a Pull Request
+### Human-Gated Pull Request Merge
 
-Only merge when:
-1. CI checks pass (`gh pr checks` shows all green)
-2. Quality gate passes (if SonarQube is configured)
-3. No unresolved review comments
+Agents must never merge pull requests. Do not run `gh pr merge`, do not run a direct GitHub merge API call, and do not merge protected base branches locally. Branch pushes, PR creation, and follow-up fix pushes are allowed; merge is a board/dashboard action.
+
+After creating or updating a PR, track it against the issue:
 
 ```bash
-# Merge the PR (squash is preferred for clean history)
-gh pr merge --squash --delete-branch
-
-# Or if the team prefers merge commits:
-gh pr merge --merge --delete-branch
+curl -s -X POST -H "Authorization: Bearer $COMBYNE_API_KEY" \
+  -H "Content-Type: application/json" \
+  "$COMBYNE_API_URL/api/issues/$COMBYNE_TASK_ID/pull-requests" \
+  -d '{
+    "repo": "owner/repo",
+    "pullNumber": 123,
+    "pullUrl": "https://github.com/owner/repo/pull/123",
+    "title": "PR title",
+    "baseBranch": "main",
+    "headBranch": "feature-branch",
+    "headSha": "current-head-sha",
+    "mergeMethod": "squash",
+    "requestedNote": "Ready for board merge after checks pass"
+  }'
 ```
 
-After merging, update the Combyne issue:
+Then update the Combyne issue to `in_review` with the PR link and a concise status:
 
-```
+```bash
 PATCH /api/issues/{issueId}
 Headers: X-Combyne-Run-Id: $COMBYNE_RUN_ID
-{ "status": "done", "comment": "PR merged to main. Quality gate passed. Branch cleaned up." }
+{ "status": "in_review", "comment": "PR ready for dashboard merge: https://github.com/owner/repo/pull/123. CI and quality gate status noted above." }
 ```
+
+If CI, code review, or quality gate feedback arrives later, fix it locally, commit, push, update the PR tracking row if the head SHA changed, and leave the issue in `in_review`. The board dashboard performs the final merge after server-side checks pass.
 
 ### Reviewing Another Agent's PR
 
@@ -243,7 +253,7 @@ Agents can also use the Combyne server proxy for GitHub operations. This is usef
 | Create branch | `POST /api/companies/:companyId/integrations/github/repos/:repo/branches` |
 | List PRs | `GET /api/companies/:companyId/integrations/github/repos/:repo/pulls` |
 | Create PR | `POST /api/companies/:companyId/integrations/github/repos/:repo/pulls` |
-| Merge PR | `PUT /api/companies/:companyId/integrations/github/repos/:repo/pulls/:number/merge` |
+| Merge PR | Board/dashboard only; agents must not call merge endpoints |
 | Create review | `POST /api/companies/:companyId/integrations/github/repos/:repo/pulls/:number/reviews` |
 | Add comment | `POST /api/companies/:companyId/integrations/github/repos/:repo/pulls/:number/comments` |
 | Check CI | `GET /api/companies/:companyId/integrations/github/repos/:repo/commits/:ref/checks` |
@@ -265,8 +275,10 @@ Here is the full flow an engineer agent follows when assigned a coding task:
 6. **Create PR**: `gh pr create --title "..." --body "..." --base main`
 7. **Wait for CI**: `gh pr checks --watch`
 8. **Check quality gate** (if SonarQube configured): call the proxy API
-9. **Merge**: `gh pr merge --squash --delete-branch`
-10. **Close issue**: PATCH status to `done` with PR link in comment
+9. **Track PR**: `POST /api/issues/{issueId}/pull-requests` with repo, PR number, URL, base/head, and head SHA
+10. **Review handoff**: PATCH status to `in_review` with PR link and status summary
+11. **Fix feedback if woken**: if CI/review/quality fails, commit and push follow-up fixes, then update PR tracking
+12. **Wait for dashboard merge**: the board merges after server-side checks pass; do not close the issue as done yourself
 
 If any step fails (CI red, quality gate blocked, review requested changes), fix and retry. If truly blocked, update the issue to `blocked` with details.
 

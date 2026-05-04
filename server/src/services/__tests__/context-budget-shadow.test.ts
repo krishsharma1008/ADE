@@ -13,6 +13,8 @@ describe("buildPreambleSectionsFromContext", () => {
       combyneBootstrapAnalysis: { preamble: "BOOTSTRAP", reason: "first-ceo-issue" },
       combyneHandoffBrief: { brief: "HANDOFF" },
       combyneMemoryPreamble: { body: "MEMORY", entryCount: 3, scope: "agent" },
+      combyneLongTermMemoryPreamble: { body: "LONG_TERM_MEMORY", entryCount: 1 },
+      combyneAcceptedWorkBrief: { body: "ACCEPTED_WORK" },
       combyneHirePlaybook: { body: "HIRE" },
       combyneFocusDirective: { body: "FOCUS_BLOCK", directive: "stay on this" },
       combyneAssignedIssues: { digestBody: "DIGEST", body: "legacy" },
@@ -23,6 +25,8 @@ describe("buildPreambleSectionsFromContext", () => {
     expect(names).toContain("bootstrap");
     expect(names).toContain("handoff");
     expect(names).toContain("memory");
+    expect(names).toContain("longTermMemory");
+    expect(names).toContain("acceptedWork");
     expect(names).toContain("focus");
     expect(names).toContain("queue");
     expect(names).toContain("projects");
@@ -95,7 +99,7 @@ describe("buildPreambleSectionsFromContext", () => {
 
 describe("resolveContextBudgetTokens", () => {
   it("uses the adapter-default budget when no override is set", () => {
-    expect(resolveContextBudgetTokens("claude-local", {})).toBe(160_000);
+    expect(resolveContextBudgetTokens("claude-local", {})).toBe(48_000);
     expect(resolveContextBudgetTokens("codex-local", {})).toBe(320_000);
     expect(resolveContextBudgetTokens("pi-local", {})).toBe(24_000);
   });
@@ -185,11 +189,11 @@ describe("runShadowComposer", () => {
 });
 
 describe("contextBudgetComposerEnabled flag", () => {
-  it("defaults to false when env is unset", () => {
+  it("defaults to true when env is unset", () => {
     const original = process.env.COMBYNE_CONTEXT_BUDGET_ENABLED;
     try {
       delete process.env.COMBYNE_CONTEXT_BUDGET_ENABLED;
-      expect(contextBudgetComposerEnabled()).toBe(false);
+      expect(contextBudgetComposerEnabled()).toBe(true);
     } finally {
       if (original !== undefined) process.env.COMBYNE_CONTEXT_BUDGET_ENABLED = original;
     }

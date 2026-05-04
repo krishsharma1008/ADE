@@ -30,6 +30,7 @@ export const queryKeys = {
     activity: (issueId: string) => ["issues", "activity", issueId] as const,
     runs: (issueId: string) => ["issues", "runs", issueId] as const,
     approvals: (issueId: string) => ["issues", "approvals", issueId] as const,
+    pullRequests: (issueId: string) => ["issues", "pull-requests", issueId] as const,
     liveRuns: (issueId: string) => ["issues", "live-runs", issueId] as const,
     activeRun: (issueId: string) => ["issues", "active-run", issueId] as const,
     documents: (issueId: string) => ["issues", "documents", issueId] as const,
@@ -80,6 +81,10 @@ export const queryKeys = {
   runIssues: (runId: string) => ["run-issues", runId] as const,
   org: (companyId: string) => ["org", companyId] as const,
   integrations: (companyId: string) => ["integrations", companyId] as const,
+  memory: {
+    entries: (companyId: string, layer?: string) => ["memory", companyId, "entries", layer ?? "all"] as const,
+    acceptedWork: (companyId: string) => ["memory", companyId, "accepted-work"] as const,
+  },
   routines: {
     list: (companyId: string) => ["routines", companyId] as const,
     detail: (id: string) => ["routines", "detail", id] as const,

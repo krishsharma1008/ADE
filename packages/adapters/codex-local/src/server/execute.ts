@@ -108,6 +108,44 @@ async function ensureCodexSkillsInjected(onLog: AdapterExecutionContext["onLog"]
   }
 }
 
+async function buildMergeGuardDir(runId: string): Promise<string> {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "combyne-merge-guard-"));
+  const script = (tool: "gh" | "git") => `#!/usr/bin/env bash
+set -euo pipefail
+COMBYNE_GUARD_DIR=${JSON.stringify(tmp)}
+tool=${JSON.stringify(tool)}
+if [[ "$tool" == "gh" ]]; then
+  if [[ "\${1:-}" == "pr" && "\${2:-}" == "merge" ]]; then
+    echo "[combyne] Blocked gh pr merge. Request merge from the Combyne dashboard PR panel after checks pass." >&2
+    exit 78
+  fi
+  if [[ "$*" == *"/pulls/"*"/merge"* ]]; then
+    echo "[combyne] Blocked direct GitHub pull merge API call. Request dashboard merge instead." >&2
+    exit 78
+  fi
+fi
+if [[ "$tool" == "git" && "\${1:-}" == "merge" ]]; then
+  for arg in "$@"; do
+    case "$arg" in
+      main|master|develop|development|origin/main|origin/master|origin/develop|origin/development)
+        echo "[combyne] Blocked direct git merge into a protected base branch. Request dashboard merge instead." >&2
+        exit 78
+        ;;
+    esac
+  done
+fi
+export PATH="\${PATH#$COMBYNE_GUARD_DIR:}"
+command "$tool" "$@"
+`;
+  for (const tool of ["gh", "git"] as const) {
+    const target = path.join(tmp, tool);
+    await fs.writeFile(target, script(tool), "utf8");
+    await fs.chmod(target, 0o755);
+  }
+  await fs.writeFile(path.join(tmp, "README.txt"), `Combyne merge command guard for run ${runId}\n`, "utf8");
+  return tmp;
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, authToken } = ctx;
 
@@ -215,6 +253,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     env.COMBYNE_API_KEY = authToken;
   }
   const billingType = resolveCodexBillingType(env);
+  const mergeGuardDir = await buildMergeGuardDir(runId);
+  const pathEnv = ensurePathInEnv({ ...process.env, ...env });
+  env.PATH = `${mergeGuardDir}:${pathEnv.PATH ?? pathEnv.Path ?? ""}`;
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   await ensureCommandResolvable(command, cwd, runtimeEnv);
 
@@ -304,6 +345,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const memoryBody = asString(memory.body, "").trim();
   if (memoryBody.length > 0) {
     preambleSegments.push(`# Recent memory\n\n${memoryBody}`);
+  }
+  const longTermMemory = parseObject(context.combyneLongTermMemoryPreamble);
+  const longTermMemoryBody = asString(longTermMemory.body, "").trim();
+  if (longTermMemoryBody.length > 0) {
+    preambleSegments.push(`# Long-term company memory\n\n${longTermMemoryBody}`);
+  }
+  const acceptedWork = parseObject(context.combyneAcceptedWorkBrief);
+  const acceptedWorkBody = asString(acceptedWork.body, "").trim();
+  if (acceptedWorkBody.length > 0) {
+    preambleSegments.push(`# Accepted work memory task\n\n${acceptedWorkBody}`);
   }
   const assigned = parseObject(context.combyneAssignedIssues);
   const digestBody = asString(assigned.digestBody, "").trim();
@@ -444,20 +495,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  const initial = await runAttempt(sessionId);
-  if (
-    sessionId &&
-    !initial.proc.timedOut &&
-    (initial.proc.exitCode ?? 0) !== 0 &&
-    isCodexUnknownSessionError(initial.proc.stdout, initial.rawStderr)
-  ) {
-    await onLog(
-      "stderr",
-      `[combyne] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
-    );
-    const retry = await runAttempt(null);
-    return toResult(retry, true);
-  }
+  try {
+    const initial = await runAttempt(sessionId);
+    if (
+      sessionId &&
+      !initial.proc.timedOut &&
+      (initial.proc.exitCode ?? 0) !== 0 &&
+      isCodexUnknownSessionError(initial.proc.stdout, initial.rawStderr)
+    ) {
+      await onLog(
+        "stderr",
+        `[combyne] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+      );
+      const retry = await runAttempt(null);
+      return toResult(retry, true);
+    }
 
-  return toResult(initial);
+    return toResult(initial);
+  } finally {
+    fs.rm(mergeGuardDir, { recursive: true, force: true }).catch(() => {});
+  }
 }

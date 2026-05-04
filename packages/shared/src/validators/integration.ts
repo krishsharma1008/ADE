@@ -94,6 +94,7 @@ export const githubCreatePRSchema = z.object({
   head: z.string().min(1),
   base: z.string().min(1),
   draft: z.boolean().optional(),
+  issueId: z.string().uuid().optional().nullable(),
 });
 export type GitHubCreatePR = z.infer<typeof githubCreatePRSchema>;
 
@@ -109,6 +110,9 @@ export const githubMergePRSchema = z.object({
   pullNumber: z.number().int().positive(),
   mergeMethod: z.enum(["merge", "squash", "rebase"]).optional(),
   commitMessage: z.string().optional(),
+  issueId: z.string().uuid().optional().nullable(),
+  approvalId: z.string().uuid().optional().nullable(),
+  expectedHeadSha: z.string().optional().nullable(),
 });
 export type GitHubMergePR = z.infer<typeof githubMergePRSchema>;
 

@@ -41,6 +41,8 @@ import {
   ChevronRight,
   ClipboardList,
   EyeOff,
+  GitMerge,
+  GitPullRequest,
   Hexagon,
   HelpCircle,
   PlayCircle,
@@ -48,6 +50,7 @@ import {
   MessageSquare,
   MoreHorizontal,
   Paperclip,
+  RefreshCw,
   SlidersHorizontal,
   Trash2,
   UserPlus,
@@ -55,7 +58,7 @@ import {
   XCircle,
 } from "lucide-react";
 import type { ActivityEvent } from "@combyne/shared";
-import type { Agent, IssueAttachment } from "@combyne/shared";
+import type { Agent, IssueAttachment, IssuePullRequest } from "@combyne/shared";
 import { resolveAgentErrorCode } from "@combyne/shared";
 
 type CommentReassignment = {
@@ -107,6 +110,16 @@ function usageNumber(usage: Record<string, unknown> | null, ...keys: string[]) {
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return text.slice(0, max - 1) + "\u2026";
+}
+
+function gateClass(status: string) {
+  if (status === "passed" || status === "clean" || status === "ready" || status === "merged" || status === "not_configured") {
+    return "text-green-500";
+  }
+  if (status === "failed" || status === "changes_requested" || status === "blocked") {
+    return "text-red-500";
+  }
+  return "text-yellow-500";
 }
 
 function formatAction(action: string, details?: Record<string, unknown> | null): string {
@@ -204,6 +217,13 @@ export function IssueDetail() {
     queryKey: queryKeys.issues.approvals(issueId!),
     queryFn: () => issuesApi.listApprovals(issueId!),
     enabled: !!issueId,
+  });
+
+  const { data: pullRequests } = useQuery({
+    queryKey: queryKeys.issues.pullRequests(issueId!),
+    queryFn: () => issuesApi.listPullRequests(issueId!),
+    enabled: !!issueId,
+    refetchInterval: 15000,
   });
 
   const { data: attachments } = useQuery({
@@ -381,7 +401,7 @@ export function IssueDetail() {
       output,
       cached,
       cost,
-      totalTokens: input + output,
+      totalTokens: input + cached + output,
       hasCost,
       hasTokens,
     };
@@ -392,6 +412,7 @@ export function IssueDetail() {
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.approvals(issueId!) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.issues.pullRequests(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.attachments(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(issueId!) });
@@ -510,6 +531,30 @@ export function IssueDetail() {
         queryClient.invalidateQueries({ queryKey: ["company", selectedCompanyId, "approvals"] });
       }
     },
+  });
+
+  const reconcilePr = useMutation({
+    mutationFn: (pullRequestId: string) => issuesApi.reconcilePullRequest(pullRequestId),
+    onSuccess: () => invalidateIssue(),
+  });
+
+  const wakePrFeedback = useMutation({
+    mutationFn: (pullRequestId: string) => issuesApi.wakePullRequestFeedback(pullRequestId),
+    onSuccess: () => {
+      invalidateIssue();
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
+    },
+  });
+
+  const mergePr = useMutation({
+    mutationFn: (pullRequest: IssuePullRequest) =>
+      issuesApi.mergePullRequest(pullRequest.id, {
+        approvalId: pullRequest.approvalId,
+        expectedHeadSha: pullRequest.headSha,
+        mergeMethod: pullRequest.mergeMethod,
+        decisionNote: "Merged from Combyne dashboard after server-side checks passed.",
+      }),
+    onSuccess: () => invalidateIssue(),
   });
 
   const pendingHires = useMemo(
@@ -900,6 +945,7 @@ export function IssueDetail() {
       {issue.assigneeAgentId &&
         issue.originKind !== "terminal_session" &&
         openQuestions.length === 0 &&
+        (issue.status === "awaiting_user" || extractedQuestions.length > 0) &&
         !hasLiveRuns && (
           <ReplyAndWakeCard
             issueStatus={issue.status}
@@ -1297,6 +1343,117 @@ export function IssueDetail() {
         </TabsContent>
       </Tabs>
 
+      {pullRequests && pullRequests.length > 0 && (
+        <div className="rounded-lg border border-border">
+          <div className="flex items-center justify-between border-b border-border px-3 py-2">
+            <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+              <GitPullRequest className="h-4 w-4" />
+              Pull Requests ({pullRequests.length})
+            </div>
+          </div>
+          <div className="divide-y divide-border">
+            {pullRequests.map((pr) => {
+              const metadata = asRecord(pr.metadata);
+              const blockers = Array.isArray(metadata?.blockers)
+                ? metadata.blockers.filter((value): value is string => typeof value === "string")
+                : [];
+              const canMerge =
+                pr.mergeStatus === "ready" &&
+                pr.ciStatus === "passed" &&
+                pr.reviewStatus !== "changes_requested" &&
+                (pr.qualityStatus === "passed" || pr.qualityStatus === "not_configured") &&
+                !!pr.approvalId &&
+                !!pr.headSha;
+              const isWorking =
+                reconcilePr.variables === pr.id ||
+                wakePrFeedback.variables === pr.id ||
+                mergePr.variables?.id === pr.id;
+              return (
+                <div key={pr.id} className="px-3 py-3 space-y-2">
+                  <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="min-w-0">
+                      <a
+                        href={pr.pullUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-sm font-medium hover:underline"
+                      >
+                        {pr.repo}#{pr.pullNumber}: {pr.title}
+                      </a>
+                      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                        <span>{pr.headBranch ?? "head"} → {pr.baseBranch}</span>
+                        {pr.headSha && <span className="font-mono">{pr.headSha.slice(0, 8)}</span>}
+                        {pr.approvalId && (
+                          <Link to={`/approvals/${pr.approvalId}`} className="hover:underline">
+                            approval {pr.approvalId.slice(0, 8)}
+                          </Link>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => reconcilePr.mutate(pr.id)}
+                        disabled={isWorking}
+                      >
+                        <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+                        Refresh
+                      </Button>
+                      {blockers.length > 0 && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => wakePrFeedback.mutate(pr.id)}
+                          disabled={isWorking}
+                        >
+                          <MessageSquare className="h-3.5 w-3.5 mr-1.5" />
+                          Wake agent
+                        </Button>
+                      )}
+                      <Button
+                        size="sm"
+                        onClick={() => mergePr.mutate(pr)}
+                        disabled={!canMerge || isWorking}
+                        className="bg-green-700 text-white hover:bg-green-600 disabled:bg-muted disabled:text-muted-foreground"
+                      >
+                        <GitMerge className="h-3.5 w-3.5 mr-1.5" />
+                        Merge PR
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="grid gap-2 text-xs sm:grid-cols-4">
+                    <div>
+                      <span className="text-muted-foreground">CI</span>{" "}
+                      <span className={cn("font-medium", gateClass(pr.ciStatus))}>{pr.ciStatus}</span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Review</span>{" "}
+                      <span className={cn("font-medium", gateClass(pr.reviewStatus))}>{pr.reviewStatus}</span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Quality</span>{" "}
+                      <span className={cn("font-medium", gateClass(pr.qualityStatus))}>{pr.qualityStatus}</span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Merge</span>{" "}
+                      <span className={cn("font-medium", gateClass(pr.mergeStatus))}>{pr.mergeStatus}</span>
+                    </div>
+                  </div>
+                  {blockers.length > 0 && (
+                    <div className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-300">
+                      {blockers.slice(0, 4).map((blocker) => (
+                        <div key={blocker}>- {blocker}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {linkedApprovals && linkedApprovals.length > 0 && (
         <Collapsible
           open={secondaryOpen.approvals}
@@ -1360,9 +1517,7 @@ export function IssueDetail() {
                   {issueCostSummary.hasTokens && (
                     <span>
                       Tokens {formatTokens(issueCostSummary.totalTokens)}
-                      {issueCostSummary.cached > 0
-                        ? ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)}, cached ${formatTokens(issueCostSummary.cached)})`
-                        : ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)})`}
+                      {` (fresh in ${formatTokens(issueCostSummary.input)}, cached in ${formatTokens(issueCostSummary.cached)}, out ${formatTokens(issueCostSummary.output)})`}
                     </span>
                   )}
                 </div>

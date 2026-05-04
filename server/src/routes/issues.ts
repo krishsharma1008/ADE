@@ -1010,7 +1010,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
   // Round 3 Phase 8 — operator-initiated force-unlock for a stuck issue.
   // Clears issues.executionRunId unconditionally (even if the run is still
-  // 'running'). Callers MUST be user actors — agent tokens cannot force-unlock.
+  // 'running'). Callers MUST be board actors — agent tokens cannot force-unlock.
   router.post("/issues/:id/force-unlock", async (req, res) => {
     const id = req.params.id as string;
     const existing = await svc.getById(id);
@@ -1019,8 +1019,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
     assertCompanyAccess(req, existing.companyId);
-    if (req.actor.type !== "user") {
-      res.status(403).json({ error: "Only users may force-unlock an issue" });
+    if (req.actor.type !== "board") {
+      res.status(403).json({ error: "Only board users may force-unlock an issue" });
       return;
     }
 

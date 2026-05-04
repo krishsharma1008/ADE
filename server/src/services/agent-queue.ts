@@ -47,6 +47,7 @@ export interface LoadAssignedQueueOptions {
   currentIssueBody?: string | null;
   limit?: number;
   focusMode?: boolean;
+  includeReviewIssues?: boolean;
 }
 
 const FOCUS_BODY_TRUNCATE = 512;
@@ -97,6 +98,9 @@ export async function loadAssignedIssueQueue(
 ): Promise<AssignedQueueResult> {
   const limit = Math.min(Math.max(opts.limit ?? 25, 1), 100);
   const focusMode = opts.focusMode ?? true;
+  const statuses = opts.includeReviewIssues === false
+    ? OPEN_STATUSES.filter((status) => status !== "in_review")
+    : OPEN_STATUSES;
   const rows = await db
     .select({
       id: issues.id,
@@ -112,7 +116,7 @@ export async function loadAssignedIssueQueue(
       and(
         eq(issues.companyId, opts.companyId),
         eq(issues.assigneeAgentId, opts.agentId),
-        inArray(issues.status, OPEN_STATUSES as unknown as string[]),
+        inArray(issues.status, statuses as unknown as string[]),
       ),
     )
     .orderBy(asc(issues.priority), asc(issues.createdAt))

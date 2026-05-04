@@ -68,6 +68,44 @@ async function buildSkillsDir(): Promise<string> {
   return tmp;
 }
 
+async function buildMergeGuardDir(runId: string): Promise<string> {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "combyne-merge-guard-"));
+  const script = (tool: "gh" | "git") => `#!/usr/bin/env bash
+set -euo pipefail
+COMBYNE_GUARD_DIR=${JSON.stringify(tmp)}
+tool=${JSON.stringify(tool)}
+if [[ "$tool" == "gh" ]]; then
+  if [[ "\${1:-}" == "pr" && "\${2:-}" == "merge" ]]; then
+    echo "[combyne] Blocked gh pr merge. Request merge from the Combyne dashboard PR panel after checks pass." >&2
+    exit 78
+  fi
+  if [[ "$*" == *"/pulls/"*"/merge"* ]]; then
+    echo "[combyne] Blocked direct GitHub pull merge API call. Request dashboard merge instead." >&2
+    exit 78
+  fi
+fi
+if [[ "$tool" == "git" && "\${1:-}" == "merge" ]]; then
+  for arg in "$@"; do
+    case "$arg" in
+      main|master|develop|development|origin/main|origin/master|origin/develop|origin/development)
+        echo "[combyne] Blocked direct git merge into a protected base branch. Request dashboard merge instead." >&2
+        exit 78
+        ;;
+    esac
+  done
+fi
+export PATH="\${PATH#$COMBYNE_GUARD_DIR:}"
+command "$tool" "$@"
+`;
+  for (const tool of ["gh", "git"] as const) {
+    const target = path.join(tmp, tool);
+    await fs.writeFile(target, script(tool), "utf8");
+    await fs.chmod(target, 0o755);
+  }
+  await fs.writeFile(path.join(tmp, "README.txt"), `Combyne merge command guard for run ${runId}\n`, "utf8");
+  return tmp;
+}
+
 interface ClaudeExecutionInput {
   runId: string;
   agent: AdapterExecutionContext["agent"];
@@ -309,6 +347,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   } = runtimeConfig;
   const billingType = resolveClaudeBillingType(env);
   const skillsDir = await buildSkillsDir();
+  const mergeGuardDir = await buildMergeGuardDir(runId);
+  const pathEnv = ensurePathInEnv({ ...process.env, ...env });
+  env.PATH = `${mergeGuardDir}:${pathEnv.PATH ?? pathEnv.Path ?? ""}`;
 
   // When instructionsFilePath is configured, create a combined temp file that
   // includes both the file content and the path directive, so we only need
@@ -369,6 +410,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const memoryBody = asString(memory.body, "").trim();
   if (memoryBody.length > 0) {
     preambleSegments.push(`# Recent memory\n\n${memoryBody}`);
+  }
+  const longTermMemory = parseObject(context.combyneLongTermMemoryPreamble);
+  const longTermMemoryBody = asString(longTermMemory.body, "").trim();
+  if (longTermMemoryBody.length > 0) {
+    preambleSegments.push(`# Long-term company memory\n\n${longTermMemoryBody}`);
+  }
+  const acceptedWork = parseObject(context.combyneAcceptedWorkBrief);
+  const acceptedWorkBody = asString(acceptedWork.body, "").trim();
+  if (acceptedWorkBody.length > 0) {
+    preambleSegments.push(`# Accepted work memory task\n\n${acceptedWorkBody}`);
   }
   const assigned = parseObject(context.combyneAssignedIssues);
   // When focus directive is present the focus block is already rendered above;
@@ -590,5 +641,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
   } finally {
     fs.rm(skillsDir, { recursive: true, force: true }).catch(() => {});
+    fs.rm(mergeGuardDir, { recursive: true, force: true }).catch(() => {});
   }
 }

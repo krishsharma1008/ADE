@@ -288,6 +288,27 @@
       "when": 1776369746300,
       "tag": "0040_memory_layers",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1776369746500,
+      "tag": "0041_accepted_work_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1776369746700,
+      "tag": "0042_issue_plans",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1777830598725,
+      "tag": "0043_premium_wonder_man",
+      "breakpoints": true
     }
   ]
 }

@@ -341,6 +341,14 @@ export type {
   GitHubPullRequest,
   GitHubPRReview,
   GitHubCheckRun,
+  IssuePullRequest,
+  IssuePullRequestStatus,
+  IssuePullRequestProvider,
+  IssuePullRequestCiStatus,
+  IssuePullRequestReviewStatus,
+  IssuePullRequestQualityStatus,
+  IssuePullRequestMergeStatus,
+  IssuePullRequestFeedbackStatus,
   SonarQubeQualityGate,
   SonarQubeIssue,
   SonarQubeMetric,
@@ -353,6 +361,15 @@ export {
   MEMORY_OWNER_TYPES,
   MEMORY_PROMOTION_STATES,
 } from "./types/memory.js";
+export {
+  ACCEPTED_WORK_MEMORY_STATUSES,
+  ACCEPTED_WORK_DETECTION_SOURCES,
+} from "./types/accepted-work.js";
+export type {
+  AcceptedWorkEvent,
+  AcceptedWorkMemoryStatus,
+  AcceptedWorkDetectionSource,
+} from "./types/accepted-work.js";
 
 export {
   instanceGeneralSettingsSchema,
@@ -627,6 +644,11 @@ export {
   memoryRecordUsageSchema,
   memoryProposePromotionSchema,
   memoryDecidePromotionSchema,
+  acceptedWorkSimulateMergeSchema,
+  acceptedWorkResolveSchema,
+  acceptedWorkCreateMemorySchema,
+  issuePullRequestUpsertSchema,
+  issuePullRequestMergeSchema,
   type CreateMemoryEntry,
   type UpdateMemoryEntry,
   type MemoryQuery,
@@ -635,6 +657,11 @@ export {
   type MemoryRecordUsage,
   type MemoryProposePromotion,
   type MemoryDecidePromotion,
+  type AcceptedWorkSimulateMerge,
+  type AcceptedWorkResolve,
+  type AcceptedWorkCreateMemory,
+  type IssuePullRequestUpsert,
+  type IssuePullRequestMerge,
 } from "./validators/index.js";
 
 export { API_PREFIX, API } from "./api.js";

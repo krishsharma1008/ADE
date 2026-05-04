@@ -20,19 +20,39 @@ import {
   type IntegrationProvider,
 } from "@combyne/shared";
 import { validate } from "../middleware/validate.js";
-import { assertBoard, assertCompanyAccess } from "./authz.js";
-import { logActivity } from "../services/index.js";
+import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { acceptedWorkService, heartbeatService, issuePullRequestService, logActivity } from "../services/index.js";
 import { integrationService } from "../services/integrations.js";
 import { createJiraClient } from "../services/jira.js";
 import { createConfluentClient } from "../services/confluent.js";
 import { createGitHubClient } from "../services/github.js";
 import { createSonarQubeClient } from "../services/sonarqube.js";
-import { badRequest, notFound } from "../errors.js";
+import { badRequest, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
 export function integrationRoutes(db: Db) {
   const router = Router();
   const svc = integrationService(db);
+  const acceptedWork = acceptedWorkService(db);
+  const issuePrs = issuePullRequestService(db);
+  const heartbeat = heartbeatService(db);
+
+  async function wakeAcceptedWorkManager(event: { id: string; managerAgentId: string | null }) {
+    if (!event.managerAgentId) return;
+    await heartbeat.wakeup(event.managerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "accepted_work_merged_pr",
+      payload: { acceptedWorkEventId: event.id },
+      requestedByActorType: "system",
+      requestedByActorId: "accepted-work",
+      contextSnapshot: {
+        acceptedWorkEventId: event.id,
+        source: "accepted_work.merged_pr",
+      },
+    });
+    await acceptedWork.markWakeRequested(event.id);
+  }
 
   // ── CRUD ──────────────────────────────────────────────────────────
 
@@ -454,6 +474,24 @@ export function integrationRoutes(db: Db) {
       const config = await requireGitHubConfig(companyId);
       const client = createGitHubClient(config);
       const pr = await client.createPullRequest(repo, parsed.title, parsed.head, parsed.base, parsed.body);
+      let trackedPullRequest = null;
+      if (parsed.issueId) {
+        const actor = getActorInfo(req);
+        trackedPullRequest = await issuePrs.upsertForIssue({
+          companyId,
+          issueId: parsed.issueId,
+          requestedByAgentId: actor.agentId,
+          repo,
+          pullNumber: pr.number,
+          pullUrl: pr.htmlUrl,
+          title: pr.title,
+          baseBranch: pr.baseBranch,
+          headBranch: pr.headBranch,
+          headSha: pr.headSha,
+          mergeMethod: "squash",
+          metadata: { source: "github_create_pr_api" },
+        });
+      }
 
       await logActivity(db, {
         companyId,
@@ -462,10 +500,10 @@ export function integrationRoutes(db: Db) {
         action: "github.pr.created",
         entityType: "integration",
         entityId: `${repo}#${pr.number}`,
-        details: { repo, pr: pr.number },
+        details: { repo, pr: pr.number, issuePullRequestId: trackedPullRequest?.id ?? null },
       });
 
-      res.status(201).json(pr);
+      res.status(201).json({ ...pr, issuePullRequest: trackedPullRequest });
     },
   );
 
@@ -478,9 +516,41 @@ export function integrationRoutes(db: Db) {
       const pullNumber = Number(req.params.pullNumber);
       assertCompanyAccess(req, companyId);
       const parsed = githubMergePRSchema.parse({ ...req.body, repo, pullNumber });
-      const config = await requireGitHubConfig(companyId);
-      const client = createGitHubClient(config);
-      const result = await client.mergePullRequest(repo, pullNumber, parsed.mergeMethod);
+      if (!parsed.issueId) {
+        throw unprocessable("Use the PR panel merge flow with a linked issue and merge_pr approval");
+      }
+      let tracked = null;
+      const existing = await issuePrs.listForIssue(parsed.issueId);
+      tracked = existing.find((row) => row.repo === repo && row.pullNumber === pullNumber) ?? null;
+      if (!tracked) {
+        throw unprocessable("PR is not tracked for this issue; create issue pull request tracking before merging");
+      }
+      const merged = await issuePrs.merge(tracked.id, {
+        approvalId: parsed.approvalId,
+        expectedHeadSha: parsed.expectedHeadSha,
+        mergeMethod: parsed.mergeMethod,
+        decisionNote: parsed.commitMessage,
+        decidedByUserId: req.actor.userId ?? "board",
+      });
+      const result = merged.mergeResult;
+      if (result.merged) {
+        const pr = merged.githubPullRequest;
+        const accepted = await acceptedWork.upsertMergedPull({
+          companyId,
+          issueId: parsed.issueId ?? null,
+          repo,
+          pullNumber,
+          pullUrl: pr.htmlUrl,
+          title: pr.title,
+          body: pr.body,
+          headBranch: pr.headBranch,
+          mergedSha: pr.mergeCommitSha ?? result.sha ?? null,
+          mergedAt: pr.mergedAt ?? new Date().toISOString(),
+          detectionSource: "github_merge_api",
+          metadata: { githubUser: pr.user, baseBranch: pr.baseBranch },
+        });
+        if (accepted.shouldWakeManager) await wakeAcceptedWorkManager(accepted.event);
+      }
 
       await logActivity(db, {
         companyId,

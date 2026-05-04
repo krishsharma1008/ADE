@@ -1,4 +1,4 @@
-/// <reference path="./types/express.d.ts" />
+import "./types/express.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";

@@ -91,7 +91,7 @@ const PROVIDERS: ProviderMeta[] = [
     description: "Source control, pull requests, code reviews, and CI checks",
     iconBg: "bg-[#24292f] dark:bg-[#f0f0f0]",
     iconLetter: "G",
-    capabilities: ["Create branches & PRs", "Merge pull requests", "Code reviews", "CI status checks"],
+    capabilities: ["Create branches & PRs", "Dashboard-gated merge", "Code reviews", "CI status checks"],
     helpUrl: "https://github.com/settings/tokens",
     helpLabel: "Create a token",
   },

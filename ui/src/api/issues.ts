@@ -7,6 +7,8 @@ import type {
   IssueDocument,
   IssueDocumentSummary,
   IssueLabel,
+  IssuePullRequest,
+  IssuePullRequestStatus,
 } from "@combyne/shared";
 import { api } from "./client";
 
@@ -102,6 +104,23 @@ export const issuesApi = {
     api.post<Approval[]>(`/issues/${id}/approvals`, { approvalId }),
   unlinkApproval: (id: string, approvalId: string) =>
     api.delete<{ ok: true }>(`/issues/${id}/approvals/${approvalId}`),
+  listPullRequests: (id: string) => api.get<IssuePullRequest[]>(`/issues/${id}/pull-requests`),
+  reconcilePullRequest: (id: string) =>
+    api.post<IssuePullRequestStatus>(`/issue-pull-requests/${id}/reconcile`, {}),
+  wakePullRequestFeedback: (id: string) =>
+    api.post<{ status: IssuePullRequestStatus; sent: boolean; wakeRunId: string | null }>(
+      `/issue-pull-requests/${id}/wake-feedback`,
+      {},
+    ),
+  mergePullRequest: (
+    id: string,
+    data: {
+      approvalId?: string | null;
+      expectedHeadSha?: string | null;
+      mergeMethod?: "merge" | "squash" | "rebase";
+      decisionNote?: string | null;
+    },
+  ) => api.post<{ pullRequest: IssuePullRequest; mergeResult: unknown }>(`/issue-pull-requests/${id}/merge`, data),
   listByExecutionWorkspace: (companyId: string, executionWorkspaceId: string) =>
     api.get<Issue[]>(
       `/companies/${companyId}/issues?executionWorkspaceId=${encodeURIComponent(executionWorkspaceId)}`,

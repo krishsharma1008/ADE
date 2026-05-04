@@ -102,9 +102,12 @@ export interface GitHubPullRequest {
   draft: boolean;
   user: string;
   headBranch: string;
+  headSha: string | null;
   baseBranch: string;
   merged: boolean;
   mergeable: boolean | null;
+  mergeCommitSha: string | null;
+  mergedAt: string | null;
   createdAt: string;
   updatedAt: string;
   htmlUrl: string;

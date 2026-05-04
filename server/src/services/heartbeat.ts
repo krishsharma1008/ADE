@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   agents,
@@ -9,6 +9,7 @@ import {
   agentWakeupRequests,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   costEvents,
   issues,
   projectWorkspaces,
@@ -19,6 +20,8 @@ import { publishLiveEvent } from "./live-events.js";
 import { appendTranscriptEntry, type TranscriptRole } from "./agent-transcripts.js";
 import { loadRecentMemory, summarizeRunAndPersist } from "./agent-memory.js";
 import { getPendingHandoffBrief, markHandoffConsumed } from "./agent-handoff.js";
+import { acceptedWorkService } from "./accepted-work.js";
+import { memoryService } from "./memory.js";
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
 import { loadAssignedIssueQueue } from "./agent-queue.js";
 import {
@@ -40,7 +43,9 @@ import {
 import { resolveModel } from "@combyne/context-budget";
 import { inspectGitStateForIssue } from "./git-state.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
-import { extractAndPostQuestions } from "./agent-question-extract.js";
+import { extractAndPostQuestions, type ExtractedQuestionsResult } from "./agent-question-extract.js";
+import { issueService } from "./issues.js";
+import { logActivity } from "./activity-log.js";
 import { loadCompanyProjectOverview } from "./agent-company-context.js";
 import {
   loadLatestSummary,
@@ -72,8 +77,83 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_combyneWakeContext";
+const SMALL_TASK_MAX_TURNS_DEFAULT = 30;
+const SMALL_TASK_TIMEOUT_SEC_DEFAULT = 20 * 60;
+const SMALL_TASK_TOKEN_PAUSE_THRESHOLD_DEFAULT = 80_000;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__combyne_repo_only__";
+
+const AUTO_CLOSE_SUCCESS_STATUSES = new Set(["todo", "in_progress"]);
+
+export async function autoCloseIssueAfterSuccessfulRun(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    issueId: string;
+    questionResult?: ExtractedQuestionsResult | null;
+  },
+): Promise<{ closed: boolean; reason: string }> {
+  const issue = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      status: issues.status,
+      originKind: issues.originKind,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+    .then((rows) => rows[0] ?? null);
+
+  if (!issue) return { closed: false, reason: "issue_not_found" };
+  if (issue.originKind === "terminal_session") {
+    return { closed: false, reason: "terminal_session_issue" };
+  }
+  if (!AUTO_CLOSE_SUCCESS_STATUSES.has(issue.status)) {
+    return { closed: false, reason: `status_${issue.status}` };
+  }
+  if (
+    input.questionResult &&
+    (input.questionResult.posted > 0 || input.questionResult.skippedExisting > 0)
+  ) {
+    return { closed: false, reason: "questions_extracted" };
+  }
+
+  const openQuestion = await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.issueId, issue.id),
+        eq(issueComments.kind, "question"),
+        isNull(issueComments.answeredAt),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (openQuestion) return { closed: false, reason: "open_questions" };
+
+  const updated = await issueService(db).update(issue.id, { status: "done" });
+  if (!updated) return { closed: false, reason: "update_failed" };
+
+  await logActivity(db, {
+    companyId: input.companyId,
+    actorType: "system",
+    actorId: "heartbeat",
+    agentId: input.agentId,
+    runId: input.runId,
+    action: "issue.auto_closed",
+    entityType: "issue",
+    entityId: issue.id,
+    details: {
+      reason: "successful_run_without_questions",
+      previousStatus: issue.status,
+    },
+  });
+
+  return { closed: true, reason: "successful_run_without_questions" };
+}
 
 function appendExcerpt(prev: string, chunk: string) {
   return appendWithCap(prev, chunk, MAX_EXCERPT_BYTES);
@@ -83,6 +163,39 @@ function normalizeMaxConcurrentRuns(value: unknown) {
   const parsed = Math.floor(asNumber(value, HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT));
   if (!Number.isFinite(parsed)) return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
   return Math.max(HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT, Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed));
+}
+
+function envPositiveInt(name: string, fallback: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function withSmallCodingTaskControls(
+  agent: typeof agents.$inferSelect,
+  config: Record<string, unknown>,
+  context: Record<string, unknown>,
+): Record<string, unknown> {
+  if (agent.adapterType !== "claude_local") return config;
+  if ((agent.adapterConfig as Record<string, unknown> | null)?.smallCodingTaskProfile === false) return config;
+  if (config.smallCodingTaskProfile === false) return config;
+  if (!readNonEmptyString(context.issueId) && !readNonEmptyString(context.taskId)) return config;
+  if (readNonEmptyString(context.acceptedWorkEventId)) return config;
+
+  const maxTurnsLimit = envPositiveInt("COMBYNE_SMALL_TASK_MAX_TURNS", SMALL_TASK_MAX_TURNS_DEFAULT);
+  const timeoutLimit = envPositiveInt("COMBYNE_SMALL_TASK_TIMEOUT_SEC", SMALL_TASK_TIMEOUT_SEC_DEFAULT);
+  const currentMaxTurns = asNumber(config.maxTurnsPerRun, 0);
+  const currentTimeout = asNumber(config.timeoutSec, 0);
+  return {
+    ...config,
+    maxTurnsPerRun:
+      currentMaxTurns > 0 ? Math.min(currentMaxTurns, maxTurnsLimit) : maxTurnsLimit,
+    timeoutSec:
+      currentTimeout > 0 ? Math.min(currentTimeout, timeoutLimit) : timeoutLimit,
+  };
+}
+
+function smallTaskTokenPauseThreshold(): number {
+  return envPositiveInt("COMBYNE_SMALL_TASK_TOKEN_PAUSE_THRESHOLD", SMALL_TASK_TOKEN_PAUSE_THRESHOLD_DEFAULT);
 }
 
 async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T>) {
@@ -1318,6 +1431,36 @@ export function heartbeatService(db: Db) {
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
     const memoryIssueId = readNonEmptyString(context.issueId);
+    const acceptedWorkSvc = acceptedWorkService(db);
+    void acceptedWorkSvc
+      .maybeReconcileGitHubCompany(agent.companyId)
+      .then(async (result) => {
+        if (result.skipped) return;
+        for (const event of result.events) {
+          if (
+            event.memoryStatus !== "pending" ||
+            event.wakeupRequestedAt ||
+            !event.managerAgentId
+          ) {
+            continue;
+          }
+          await enqueueWakeup(event.managerAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "accepted_work_merged_pr",
+            requestedByActorType: "system",
+            requestedByActorId: "accepted-work-reconcile",
+            contextSnapshot: {
+              acceptedWorkEventId: event.id,
+              source: "accepted_work.github_reconcile",
+            },
+          });
+          await acceptedWorkSvc.markWakeRequested(event.id);
+        }
+      })
+      .catch((err) => {
+        logger.debug({ err, companyId: agent.companyId }, "accepted-work heartbeat reconciliation failed");
+      });
     let pendingHandoffId: string | null = null;
     try {
       const handoff = await getPendingHandoffBrief(db, agent.id, memoryIssueId ?? null);
@@ -1381,6 +1524,100 @@ export function heartbeatService(db: Db) {
       }
     } catch (err) {
       logger.debug({ err, agentId: agent.id, runId }, "failed to load agent memory preamble");
+    }
+    try {
+      const acceptedWorkEventId = readNonEmptyString(context.acceptedWorkEventId);
+      const events = await acceptedWorkSvc.pendingForManager(
+        agent.companyId,
+        agent.id,
+        acceptedWorkEventId ?? null,
+      );
+      if (events.length > 0) {
+        const body = await acceptedWorkSvc.buildBrief(agent.companyId, events);
+        if (body) {
+          context.combyneAcceptedWorkBrief = {
+            body,
+            eventIds: events.map((event) => event.id),
+          };
+          try {
+            await appendTranscriptEntry(db, {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              runId: run.id,
+              issueId: memoryIssueId ?? null,
+              seq: 0,
+              role: "system",
+              contentKind: "accepted_work_brief",
+              content: {
+                eventIds: events.map((event) => event.id),
+                body,
+              },
+            });
+          } catch (err) {
+            logger.debug({ err, agentId: agent.id, runId }, "failed to transcript accepted work brief");
+          }
+        }
+      }
+    } catch (err) {
+      logger.debug({ err, agentId: agent.id, runId }, "failed to load accepted work brief");
+    }
+    if (memoryIssueId) {
+      try {
+        const issueRow = await db
+          .select({
+            title: issues.title,
+            description: issues.description,
+            identifier: issues.identifier,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (issueRow) {
+          const longTerm = memoryService(db);
+          const query = [
+            issueRow.identifier,
+            issueRow.title,
+            issueRow.description,
+          ].filter(Boolean).join("\n");
+          const ranked = await longTerm.queryRanked(agent.companyId, query, {
+            layers: ["workspace", "shared", "personal"],
+            ownerType: "agent",
+            ownerId: agent.id,
+            limit: 8,
+            includeSnippets: false,
+          });
+          const entries = [];
+          for (const item of ranked.items) {
+            const entry = await longTerm.getEntry(item.id);
+            if (!entry) continue;
+            entries.push(entry);
+            await longTerm.recordUsage({
+              entryId: entry.id,
+              companyId: agent.companyId,
+              issueId: memoryIssueId,
+              actorType: "agent",
+              actorId: agent.id,
+              score: item.score,
+            });
+          }
+          if (entries.length > 0) {
+            const body = entries
+              .map((entry) => {
+                const scope = entry.serviceScope ? ` · ${entry.serviceScope}` : "";
+                const tags = entry.tags.length ? `\nTags: ${entry.tags.join(", ")}` : "";
+                return `## ${entry.subject}\nLayer: ${entry.layer}${scope}${tags}\n${entry.body}`;
+              })
+              .join("\n\n");
+            context.combyneLongTermMemoryPreamble = {
+              body: body.length > 16_000 ? `${body.slice(0, 16_000)}\n…(truncated)` : body,
+              entryCount: entries.length,
+              source: "memory_entries",
+            };
+          }
+        }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId, issueId: memoryIssueId }, "failed to load long-term memory");
+      }
     }
     if (memoryIssueId) {
       try {
@@ -1512,6 +1749,7 @@ export function heartbeatService(db: Db) {
         currentIssueId: memoryIssueId ?? null,
         currentIssueBody: focusIssueBody,
         focusMode,
+        includeReviewIssues: run.invocationSource !== "timer" || Boolean(memoryIssueId),
       });
       context.combyneAssignedIssues = queue;
 
@@ -2037,11 +2275,12 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected COMBYNE_API_KEY",
         );
       }
+      const effectiveResolvedConfig = withSmallCodingTaskControls(agent, resolvedConfig, context);
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
         runtime: runtimeForAdapter,
-        config: resolvedConfig,
+        config: effectiveResolvedConfig,
         context,
         onLog,
         onMeta: onAdapterMeta,
@@ -2089,6 +2328,15 @@ export function heartbeatService(db: Db) {
               ...(adapterResult.billingType ? { billingType: adapterResult.billingType } : {}),
             } as Record<string, unknown>)
           : null;
+      const usageForBudget = (adapterResult.usage ?? {}) as Record<string, unknown>;
+      const runTokenTotal =
+        asNumber(usageForBudget.inputTokens, asNumber(usageForBudget.input_tokens, 0)) +
+        asNumber(usageForBudget.cachedInputTokens, asNumber(usageForBudget.cached_input_tokens, asNumber(usageForBudget.cache_read_input_tokens, 0))) +
+        asNumber(usageForBudget.outputTokens, asNumber(usageForBudget.output_tokens, 0));
+      const pauseForSmallTaskBudget =
+        agent.adapterType === "claude_local" &&
+        Boolean(readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId)) &&
+        runTokenTotal >= smallTaskTokenPauseThreshold();
 
       // Round 3 Phase 3 — close the calibration loop. Compares our
       // pre-run estimate with the adapter-reported actual usage.inputTokens
@@ -2325,30 +2573,70 @@ export function heartbeatService(db: Db) {
           }
         })();
 
+        const runIssueId = resolveRunIssueId(finalizedRun);
+        if (pauseForSmallTaskBudget && runIssueId) {
+          try {
+            const issueRow = await db
+              .select({ status: issues.status })
+              .from(issues)
+              .where(and(eq(issues.id, runIssueId), eq(issues.companyId, finalizedRun.companyId)))
+              .then((rows) => rows[0] ?? null);
+            if (issueRow && issueRow.status !== "done" && issueRow.status !== "cancelled") {
+              await db.insert(issueComments).values({
+                companyId: finalizedRun.companyId,
+                issueId: runIssueId,
+                authorAgentId: null,
+                authorUserId: null,
+                body:
+                  `Run paused after crossing the small-task token threshold. ` +
+                  `Reported tokens: ${runTokenTotal}; threshold: ${smallTaskTokenPauseThreshold()}. ` +
+                  `Review the run before waking the agent again or raise the per-agent limit for this issue.`,
+              });
+              await issueService(db).update(runIssueId, { status: "awaiting_user" });
+            }
+          } catch (err) {
+            logger.debug({ err, runId: finalizedRun.id, issueId: runIssueId }, "small-task budget pause failed");
+          }
+        }
+
         // Auto-surface any numbered / bulleted questions the agent buried
         // in its output as structured `kind="question"` comments, so the
         // Reply-and-Wake card renders each with its own answer input
         // instead of leaving them as prose in the plan document.
-        const runIssueId = resolveRunIssueId(finalizedRun);
-        if (runIssueId && outcome === "succeeded") {
+        let questionResult: ExtractedQuestionsResult | null = null;
+        if (runIssueId && outcome === "succeeded" && !pauseForSmallTaskBudget) {
           const resultText =
             adapterResult.resultJson && typeof adapterResult.resultJson === "object"
               ? JSON.stringify(adapterResult.resultJson)
               : "";
           const sourceText = [stdoutExcerpt, resultText].filter(Boolean).join("\n\n");
           if (sourceText.length > 0) {
-            void extractAndPostQuestions(db, {
-              companyId: finalizedRun.companyId,
-              agentId: finalizedRun.agentId,
-              issueId: runIssueId,
-              sourceText,
-            }).catch((err) => {
+            try {
+              questionResult = await extractAndPostQuestions(db, {
+                companyId: finalizedRun.companyId,
+                agentId: finalizedRun.agentId,
+                issueId: runIssueId,
+                sourceText,
+              });
+            } catch (err) {
               logger.debug(
                 { err, runId: finalizedRun.id, issueId: runIssueId },
                 "question-extractor failed",
               );
-            });
+            }
           }
+          await autoCloseIssueAfterSuccessfulRun(db, {
+            companyId: finalizedRun.companyId,
+            agentId: finalizedRun.agentId,
+            runId: finalizedRun.id,
+            issueId: runIssueId,
+            questionResult,
+          }).catch((err) => {
+            logger.debug(
+              { err, runId: finalizedRun.id, issueId: runIssueId },
+              "successful-run auto-close failed",
+            );
+          });
         }
       }
 

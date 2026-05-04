@@ -217,7 +217,7 @@ function runMetrics(run: HeartbeatRun) {
     output,
     cached,
     cost,
-    totalTokens: input + output,
+    totalTokens: input + cached + output,
   };
 }
 
@@ -1715,7 +1715,7 @@ function RunDetail({ run, agentRouteId, adapterType }: { run: HeartbeatRun; agen
           {hasMetrics && (
             <div className="border-t sm:border-t-0 sm:border-l border-border p-4 grid grid-cols-2 gap-x-4 sm:gap-x-8 gap-y-3 content-center">
               <div>
-                <div className="text-xs text-muted-foreground">Input</div>
+                <div className="text-xs text-muted-foreground">Fresh input</div>
                 <div className="text-sm font-medium font-mono">{formatTokens(metrics.input)}</div>
               </div>
               <div>
@@ -2735,4 +2735,3 @@ function KeysTab({ agentId, companyId }: { agentId: string; companyId?: string }
     </div>
   );
 }
-

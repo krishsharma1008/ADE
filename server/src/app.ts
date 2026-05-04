@@ -35,6 +35,8 @@ import { instanceSettingsRoutes } from "./routes/instance-settings.js";
 import { fileOpsRoutes } from "./routes/file-ops.js";
 import { terminalRoutes } from "./routes/terminal.js";
 import { memoryRoutes } from "./routes/memory.js";
+import { acceptedWorkRoutes } from "./routes/accepted-work.js";
+import { issuePullRequestRoutes } from "./routes/issue-pull-requests.js";
 import { licenseGateMiddleware } from "./middleware/license-gate.js";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import type { LicenseConfig } from "./services/license.js";
@@ -155,6 +157,8 @@ export async function createApp(
   api.use(fileOpsRoutes());
   api.use(terminalRoutes(db));
   api.use(memoryRoutes(db));
+  api.use(acceptedWorkRoutes(db));
+  api.use(issuePullRequestRoutes(db));
   api.use(
     accessRoutes(db, {
       deploymentMode: opts.deploymentMode,

@@ -347,3 +347,17 @@ export {
   type MemoryProposePromotion,
   type MemoryDecidePromotion,
 } from "./memory.js";
+export {
+  acceptedWorkSimulateMergeSchema,
+  acceptedWorkResolveSchema,
+  acceptedWorkCreateMemorySchema,
+  type AcceptedWorkSimulateMerge,
+  type AcceptedWorkResolve,
+  type AcceptedWorkCreateMemory,
+} from "./accepted-work.js";
+export {
+  issuePullRequestUpsertSchema,
+  issuePullRequestMergeSchema,
+  type IssuePullRequestUpsert,
+  type IssuePullRequestMerge,
+} from "./issue-pull-request.js";

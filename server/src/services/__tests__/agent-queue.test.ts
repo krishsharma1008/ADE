@@ -118,6 +118,17 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
     expect(result.body).toMatch(/awaiting review/);
   });
 
+  it("can omit in_review work from timer heartbeat queue digests", async () => {
+    const result = await loadAssignedIssueQueue(handle.db, {
+      companyId,
+      agentId,
+      includeReviewIssues: false,
+    });
+    expect(result.items.map((i) => i.status)).not.toContain("in_review");
+    expect(result.body).not.toMatch(/awaiting review/);
+    expect(result.body).toMatch(/todo item/);
+  });
+
   it("marks the currently-woken issue and surfaces it first", async () => {
     const rows = await handle.db
       .select({ id: issues.id })

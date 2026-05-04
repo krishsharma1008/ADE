@@ -236,6 +236,25 @@ export type {
   MemoryCoreContext,
   MemoryPromotion,
 } from "./memory.js";
+export {
+  ACCEPTED_WORK_MEMORY_STATUSES,
+  ACCEPTED_WORK_DETECTION_SOURCES,
+} from "./accepted-work.js";
+export type {
+  AcceptedWorkEvent,
+  AcceptedWorkMemoryStatus,
+  AcceptedWorkDetectionSource,
+} from "./accepted-work.js";
+export type {
+  IssuePullRequest,
+  IssuePullRequestStatus,
+  IssuePullRequestProvider,
+  IssuePullRequestCiStatus,
+  IssuePullRequestReviewStatus,
+  IssuePullRequestQualityStatus,
+  IssuePullRequestMergeStatus,
+  IssuePullRequestFeedbackStatus,
+} from "./issue-pull-request.js";
 export type {
   ExecutionWorkspaceStrategyType,
   ProjectExecutionWorkspaceDefaultMode,

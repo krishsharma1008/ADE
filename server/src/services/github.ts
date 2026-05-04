@@ -56,9 +56,12 @@ export function createGitHubClient(config: GitHubConfig) {
       draft: (p.draft as boolean) ?? false,
       user: (user?.login as string) ?? "",
       headBranch: head?.ref as string,
+      headSha: (head?.sha as string | null) ?? null,
       baseBranch: base?.ref as string,
       merged: (p.merged as boolean) ?? false,
       mergeable: (p.mergeable as boolean | null) ?? null,
+      mergeCommitSha: (p.merge_commit_sha as string | null) ?? null,
+      mergedAt: (p.merged_at as string | null) ?? null,
       createdAt: p.created_at as string,
       updatedAt: p.updated_at as string,
       htmlUrl: p.html_url as string,
@@ -191,8 +194,8 @@ export function createGitHubClient(config: GitHubConfig) {
       number: number,
       method?: "merge" | "squash" | "rebase",
       commitMessage?: string,
-    ): Promise<{ merged: boolean; message: string }> {
-      return request<{ merged: boolean; message: string }>(
+    ): Promise<{ merged: boolean; message: string; sha?: string }> {
+      return request<{ merged: boolean; message: string; sha?: string }>(
         `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/pulls/${number}/merge`,
         {
           method: "PUT",

@@ -32,6 +32,7 @@ import { InviteLandingPage } from "./pages/InviteLanding";
 import { Routines } from "./pages/Routines";
 import { RoutineDetail } from "./pages/RoutineDetail";
 import { CompanySkills } from "./pages/CompanySkills";
+import { CompanyMemory } from "./pages/CompanyMemory";
 import { PluginManager } from "./pages/PluginManager";
 import { PluginPage } from "./pages/PluginPage";
 import { PluginSettings } from "./pages/PluginSettings";
@@ -147,6 +148,7 @@ function boardRoutes() {
       <Route path="routines" element={<Routines />} />
       <Route path="routines/:routineId" element={<RoutineDetail />} />
       <Route path="skills" element={<CompanySkills />} />
+      <Route path="memory" element={<CompanyMemory />} />
       <Route path="skills/:skillId" element={<CompanySkills />} />
       <Route path="skills/:skillId/*" element={<CompanySkills />} />
       <Route path="plugins" element={<PluginManager />} />
@@ -249,6 +251,7 @@ export function App() {
           <Route path="agents/:agentId" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/:agentId/:tab" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/:agentId/runs/:runId" element={<UnprefixedBoardRedirect />} />
+          <Route path="memory" element={<UnprefixedBoardRedirect />} />
           <Route path="projects" element={<UnprefixedBoardRedirect />} />
           <Route path="projects/:projectId" element={<UnprefixedBoardRedirect />} />
           <Route path="projects/:projectId/overview" element={<UnprefixedBoardRedirect />} />

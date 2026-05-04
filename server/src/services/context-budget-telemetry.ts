@@ -296,13 +296,20 @@ function readObject(v: unknown): Record<string, unknown> | null {
 // Round 3 plan; the precise numbers are tunable via env in Phase 5. For
 // shadow mode they just need to be in the right ballpark.
 const ADAPTER_BUDGETS: Record<string, number> = {
-  "claude-local": 160_000,
+  "claude_local": 48_000,
+  "claude-local": 48_000,
+  "codex_local": 160_000,
   "codex-local": 320_000,
+  "cursor": 160_000,
   "cursor-local": 160_000,
+  "gemini_local": 800_000,
   "gemini-local": 800_000,
+  "opencode_local": 100_000,
   "opencode-local": 100_000,
+  "pi_local": 24_000,
   "pi-local": 24_000,
   "browser-use": 100_000,
+  "openclaw_gateway": 160_000,
   "openclaw-gateway": 160_000,
 };
 
@@ -365,6 +372,32 @@ export function buildPreambleSectionsFromContext(
       content: memoryBody,
       priority: 3,
       cacheStable: true,
+      truncationStrategy: "tail",
+      maxTokens: 4_000,
+    });
+  }
+
+  const longTermMemory = readObject(context.combyneLongTermMemoryPreamble);
+  const longTermMemoryBody = readString(longTermMemory?.body);
+  if (longTermMemoryBody) {
+    out.push({
+      name: "longTermMemory",
+      content: longTermMemoryBody,
+      priority: 2,
+      cacheStable: true,
+      truncationStrategy: "tail",
+      maxTokens: 4_000,
+    });
+  }
+
+  const acceptedWork = readObject(context.combyneAcceptedWorkBrief);
+  const acceptedWorkBody = readString(acceptedWork?.body);
+  if (acceptedWorkBody) {
+    out.push({
+      name: "acceptedWork",
+      content: acceptedWorkBody,
+      priority: 1,
+      cacheStable: false,
       truncationStrategy: "tail",
       maxTokens: 4_000,
     });
@@ -508,11 +541,11 @@ export interface ShadowCompareResult {
   deltaPct: number;
 }
 
-// Round 3 Phase 5 — feature flags. Default to shadow-only; ops flips
-// COMBYNE_CONTEXT_BUDGET_ENABLED=1 to let the composer replace byte caps.
+// Context pruning is now default-on. Set COMBYNE_CONTEXT_BUDGET_ENABLED=0
+// to force shadow-only behavior while investigating a production issue.
 export function contextBudgetComposerEnabled(): boolean {
   const v = process.env.COMBYNE_CONTEXT_BUDGET_ENABLED;
-  return v === "1" || v === "true";
+  return v !== "0" && v !== "false" && v !== "no" && v !== "off";
 }
 
 // Round 3 Phase 7 (PR 6.5) — aggressive pruning A/B.
@@ -606,6 +639,14 @@ function writeSectionBackToContext(
     case "memory":
       if (section.dropped) delete context.combyneMemoryPreamble;
       else patch("combyneMemoryPreamble", ["body"], section.content);
+      break;
+    case "longTermMemory":
+      if (section.dropped) delete context.combyneLongTermMemoryPreamble;
+      else patch("combyneLongTermMemoryPreamble", ["body"], section.content);
+      break;
+    case "acceptedWork":
+      if (section.dropped) delete context.combyneAcceptedWorkBrief;
+      else patch("combyneAcceptedWorkBrief", ["body"], section.content);
       break;
     case "focus":
       if (section.dropped) delete context.combyneFocusDirective;

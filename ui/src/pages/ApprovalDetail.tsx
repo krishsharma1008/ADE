@@ -260,7 +260,14 @@ export function ApprovalDetail() {
           </div>
         )}
         <div className="flex flex-wrap items-center gap-2">
-          {isActionable && (
+          {isActionable && approval.type === "merge_pr" && (
+            <Button asChild size="sm" className="bg-green-700 hover:bg-green-600 text-white">
+              <Link to={payload.issueId ? `/issues/${String(payload.issueId)}` : "/issues"}>
+                Open issue PR panel
+              </Link>
+            </Button>
+          )}
+          {isActionable && approval.type !== "merge_pr" && (
             <>
               <Button
                 size="sm"

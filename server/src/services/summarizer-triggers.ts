@@ -94,7 +94,7 @@ export async function unsummarizedTokensFor(
 // to context. The composer still bounds it per its section strategy; this
 // is a cheap pre-clip so we don't spend composer cycles on a 200k-token
 // payload that will obviously be trimmed.
-export const RECENT_TURNS_MAX_TOKENS = 20_000;
+export const RECENT_TURNS_MAX_TOKENS = 5_000;
 
 export interface RenderRecentTurnsOutput {
   body: string;

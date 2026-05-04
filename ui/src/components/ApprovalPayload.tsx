@@ -1,15 +1,17 @@
-import { UserPlus, Lightbulb, ShieldCheck, ClipboardList } from "lucide-react";
+import { UserPlus, Lightbulb, ShieldCheck, ClipboardList, GitMerge } from "lucide-react";
 
 export const typeLabel: Record<string, string> = {
   hire_agent: "Hire Agent",
   approve_ceo_strategy: "CEO Strategy",
   plan_review: "Plan Review",
+  merge_pr: "Merge PR",
 };
 
 export const typeIcon: Record<string, typeof UserPlus> = {
   hire_agent: UserPlus,
   approve_ceo_strategy: Lightbulb,
   plan_review: ClipboardList,
+  merge_pr: GitMerge,
 };
 
 export const defaultTypeIcon = ShieldCheck;
@@ -86,8 +88,28 @@ export function PlanReviewPayload({ payload }: { payload: Record<string, unknown
   );
 }
 
+export function MergePrPayload({ payload }: { payload: Record<string, unknown> }) {
+  return (
+    <div className="mt-3 space-y-1.5 text-sm">
+      <PayloadField label="Repo" value={payload.repo} />
+      <PayloadField label="PR" value={payload.pullNumber ? `#${payload.pullNumber}` : payload.pullUrl} />
+      <PayloadField label="Base" value={payload.baseBranch} />
+      <PayloadField label="Head" value={payload.headSha ? String(payload.headSha).slice(0, 8) : payload.headBranch} />
+      <PayloadField label="CI" value={payload.ciStatus} />
+      <PayloadField label="Review" value={payload.reviewStatus} />
+      <PayloadField label="Quality" value={payload.qualityStatus} />
+      {!!payload.pullUrl && (
+        <a href={String(payload.pullUrl)} target="_blank" rel="noreferrer" className="text-xs text-primary hover:underline">
+          Open pull request
+        </a>
+      )}
+    </div>
+  );
+}
+
 export function ApprovalPayloadRenderer({ type, payload }: { type: string; payload: Record<string, unknown> }) {
   if (type === "hire_agent") return <HireAgentPayload payload={payload} />;
   if (type === "plan_review") return <PlanReviewPayload payload={payload} />;
+  if (type === "merge_pr") return <MergePrPayload payload={payload} />;
   return <CeoStrategyPayload payload={payload} />;
 }
