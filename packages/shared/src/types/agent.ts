@@ -6,6 +6,8 @@ import type {
 
 export interface AgentPermissions {
   canCreateAgents: boolean;
+  canAssignTasks: boolean;
+  taskAssignmentScope: "none" | "reports" | "company";
 }
 
 export interface Agent {

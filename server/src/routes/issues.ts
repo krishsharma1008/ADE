@@ -27,6 +27,7 @@ import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { createHandoff } from "../services/agent-handoff.js";
+import { captureIssueContextRefs } from "../services/issue-context-refs.js";
 
 const MAX_ATTACHMENT_BYTES = Number(process.env.COMBYNE_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
@@ -107,7 +108,25 @@ export function issueRoutes(db: Db, storage: StorageService) {
     return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
   }
 
-  async function assertCanAssignTasks(req: Request, companyId: string) {
+  async function isDirectOrIndirectReport(companyId: string, managerId: string, targetAgentId: string) {
+    if (managerId === targetAgentId) return true;
+    const companyAgents = await agentsSvc.list(companyId, { includeTerminated: false });
+    const byId = new Map(companyAgents.map((agent) => [agent.id, agent]));
+    let cursor = byId.get(targetAgentId)?.reportsTo ?? null;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor)) {
+      if (cursor === managerId) return true;
+      seen.add(cursor);
+      cursor = byId.get(cursor)?.reportsTo ?? null;
+    }
+    return false;
+  }
+
+  async function assertCanAssignTasks(
+    req: Request,
+    companyId: string,
+    target?: { assigneeAgentId?: string | null; assigneeUserId?: string | null },
+  ) {
     assertCompanyAccess(req, companyId);
     if (req.actor.type === "board") {
       if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return;
@@ -120,10 +139,34 @@ export function issueRoutes(db: Db, storage: StorageService) {
       const allowedByGrant = await access.hasPermission(companyId, "agent", req.actor.agentId, "tasks:assign");
       if (allowedByGrant) return;
       const actorAgent = await agentsSvc.getById(req.actor.agentId);
-      if (actorAgent && actorAgent.companyId === companyId && canCreateAgentsLegacy(actorAgent)) return;
+      if (!actorAgent || actorAgent.companyId !== companyId) throw forbidden("Missing permission: tasks:assign");
+      const permissions = actorAgent.permissions ?? {};
+      const scope = permissions.taskAssignmentScope ?? "none";
+      if (permissions.canAssignTasks && scope === "company") return;
+      if (canCreateAgentsLegacy(actorAgent) && scope !== "reports") return;
+      if (permissions.canAssignTasks && scope === "reports" && target?.assigneeAgentId && !target.assigneeUserId) {
+        if (await isDirectOrIndirectReport(companyId, actorAgent.id, target.assigneeAgentId)) return;
+        throw forbidden("Missing permission: tasks:assign for non-report agent");
+      }
       throw forbidden("Missing permission: tasks:assign");
     }
     throw unauthorized();
+  }
+
+  function blockedSourceForActor(req: Request): "human" | "agent" | "system" {
+    if (req.actor.type === "board") return "human";
+    if (req.actor.type === "agent") return "agent";
+    return "system";
+  }
+
+  async function safeCaptureIssueContextRefs(
+    input: Parameters<typeof captureIssueContextRefs>[1],
+  ) {
+    try {
+      await captureIssueContextRefs(db, input);
+    } catch (err) {
+      logger.debug({ err, issueId: input.issueId }, "failed to capture issue context refs");
+    }
   }
 
   function requireAgentRunId(req: Request, res: Response) {
@@ -252,6 +295,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       originKind: req.query.originKind as string | undefined,
       excludeOriginKind: req.query.excludeOriginKind as string | undefined,
       q: req.query.q as string | undefined,
+      excludeHumanBlocked: req.actor.type === "agent" && req.query.includeHumanBlocked !== "true",
     });
     res.json(result);
   });
@@ -437,12 +481,32 @@ export function issueRoutes(db: Db, storage: StorageService) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (req.body.assigneeAgentId || req.body.assigneeUserId) {
-      await assertCanAssignTasks(req, companyId);
+      await assertCanAssignTasks(req, companyId, {
+        assigneeAgentId: req.body.assigneeAgentId ?? null,
+        assigneeUserId: req.body.assigneeUserId ?? null,
+      });
     }
 
     const actor = getActorInfo(req);
-    const issue = await svc.create(companyId, {
+    const createPatch = {
       ...req.body,
+      ...(req.body.status === "blocked"
+        ? {
+            blockedSource: blockedSourceForActor(req),
+            blockedReason: req.body.description?.slice(0, 1000) ?? null,
+          }
+        : {}),
+      createdByAgentId: actor.agentId,
+      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+    };
+    const issue = await svc.create(companyId, {
+      ...createPatch,
+    });
+
+    await safeCaptureIssueContextRefs({
+      companyId,
+      issueId: issue.id,
+      text: `${issue.title}\n\n${issue.description ?? ""}`,
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
     });
@@ -499,7 +563,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
     if (assigneeWillChange) {
       if (!isAgentReturningIssueToCreator) {
-        await assertCanAssignTasks(req, existing.companyId);
+        await assertCanAssignTasks(req, existing.companyId, {
+          assigneeAgentId:
+            req.body.assigneeAgentId === undefined ? existing.assigneeAgentId : req.body.assigneeAgentId,
+          assigneeUserId:
+            req.body.assigneeUserId === undefined ? existing.assigneeUserId : req.body.assigneeUserId,
+        });
       }
     }
     if (!(await assertAgentRunCheckoutOwnership(req, res, existing))) return;
@@ -507,6 +576,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
     const { comment: commentBody, hiddenAt: hiddenAtRaw, ...updateFields } = req.body;
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
+    }
+    if (updateFields.status === "blocked") {
+      (updateFields as typeof updateFields & { blockedSource?: "human" | "agent" | "system"; blockedReason?: string | null }).blockedSource =
+        blockedSourceForActor(req);
+      (updateFields as typeof updateFields & { blockedSource?: "human" | "agent" | "system"; blockedReason?: string | null }).blockedReason =
+        commentBody?.slice(0, 1000) ?? existing.blockedReason ?? null;
     }
     let issue;
     try {
@@ -618,6 +693,14 @@ export function issueRoutes(db: Db, storage: StorageService) {
         },
       });
 
+      await safeCaptureIssueContextRefs({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        sourceCommentId: comment.id,
+        text: comment.body,
+        createdByAgentId: actor.agentId,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
     }
 
     const assigneeChanged = assigneeWillChange;
@@ -877,6 +960,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
     assertCompanyAccess(req, parent.companyId);
+    await assertCanAssignTasks(req, parent.companyId, { assigneeAgentId: toAgentId });
 
     const actor = getActorInfo(req);
     const fromAgentId =
@@ -903,6 +987,14 @@ export function issueRoutes(db: Db, storage: StorageService) {
       issueId: created.id,
       fromAgentId: fromAgentId ?? null,
       toAgentId,
+    });
+
+    await safeCaptureIssueContextRefs({
+      companyId: parent.companyId,
+      issueId: created.id,
+      text: `${created.title}\n\n${created.description ?? ""}`,
+      createdByAgentId: actor.agentId,
+      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
     });
 
     try {
@@ -1126,6 +1218,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
     const isAwaitingUser = issue.status === "awaiting_user";
     let resumedFromAwaitingUser = false;
+    const isHumanBlocked = issue.status === "blocked" && issue.blockedSource === "human";
+    let resumedFromHumanBlocked = false;
 
     if (reopenRequested && isClosed) {
       const reopenedIssue = await svc.update(id, { status: "todo" });
@@ -1210,6 +1304,14 @@ export function issueRoutes(db: Db, storage: StorageService) {
       }
     }
 
+    if (isHumanBlocked && actor.actorType === "user") {
+      const resumed = await svc.update(id, { status: statusAfterUserResponse(issue) });
+      if (resumed) {
+        currentIssue = resumed;
+        resumedFromHumanBlocked = true;
+      }
+    }
+
     const comment = await svc.addComment(id, req.body.body, {
       agentId: actor.agentId ?? undefined,
       userId: actor.actorType === "user" ? actor.actorId : undefined,
@@ -1234,6 +1336,15 @@ export function issueRoutes(db: Db, storage: StorageService) {
       },
     });
 
+    await safeCaptureIssueContextRefs({
+      companyId: currentIssue.companyId,
+      issueId: currentIssue.id,
+      sourceCommentId: comment.id,
+      text: comment.body,
+      createdByAgentId: actor.agentId,
+      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+    });
+
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
     void (async () => {
       const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
@@ -1241,16 +1352,16 @@ export function issueRoutes(db: Db, storage: StorageService) {
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
       const skipWake = selfComment || isClosed;
-      if (assigneeId && resumedFromAwaitingUser) {
+      if (assigneeId && (resumedFromAwaitingUser || resumedFromHumanBlocked)) {
         const replySnippet = comment.body.slice(0, 1000);
         wakeups.set(assigneeId, {
           source: "automation",
           triggerDetail: "system",
-          reason: "user_responded",
+          reason: resumedFromHumanBlocked ? "human_block_resolved" : "user_responded",
           payload: {
             issueId: currentIssue.id,
             commentId: comment.id,
-            mutation: "awaiting_user_response",
+            mutation: resumedFromHumanBlocked ? "human_block_response" : "awaiting_user_response",
             userReplyBody: replySnippet,
           },
           requestedByActorType: actor.actorType,
@@ -1259,8 +1370,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
             issueId: currentIssue.id,
             taskId: currentIssue.id,
             commentId: comment.id,
-            source: "issue.comment.awaiting_user_response",
-            wakeReason: "user_responded",
+            source: resumedFromHumanBlocked ? "issue.comment.human_block_response" : "issue.comment.awaiting_user_response",
+            wakeReason: resumedFromHumanBlocked ? "human_block_resolved" : "user_responded",
             userReplyBody: replySnippet,
           },
         });

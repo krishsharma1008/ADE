@@ -59,6 +59,18 @@ function applyStatusSideEffects(
   } else if (status && status !== "awaiting_user") {
     (patch as Partial<typeof issues.$inferInsert> & { awaitingUserSince?: Date | null }).awaitingUserSince =
       null;
+    (patch as Partial<typeof issues.$inferInsert> & { latestUserFacingAgentMessage?: string | null }).latestUserFacingAgentMessage =
+      null;
+  }
+  if (status === "blocked") {
+    (patch as Partial<typeof issues.$inferInsert> & { blockedAt?: Date }).blockedAt = new Date();
+    if (!("blockedSource" in patch)) {
+      (patch as Partial<typeof issues.$inferInsert> & { blockedSource?: string }).blockedSource = "system";
+    }
+  } else if (status && status !== "blocked") {
+    (patch as Partial<typeof issues.$inferInsert> & { blockedSource?: string | null }).blockedSource = null;
+    (patch as Partial<typeof issues.$inferInsert> & { blockedReason?: string | null }).blockedReason = null;
+    (patch as Partial<typeof issues.$inferInsert> & { blockedAt?: Date | null }).blockedAt = null;
   }
   return patch;
 }
@@ -73,6 +85,7 @@ export interface IssueFilters {
   labelId?: string;
   originKind?: string;
   excludeOriginKind?: string;
+  excludeHumanBlocked?: boolean;
   q?: string;
 }
 
@@ -107,7 +120,13 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
+  "succeeded",
+  "failed",
+  "interrupted_recoverable",
+  "cancelled",
+  "timed_out",
+]);
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, "\\$&");
@@ -496,6 +515,9 @@ export function issueService(db: Db) {
           );
         }
       }
+      if (filters?.excludeHumanBlocked) {
+        conditions.push(or(ne(issues.blockedSource, "human"), isNull(issues.blockedSource))!);
+      }
       if (filters?.labelId) {
         const labeledIssueIds = await db
           .select({ issueId: issueLabels.issueId })
@@ -682,16 +704,12 @@ export function issueService(db: Db) {
         const issueNumber = company.issueCounter;
         const identifier = `${company.issuePrefix}-${issueNumber}`;
 
-        const values = { ...issueData, companyId, issueNumber, identifier } as typeof issues.$inferInsert;
-        if (values.status === "in_progress" && !values.startedAt) {
-          values.startedAt = new Date();
-        }
-        if (values.status === "done") {
-          values.completedAt = new Date();
-        }
-        if (values.status === "cancelled") {
-          values.cancelledAt = new Date();
-        }
+        const values = applyStatusSideEffects(issueData.status, {
+          ...issueData,
+          companyId,
+          issueNumber,
+          identifier,
+        } as typeof issues.$inferInsert) as typeof issues.$inferInsert;
 
         const [issue] = await tx.insert(issues).values(values).returning();
         if (inputLabelIds) {
@@ -944,6 +962,7 @@ export function issueService(db: Db) {
           and(
             eq(issues.id, id),
             inArray(issues.status, expectedStatuses),
+            or(ne(issues.blockedSource, "human"), isNull(issues.blockedSource)),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
           ),
@@ -963,12 +982,21 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
+          blockedSource: issues.blockedSource,
         })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+      if (current.status === "blocked" && current.blockedSource === "human") {
+        throw conflict("Issue is blocked by a human and requires a user/board event before checkout", {
+          issueId: current.id,
+          status: current.status,
+          blockedSource: current.blockedSource,
+          assigneeAgentId: current.assigneeAgentId,
+        });
+      }
 
       if (
         current.assigneeAgentId === agentId &&

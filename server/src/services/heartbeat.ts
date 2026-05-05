@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
@@ -47,7 +48,7 @@ import {
 import { resolveModel } from "@combyne/context-budget";
 import { inspectGitStateForIssue } from "./git-state.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
-import { extractAndPostQuestions, type ExtractedQuestionsResult } from "./agent-question-extract.js";
+import { extractAndPostQuestions, extractQuestionsFromText, type ExtractedQuestionsResult } from "./agent-question-extract.js";
 import { issueService } from "./issues.js";
 import { logActivity } from "./activity-log.js";
 import { loadCompanyProjectOverview } from "./agent-company-context.js";
@@ -76,6 +77,7 @@ import { createLocalAgentJwt, ensureLocalAgentJwtSecretAtRuntime } from "../agen
 import { parseObject, asBoolean, asNumber, asString, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { loadIssueContextRefs, renderIssueContextRefs } from "./issue-context-refs.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
@@ -88,6 +90,8 @@ const SMALL_TASK_TIMEOUT_SEC_DEFAULT = 20 * 60;
 const SMALL_TASK_TOKEN_PAUSE_THRESHOLD_DEFAULT = 80_000;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__combyne_repo_only__";
+const SERVER_HOST_ID = process.env.COMBYNE_HOST_ID ?? `${os.hostname()}:${process.pid}`;
+const SERVER_RESTART_GENERATION = Number(process.env.COMBYNE_RESTART_GENERATION ?? 0);
 
 const AUTO_CLOSE_SUCCESS_STATUSES = new Set(["todo", "in_progress"]);
 
@@ -295,12 +299,31 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function deriveLatestUserFacingAgentMessage(sourceText: string, resultJson: unknown): string | null {
+  const extracted = extractQuestionsFromText(sourceText, 1)[0];
+  if (extracted) return extracted;
+
+  const result = parseObject(resultJson);
+  const structured =
+    readNonEmptyString(result?.summary) ??
+    readNonEmptyString(result?.message) ??
+    readNonEmptyString(result?.result) ??
+    readNonEmptyString(result?.final);
+  if (structured) return structured.slice(0, 4000);
+
+  const trimmed = sourceText.trim();
+  if (!trimmed) return null;
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return lines.slice(-24).join("\n").slice(0, 4000);
+}
+
 function contextSectionNames(context: Record<string, unknown>): string[] {
   const sections: string[] = [];
   const hasBody = (key: string, field = "body") =>
     Boolean(readNonEmptyString(parseObject(context[key])?.[field]));
   if (hasBody("combyneBootstrapAnalysis", "preamble")) sections.push("bootstrap");
   if (hasBody("combyneHandoffBrief", "brief")) sections.push("handoff");
+  if (hasBody("combyneIssueContextRefs")) sections.push("issueContextRefs");
   if (hasBody("combyneMemoryPreamble")) sections.push("memory");
   if (hasBody("combyneLongTermMemoryPreamble")) sections.push("longTermMemory");
   if (hasBody("combyneAcceptedWorkBrief")) sections.push("acceptedWork");
@@ -1052,6 +1075,14 @@ export function heartbeatService(db: Db) {
       message: event.message,
       payload: event.payload,
     });
+    const heartbeatAt = new Date();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        processLastHeartbeatAt: heartbeatAt,
+        updatedAt: heartbeatAt,
+      })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")));
 
     publishLiveEvent({
       companyId: run.companyId,
@@ -1143,6 +1174,12 @@ export function heartbeatService(db: Db) {
       .set({
         status: "running",
         startedAt: run.startedAt ?? claimedAt,
+        processPid: process.pid,
+        processHostId: SERVER_HOST_ID,
+        processStartedAt: run.processStartedAt ?? claimedAt,
+        processLastHeartbeatAt: claimedAt,
+        processRestartGeneration: SERVER_RESTART_GENERATION,
+        recoveryStatus: null,
         updatedAt: claimedAt,
       })
       .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
@@ -1172,7 +1209,7 @@ export function heartbeatService(db: Db) {
 
   async function finalizeAgentStatus(
     agentId: string,
-    outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    outcome: "succeeded" | "failed" | "cancelled" | "timed_out" | "interrupted_recoverable",
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -1185,7 +1222,7 @@ export function heartbeatService(db: Db) {
     const nextStatus =
       runningCount > 0
         ? "running"
-        : outcome === "succeeded" || outcome === "cancelled"
+        : outcome === "succeeded" || outcome === "cancelled" || outcome === "interrupted_recoverable"
           ? "idle"
           : "error";
 
@@ -1259,11 +1296,14 @@ export function heartbeatService(db: Db) {
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      await setRunStatus(run.id, "failed", {
+      const nextRunStatus = hardCapHit ? "failed" : "interrupted_recoverable";
+      await setRunStatus(run.id, nextRunStatus, {
         error: hardCapHit
           ? "Run exceeded wall-clock hard cap"
           : "Process lost -- server may have restarted",
         errorCode: hardCapHit ? "run_hard_cap_exceeded" : "process_lost",
+        recoveryStatus: hardCapHit ? "not_recoverable" : "recoverable",
+        processLastHeartbeatAt: run.processLastHeartbeatAt ?? now,
         finishedAt: now,
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
@@ -1284,7 +1324,7 @@ export function heartbeatService(db: Db) {
         });
         await releaseIssueExecutionAndPromote(updatedRun);
       }
-      await finalizeAgentStatus(run.agentId, "failed");
+      await finalizeAgentStatus(run.agentId, hardCapHit ? "failed" : "interrupted_recoverable");
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
@@ -1950,6 +1990,26 @@ export function heartbeatService(db: Db) {
           },
           "agent_queue.focus_section_rendered",
         );
+      }
+      if (memoryIssueId) {
+        try {
+          const refs = await loadIssueContextRefs(db, memoryIssueId);
+          const body = renderIssueContextRefs(refs);
+          if (body) {
+            context.combyneIssueContextRefs = {
+              body,
+              refs: refs.slice(0, 12).map((ref) => ({
+                kind: ref.kind,
+                label: ref.label,
+                rawRef: ref.rawRef,
+                resolvedRef: ref.resolvedRef,
+                accessibilityStatus: ref.accessibilityStatus,
+              })),
+            };
+          }
+        } catch (err) {
+          logger.debug({ err, agentId: agent.id, runId, issueId: memoryIssueId }, "failed to load issue context refs");
+        }
       }
       setContextPolicy(context, {
         profile: contextProfile,
@@ -2808,12 +2868,13 @@ export function heartbeatService(db: Db) {
         // run before small-task pause handling so the pause note cannot hide
         // the actual blocker from the issue page.
         let questionResult: ExtractedQuestionsResult | null = null;
+        const resultText =
+          adapterResult.resultJson && typeof adapterResult.resultJson === "object"
+            ? JSON.stringify(adapterResult.resultJson)
+            : "";
+        const sourceText = [stdoutExcerpt, resultText].filter(Boolean).join("\n\n");
+        const latestUserFacingAgentMessage = deriveLatestUserFacingAgentMessage(sourceText, adapterResult.resultJson);
         if (runIssueId && outcome === "succeeded") {
-          const resultText =
-            adapterResult.resultJson && typeof adapterResult.resultJson === "object"
-              ? JSON.stringify(adapterResult.resultJson)
-              : "";
-          const sourceText = [stdoutExcerpt, resultText].filter(Boolean).join("\n\n");
           if (sourceText.length > 0) {
             try {
               questionResult = await extractAndPostQuestions(db, {
@@ -2822,6 +2883,11 @@ export function heartbeatService(db: Db) {
                 issueId: runIssueId,
                 sourceText,
               });
+              if ((questionResult.posted > 0 || questionResult.skippedExisting > 0) && latestUserFacingAgentMessage) {
+                await issueService(db).update(runIssueId, {
+                  latestUserFacingAgentMessage,
+                });
+              }
             } catch (err) {
               logger.debug(
                 { err, runId: finalizedRun.id, issueId: runIssueId },
@@ -2848,7 +2914,12 @@ export function heartbeatService(db: Db) {
                   `Reported tokens: ${runTokenTotal}; threshold: ${smallTaskTokenPauseThreshold()}. ` +
                   `Review the run before waking the agent again or raise the per-agent limit for this issue.`,
               });
-              await issueService(db).update(runIssueId, { status: "awaiting_user" });
+              await issueService(db).update(runIssueId, {
+                status: "awaiting_user",
+                latestUserFacingAgentMessage:
+                  latestUserFacingAgentMessage ??
+                  `Run paused after crossing the small-task token threshold. Reported tokens: ${runTokenTotal}; threshold: ${smallTaskTokenPauseThreshold()}.`,
+              });
             }
           } catch (err) {
             logger.debug({ err, runId: finalizedRun.id, issueId: runIssueId }, "small-task budget pause failed");

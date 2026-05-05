@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, or } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { issues } from "@combyne/db";
 import { OPEN_ISSUE_STATUSES } from "@combyne/shared";
@@ -118,6 +118,7 @@ export async function loadAssignedIssueQueue(
         eq(issues.companyId, opts.companyId),
         eq(issues.assigneeAgentId, opts.agentId),
         inArray(issues.status, statuses as unknown as string[]),
+        or(ne(issues.blockedSource, "human"), isNull(issues.blockedSource))!,
       ),
     )
     .orderBy(asc(issues.priority), asc(issues.createdAt))
@@ -231,6 +232,7 @@ export async function loadNextFocusedIssue(
         eq(issues.companyId, opts.companyId),
         eq(issues.assigneeAgentId, opts.agentId),
         inArray(issues.status, FOCUSED_TIMER_STATUSES as unknown as string[]),
+        or(ne(issues.blockedSource, "human"), isNull(issues.blockedSource))!,
       ),
     )
     .orderBy(asc(issues.priority), asc(issues.createdAt))

@@ -137,6 +137,10 @@ export interface Issue {
   completedAt: Date | null;
   cancelledAt: Date | null;
   awaitingUserSince?: Date | null;
+  latestUserFacingAgentMessage?: string | null;
+  blockedSource?: "human" | "agent" | "system" | null;
+  blockedReason?: string | null;
+  blockedAt?: Date | null;
   hiddenAt: Date | null;
   labelIds?: string[];
   labels?: IssueLabel[];
@@ -151,6 +155,23 @@ export interface Issue {
   myLastTouchAt?: Date | null;
   lastExternalCommentAt?: Date | null;
   isUnreadForMe?: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface IssueContextRef {
+  id: string;
+  companyId: string;
+  issueId: string;
+  sourceCommentId: string | null;
+  createdByAgentId: string | null;
+  createdByUserId: string | null;
+  kind: "path" | "attachment" | "url" | "workspace" | "external";
+  label: string | null;
+  rawRef: string;
+  resolvedRef: string | null;
+  accessibilityStatus: "accessible" | "missing" | "unknown";
+  metadata: Record<string, unknown> | null;
   createdAt: Date;
   updatedAt: Date;
 }

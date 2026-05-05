@@ -70,6 +70,7 @@ import { AgentContextBudgetCard } from "../components/AgentContextBudgetCard";
 const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string }> = {
   succeeded: { icon: CheckCircle2, color: "text-green-600 dark:text-green-400" },
   failed: { icon: XCircle, color: "text-red-600 dark:text-red-400" },
+  interrupted_recoverable: { icon: RotateCcw, color: "text-amber-600 dark:text-amber-400" },
   running: { icon: Loader2, color: "text-cyan-600 dark:text-cyan-400" },
   queued: { icon: Clock, color: "text-yellow-600 dark:text-yellow-400" },
   timed_out: { icon: Timer, color: "text-orange-600 dark:text-orange-400" },
@@ -390,8 +391,8 @@ export function AgentDetail() {
   });
 
   const updatePermissions = useMutation({
-    mutationFn: (canCreateAgents: boolean) =>
-      agentsApi.updatePermissions(agentLookupRef, { canCreateAgents }, resolvedCompanyId ?? undefined),
+    mutationFn: (patch: { canCreateAgents?: boolean; canAssignTasks?: boolean; taskAssignmentScope?: "none" | "reports" | "company" }) =>
+      agentsApi.updatePermissions(agentLookupRef, patch, resolvedCompanyId ?? undefined),
     onSuccess: () => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(routeAgentRef) });
@@ -1140,7 +1141,10 @@ function AgentConfigurePage({
   onSaveActionChange: (save: (() => void) | null) => void;
   onCancelActionChange: (cancel: (() => void) | null) => void;
   onSavingChange: (saving: boolean) => void;
-  updatePermissions: { mutate: (canCreate: boolean) => void; isPending: boolean };
+  updatePermissions: {
+    mutate: (patch: { canCreateAgents?: boolean; canAssignTasks?: boolean; taskAssignmentScope?: "none" | "reports" | "company" }) => void;
+    isPending: boolean;
+  };
 }) {
   const queryClient = useQueryClient();
   const [revisionsOpen, setRevisionsOpen] = useState(false);
@@ -1246,7 +1250,10 @@ function ConfigurationTab({
   onSaveActionChange: (save: (() => void) | null) => void;
   onCancelActionChange: (cancel: (() => void) | null) => void;
   onSavingChange: (saving: boolean) => void;
-  updatePermissions: { mutate: (canCreate: boolean) => void; isPending: boolean };
+  updatePermissions: {
+    mutate: (patch: { canCreateAgents?: boolean; canAssignTasks?: boolean; taskAssignmentScope?: "none" | "reports" | "company" }) => void;
+    isPending: boolean;
+  };
 }) {
   const queryClient = useQueryClient();
 
@@ -1297,12 +1304,49 @@ function ConfigurationTab({
               size="sm"
               className="h-7 px-2.5 text-xs"
               onClick={() =>
-                updatePermissions.mutate(!Boolean(agent.permissions?.canCreateAgents))
+                updatePermissions.mutate({ canCreateAgents: !Boolean(agent.permissions?.canCreateAgents) })
               }
               disabled={updatePermissions.isPending}
             >
               {agent.permissions?.canCreateAgents ? "Enabled" : "Disabled"}
             </Button>
+          </div>
+          <div className="mt-4 flex items-center justify-between gap-3 border-t border-border pt-4 text-sm">
+            <span>Can assign tasks</span>
+            <Button
+              variant={agent.permissions?.canAssignTasks ? "default" : "outline"}
+              size="sm"
+              className="h-7 px-2.5 text-xs"
+              onClick={() =>
+                updatePermissions.mutate({
+                  canAssignTasks: !Boolean(agent.permissions?.canAssignTasks),
+                  taskAssignmentScope: agent.permissions?.taskAssignmentScope ?? "reports",
+                })
+              }
+              disabled={updatePermissions.isPending}
+            >
+              {agent.permissions?.canAssignTasks ? "Enabled" : "Disabled"}
+            </Button>
+          </div>
+          <div className="mt-3 flex items-center justify-between gap-3 text-sm">
+            <span>Assignment scope</span>
+            <div className="flex rounded-md border border-border p-0.5">
+              {(["none", "reports", "company"] as const).map((scope) => (
+                <button
+                  key={scope}
+                  type="button"
+                  className={`rounded px-2 py-1 text-xs ${
+                    (agent.permissions?.taskAssignmentScope ?? "none") === scope
+                      ? "bg-primary text-primary-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                  onClick={() => updatePermissions.mutate({ taskAssignmentScope: scope, canAssignTasks: scope !== "none" })}
+                  disabled={updatePermissions.isPending}
+                >
+                  {scope === "none" ? "None" : scope === "reports" ? "Reports" : "Company"}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       </div>
@@ -1460,7 +1504,8 @@ function RunDetail({ run, agentRouteId, adapterType }: { run: HeartbeatRun; agen
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(run.companyId, run.agentId) });
     },
   });
-  const canResumeLostRun = run.errorCode === "process_lost" && run.status === "failed";
+  const canResumeLostRun =
+    run.errorCode === "process_lost" && (run.status === "failed" || run.status === "interrupted_recoverable");
   const resumePayload = useMemo(() => {
     const payload: Record<string, unknown> = {
       resumeFromRunId: run.id,
@@ -1496,7 +1541,7 @@ function RunDetail({ run, agentRouteId, adapterType }: { run: HeartbeatRun; agen
     },
   });
 
-  const canRetryRun = run.status === "failed" || run.status === "timed_out";
+  const canRetryRun = run.status === "failed" || run.status === "timed_out" || run.status === "interrupted_recoverable";
   const retryPayload = useMemo(() => {
     const payload: Record<string, unknown> = {};
     const context = asRecord(run.contextSnapshot);
@@ -2448,9 +2493,11 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
         <div ref={logEndRef} />
       </div>
 
-      {(run.status === "failed" || run.status === "timed_out") && (
+      {(run.status === "failed" || run.status === "timed_out" || run.status === "interrupted_recoverable") && (
         <div className="rounded-lg border border-red-300 dark:border-red-500/30 bg-red-50 dark:bg-red-950/20 p-3 space-y-2">
-          <div className="text-xs font-medium text-red-700 dark:text-red-300">Failure details</div>
+          <div className="text-xs font-medium text-red-700 dark:text-red-300">
+            {run.status === "interrupted_recoverable" ? "Recoverable interruption" : "Failure details"}
+          </div>
           {run.error && (
             <div className="text-xs text-red-600 dark:text-red-200">
               <span className="text-red-700 dark:text-red-300">Error: </span>

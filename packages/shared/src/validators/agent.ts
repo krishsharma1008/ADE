@@ -10,6 +10,8 @@ import { envConfigSchema } from "./secret.js";
 
 export const agentPermissionsSchema = z.object({
   canCreateAgents: z.boolean().optional().default(false),
+  canAssignTasks: z.boolean().optional().default(false),
+  taskAssignmentScope: z.enum(["none", "reports", "company"]).optional().default("none"),
 });
 
 export const agentInstructionsBundleModeSchema = z.enum(["managed", "external"]);
@@ -128,8 +130,9 @@ export const testAdapterEnvironmentSchema = z.object({
 export type TestAdapterEnvironment = z.infer<typeof testAdapterEnvironmentSchema>;
 
 export const updateAgentPermissionsSchema = z.object({
-  canCreateAgents: z.boolean(),
-  canAssignTasks: z.boolean(),
+  canCreateAgents: z.boolean().optional(),
+  canAssignTasks: z.boolean().optional(),
+  taskAssignmentScope: z.enum(["none", "reports", "company"]).optional(),
 });
 
 export type UpdateAgentPermissions = z.infer<typeof updateAgentPermissionsSchema>;

@@ -593,6 +593,9 @@ export function IssueDetail() {
   );
 
   const latestRunText = useMemo<string>(() => {
+    if (issue?.latestUserFacingAgentMessage?.trim()) {
+      return issue.latestUserFacingAgentMessage.trim();
+    }
     if (!linkedRuns || linkedRuns.length === 0) return "";
     const sorted = [...linkedRuns].sort((a, b) => {
       const aTs = new Date(a.finishedAt ?? a.createdAt ?? 0).getTime();
@@ -623,7 +626,7 @@ export function IssueDetail() {
       }
     }
     return texts.join("\n\n");
-  }, [linkedRuns]);
+  }, [issue?.latestUserFacingAgentMessage, linkedRuns]);
 
   const extractedQuestions = useMemo<string[]>(() => {
     const haystack = latestRunText;
@@ -934,7 +937,9 @@ export function IssueDetail() {
 	            <div className="text-xs opacity-80">
 	              {issue.originKind === "terminal_session"
 	                ? "Click Continue to reopen the terminal with the prior session's context."
-	                : "Review the latest run if needed, then reply below to resume the agent. The issue will automatically return to in-progress."}
+	                : issue.latestUserFacingAgentMessage
+                    ? "The agent's latest user-facing message is shown below. Reply to resume the agent."
+                    : "No persisted user-facing message was captured. Review the latest run if needed, then reply below to resume the agent."}
 	              {issue.awaitingUserSince ? ` Waiting since ${new Date(issue.awaitingUserSince).toLocaleString()}.` : ""}
 	            </div>
 	          </div>
@@ -960,6 +965,22 @@ export function IssueDetail() {
               {continueTerminal.isPending ? "Resuming..." : "Continue"}
             </Button>
           )}
+        </div>
+      )}
+      {issue.status === "blocked" && (
+        <div className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-300">
+          <HelpCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <div className="font-medium">
+              {issue.blockedSource === "human" ? "Blocked by board/user" : "Blocked"}
+            </div>
+            <div className="text-xs opacity-80">
+              {issue.blockedSource === "human"
+                ? "Agent timers and normal assignment wakes will skip this issue until a human comment or status change reopens it."
+                : "This issue is blocked by the agent or system and should be reviewed before resuming."}
+              {issue.blockedReason ? ` Reason: ${issue.blockedReason}` : ""}
+            </div>
+          </div>
         </div>
       )}
       {issue.assigneeAgentId &&

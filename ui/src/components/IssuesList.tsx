@@ -62,7 +62,7 @@ const defaultViewState: IssueViewState = {
 };
 
 export const quickFilterPresets = [
-  { label: "All", statuses: [] as string[] },
+  { label: "All visible work", statuses: [] as string[] },
   { label: "Active", statuses: ["todo", "in_progress", "in_review", "awaiting_user", "blocked"] },
   { label: "Needs Response", statuses: ["awaiting_user"] },
   { label: "Backlog", statuses: ["backlog"] },
@@ -241,6 +241,18 @@ export function IssuesList({
   });
 
   const activeFilterCount = countActiveFilters(viewState);
+  const visibilityStats = useMemo(() => {
+    const sourceIssues = normalizedIssueSearch.length > 0 ? searchedIssues : issues;
+    const operationalHidden = viewState.includeRoutineRuns
+      ? 0
+      : sourceIssues.filter((i) => i.originKind && operationalOriginKinds.has(i.originKind)).length;
+    return {
+      total: sourceIssues.length,
+      visible: filtered.length,
+      hiddenByFilters: Math.max(sourceIssues.length - filtered.length, 0),
+      operationalHidden,
+    };
+  }, [filtered.length, issues, normalizedIssueSearch, searchedIssues, viewState.includeRoutineRuns]);
 
   const groupedContent = useMemo(() => {
     if (viewState.groupBy === "none") {
@@ -562,6 +574,28 @@ export function IssuesList({
 
       {isLoading && <PageSkeleton variant="issues-list" />}
       {error && <p className="text-sm text-destructive">{error.message}</p>}
+
+      {!isLoading && (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">{visibilityStats.visible}</span>
+          <span>visible of {visibilityStats.total} loaded issues</span>
+          {visibilityStats.hiddenByFilters > 0 && (
+            <span className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-700 dark:text-amber-300">
+              {visibilityStats.hiddenByFilters} hidden by filters
+            </span>
+          )}
+          {visibilityStats.operationalHidden > 0 && (
+            <button
+              type="button"
+              onClick={() => updateView({ includeRoutineRuns: true })}
+              className="rounded border border-border px-2 py-0.5 text-muted-foreground hover:text-foreground"
+            >
+              Include {visibilityStats.operationalHidden} operational/run issues
+            </button>
+          )}
+          <span className="ml-auto">Archived and explicitly hidden issues stay out of this view.</span>
+        </div>
+      )}
 
       {!isLoading && filtered.length === 0 && viewState.viewMode === "list" && (
         <EmptyState

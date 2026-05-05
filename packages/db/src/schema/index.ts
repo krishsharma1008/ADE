@@ -21,6 +21,7 @@ export { labels } from "./labels.js";
 export { issueLabels } from "./issue_labels.js";
 export { issueApprovals } from "./issue_approvals.js";
 export { issueComments } from "./issue_comments.js";
+export { issueContextRefs } from "./issue_context_refs.js";
 export { issueReadStates } from "./issue_read_states.js";
 export { assets } from "./assets.js";
 export { issueAttachments } from "./issue_attachments.js";

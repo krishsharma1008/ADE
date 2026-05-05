@@ -74,6 +74,14 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
       },
       {
         companyId,
+        title: "blocked by human",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: agentId,
+        blockedSource: "human",
+      },
+      {
+        companyId,
         title: "already shipped",
         status: "done",
         priority: "medium",
@@ -105,6 +113,7 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
     expect(result.awaitingCount).toBe(1);
     expect(result.body).toMatch(/open high-priority/);
     expect(result.body).toMatch(/awaiting user input/);
+    expect(result.body).not.toMatch(/blocked by human/);
     expect(result.body).not.toMatch(/already shipped/);
     expect(result.body).not.toMatch(/someone else's/);
   });
