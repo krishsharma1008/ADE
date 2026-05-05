@@ -23,7 +23,7 @@ export interface ExtractedQuestionsResult {
 
 const DEFAULT_MAX_QUESTIONS = 10;
 const MIN_QUESTION_LENGTH = 10;
-const MAX_QUESTION_LENGTH = 500;
+const MAX_QUESTION_LENGTH = 1500;
 
 const QUESTION_SECTION_HEADERS = [
   /^#{1,6}\s+open\s+questions?\b/i,
@@ -31,6 +31,16 @@ const QUESTION_SECTION_HEADERS = [
   /^#{1,6}\s+questions?\s+for\s+(?:the\s+)?user\b/i,
   /^#{1,6}\s+questions?\s+pending\b/i,
   /^\*\*open\s+questions?\*\*/i,
+];
+
+const USER_INPUT_SECTION_HEADERS = [
+  /^#{1,6}\s+blockers?\b/i,
+  /^#{1,6}\s+blocked\b/i,
+  /^#{1,6}\s+needs?\s+user\s+input\b/i,
+  /^#{1,6}\s+waiting\s+on\s+(?:the\s+)?user\b/i,
+  /^#{1,6}\s+cannot\s+proceed\b/i,
+  /^#{1,6}\s+action\s+required\b/i,
+  /^\*\*(?:blockers?|blocked|needs?\s+user\s+input|waiting\s+on\s+(?:the\s+)?user|cannot\s+proceed|action\s+required)\*\*/i,
 ];
 
 // Trailing pleasantries / permission-seekers that look like questions but
@@ -61,6 +71,8 @@ export function extractQuestionsFromText(
 ): string[] {
   if (!raw || typeof raw !== "string") return [];
   const lines = raw.split(/\r?\n/);
+
+  const blockerItems = extractUserInputSectionQuestions(lines);
 
   // Pass 1 — find a dedicated "Open questions" section and harvest inside it.
   let insideSection = false;
@@ -97,7 +109,7 @@ export function extractQuestionsFromText(
     }
   }
 
-  const candidates = sectionItems.length > 0 ? sectionItems : fallbackItems;
+  const candidates = [...blockerItems, ...(sectionItems.length > 0 ? sectionItems : fallbackItems)];
 
   const seen = new Set<string>();
   const out: string[] = [];
@@ -112,6 +124,71 @@ export function extractQuestionsFromText(
     if (out.length >= maxQuestions) break;
   }
   return out;
+}
+
+function extractUserInputSectionQuestions(lines: string[]): string[] {
+  let insideSection = false;
+  let currentSection: string[] = [];
+  const out: string[] = [];
+
+  const flush = () => {
+    if (currentSection.length === 0) return;
+    const prompt = buildUserInputQuestion(currentSection);
+    if (prompt) out.push(prompt);
+    currentSection = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const isUserInputHeader = USER_INPUT_SECTION_HEADERS.some((re) => re.test(line));
+    if (isUserInputHeader) {
+      flush();
+      insideSection = true;
+      continue;
+    }
+    if (insideSection && /^#{1,6}\s+/.test(line)) {
+      flush();
+      insideSection = false;
+      continue;
+    }
+    if (!insideSection) continue;
+    currentSection.push(rawLine);
+  }
+  flush();
+
+  return out;
+}
+
+function buildUserInputQuestion(sectionLines: string[]): string {
+  const trimmedLines = sectionLines.map((line) => line.trim()).filter(Boolean);
+  if (trimmedLines.length === 0) return "";
+
+  const questionLines: string[] = [];
+  const optionLines: string[] = [];
+  let sawQuestion = false;
+
+  for (const line of trimmedLines) {
+    const strippedBullet = stripBullet(line);
+    const normalized = strippedBullet || line.replace(/^\*\*|\*\*$/g, "").trim();
+    if (!normalized) continue;
+    if (!sawQuestion) {
+      questionLines.push(normalized);
+      if (normalized.includes("?")) sawQuestion = true;
+      continue;
+    }
+    if (strippedBullet) {
+      optionLines.push(`- ${normalized}`);
+      continue;
+    }
+    if (normalized.endsWith("?")) {
+      questionLines.push(normalized);
+    }
+  }
+
+  if (!questionLines.some((line) => line.includes("?"))) return "";
+
+  const prompt = [...questionLines, ...optionLines].join("\n").trim();
+  return prompt.length > MAX_QUESTION_LENGTH ? `${prompt.slice(0, MAX_QUESTION_LENGTH - 1).trimEnd()}…` : prompt;
 }
 
 function isPleasantryQuestion(candidate: string): boolean {

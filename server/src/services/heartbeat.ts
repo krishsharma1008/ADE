@@ -2801,6 +2801,35 @@ export function heartbeatService(db: Db) {
         })();
 
         const runIssueId = resolveRunIssueId(finalizedRun);
+        // Auto-surface any numbered / bulleted questions the agent buried
+        // in its output as structured `kind="question"` comments, so the
+        // Reply-and-Wake card renders each with its own answer input
+        // instead of leaving them as prose in the plan document. This must
+        // run before small-task pause handling so the pause note cannot hide
+        // the actual blocker from the issue page.
+        let questionResult: ExtractedQuestionsResult | null = null;
+        if (runIssueId && outcome === "succeeded") {
+          const resultText =
+            adapterResult.resultJson && typeof adapterResult.resultJson === "object"
+              ? JSON.stringify(adapterResult.resultJson)
+              : "";
+          const sourceText = [stdoutExcerpt, resultText].filter(Boolean).join("\n\n");
+          if (sourceText.length > 0) {
+            try {
+              questionResult = await extractAndPostQuestions(db, {
+                companyId: finalizedRun.companyId,
+                agentId: finalizedRun.agentId,
+                issueId: runIssueId,
+                sourceText,
+              });
+            } catch (err) {
+              logger.debug(
+                { err, runId: finalizedRun.id, issueId: runIssueId },
+                "question-extractor failed",
+              );
+            }
+          }
+        }
         if (pauseForSmallTaskBudget && runIssueId) {
           try {
             const issueRow = await db
@@ -2826,32 +2855,7 @@ export function heartbeatService(db: Db) {
           }
         }
 
-        // Auto-surface any numbered / bulleted questions the agent buried
-        // in its output as structured `kind="question"` comments, so the
-        // Reply-and-Wake card renders each with its own answer input
-        // instead of leaving them as prose in the plan document.
-        let questionResult: ExtractedQuestionsResult | null = null;
         if (runIssueId && outcome === "succeeded" && !pauseForSmallTaskBudget) {
-          const resultText =
-            adapterResult.resultJson && typeof adapterResult.resultJson === "object"
-              ? JSON.stringify(adapterResult.resultJson)
-              : "";
-          const sourceText = [stdoutExcerpt, resultText].filter(Boolean).join("\n\n");
-          if (sourceText.length > 0) {
-            try {
-              questionResult = await extractAndPostQuestions(db, {
-                companyId: finalizedRun.companyId,
-                agentId: finalizedRun.agentId,
-                issueId: runIssueId,
-                sourceText,
-              });
-            } catch (err) {
-              logger.debug(
-                { err, runId: finalizedRun.id, issueId: runIssueId },
-                "question-extractor failed",
-              );
-            }
-          }
           await autoCloseIssueAfterSuccessfulRun(db, {
             companyId: finalizedRun.companyId,
             agentId: finalizedRun.agentId,

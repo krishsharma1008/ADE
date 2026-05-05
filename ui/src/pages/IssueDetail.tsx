@@ -258,6 +258,15 @@ export function IssueDetail() {
     return (linkedRuns ?? []).filter((r) => !liveIds.has(r.runId));
   }, [linkedRuns, liveRuns, activeRun]);
 
+  const latestTimelineRun = useMemo(() => {
+    if (!timelineRuns || timelineRuns.length === 0) return null;
+    return [...timelineRuns].sort((a, b) => {
+      const aTs = new Date(a.finishedAt ?? a.createdAt ?? 0).getTime();
+      const bTs = new Date(b.finishedAt ?? b.createdAt ?? 0).getTime();
+      return bTs - aTs;
+    })[0] ?? null;
+  }, [timelineRuns]);
+
   const { data: allIssues } = useQuery({
     queryKey: queryKeys.issues.list(selectedCompanyId!),
     queryFn: () => issuesApi.list(selectedCompanyId!),
@@ -913,24 +922,34 @@ export function IssueDetail() {
         );
       })()}
 
-      {issue.status === "awaiting_user" && openQuestions.length === 0 && (
-        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
-          <HelpCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <div className="flex-1">
-            <div className="font-medium">
-              {issue.originKind === "terminal_session"
-                ? "Terminal session idled out"
-                : "Agent is waiting for your response"}
-            </div>
-            <div className="text-xs opacity-80">
-              {issue.originKind === "terminal_session"
-                ? "Click Continue to reopen the terminal with the prior session's context."
-                : "Reply below to resume the agent. The issue will automatically return to in-progress."}
-              {issue.awaitingUserSince ? ` Waiting since ${new Date(issue.awaitingUserSince).toLocaleString()}.` : ""}
-            </div>
-          </div>
-          {issue.originKind === "terminal_session" && issue.assigneeAgentId && (
-            <Button
+	      {issue.status === "awaiting_user" && openQuestions.length === 0 && (
+	        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
+	          <HelpCircle className="mt-0.5 h-4 w-4 shrink-0" />
+	          <div className="flex-1">
+	            <div className="font-medium">
+	              {issue.originKind === "terminal_session"
+	                ? "Terminal session idled out"
+	                : "Agent is waiting, but no structured question was captured"}
+	            </div>
+	            <div className="text-xs opacity-80">
+	              {issue.originKind === "terminal_session"
+	                ? "Click Continue to reopen the terminal with the prior session's context."
+	                : "Review the latest run if needed, then reply below to resume the agent. The issue will automatically return to in-progress."}
+	              {issue.awaitingUserSince ? ` Waiting since ${new Date(issue.awaitingUserSince).toLocaleString()}.` : ""}
+	            </div>
+	          </div>
+	          {issue.originKind !== "terminal_session" && latestTimelineRun && (
+	            <Button
+	              size="sm"
+	              variant="outline"
+	              onClick={() => navigate(`/agents/${latestTimelineRun.agentId}/runs/${latestTimelineRun.runId}`)}
+	              className="shrink-0"
+	            >
+	              Open run
+	            </Button>
+	          )}
+	          {issue.originKind === "terminal_session" && issue.assigneeAgentId && (
+	            <Button
               size="sm"
               variant="outline"
               disabled={continueTerminal.isPending}

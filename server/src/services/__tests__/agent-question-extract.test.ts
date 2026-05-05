@@ -114,6 +114,35 @@ Should we adopt the new payment provider?
       const out = extractQuestionsFromText(text);
       expect(out).toEqual(["Should we adopt the new payment provider?"]);
     });
+
+    it("extracts blocker sections and preserves non-question options", () => {
+      const text = `
+## BUK-31 / LND-4999 - Analysis Complete
+
+### Blocker
+I cannot access the Google Sheet that defines the exact new fields. I need the field list to produce a concrete implementation plan with subtasks. Could you provide one of the following?
+- Paste the highlighted new fields from the gSheet
+- Point me to a local CSV/PDF export
+- Or confirm we should proceed based solely on the JIRA description (spouse data, business address details, HiBank-required fields)
+      `;
+      const out = extractQuestionsFromText(text);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain("Could you provide one of the following?");
+      expect(out[0]).toContain("- Paste the highlighted new fields from the gSheet");
+      expect(out[0]).toContain("- Point me to a local CSV/PDF export");
+      expect(out[0]).toContain("HiBank-required fields");
+    });
+
+    it("does not treat blocker sections without a real question as questions", () => {
+      const text = `
+### Blocker
+The Google Sheet is inaccessible.
+- Missing OAuth credentials
+- No local export found
+      `;
+      const out = extractQuestionsFromText(text);
+      expect(out).toEqual([]);
+    });
   });
 
   describe("extractAndPostQuestions (DB integration)", () => {
@@ -257,6 +286,56 @@ That's all for now.
         .from(issues)
         .where(eq(issues.id, closedIssue.id));
       expect(refreshed.status).toBe("done");
+    });
+
+    it("posts a BUK-31 style blocker as one structured question", async () => {
+      const [issue] = await handle.db
+        .insert(issues)
+        .values({
+          companyId,
+          title: "BUK-31 / LND-4999 analysis",
+          status: "in_progress",
+          priority: "high",
+          assigneeAgentId: agentId,
+        })
+        .returning();
+
+      const result = await extractAndPostQuestions(handle.db, {
+        companyId,
+        agentId,
+        issueId: issue.id,
+        sourceText: `
+## BUK-31 / LND-4999 - Analysis Complete
+
+### Blocker
+I cannot access the Google Sheet that defines the exact new fields. I need the field list to produce a concrete implementation plan with subtasks. Could you provide one of the following?
+- Paste the highlighted new fields from the gSheet
+- Point me to a local CSV/PDF export
+- Or confirm we should proceed based solely on the JIRA description (spouse data, business address details, HiBank-required fields)
+        `,
+      });
+
+      expect(result.posted).toBe(1);
+      expect(result.statusTransitioned).toBe(true);
+
+      const [question] = await handle.db
+        .select()
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, issue.id),
+            eq(issueComments.kind, "question"),
+            isNull(issueComments.answeredAt),
+          ),
+        );
+      expect(question?.body).toContain("Could you provide one of the following?");
+      expect(question?.body).toContain("- Paste the highlighted new fields from the gSheet");
+
+      const [refreshed] = await handle.db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issue.id));
+      expect(refreshed.status).toBe("awaiting_user");
     });
   });
 });
