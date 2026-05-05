@@ -37,6 +37,19 @@ const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
   "image/gif",
 ]);
 
+export function shouldCancelInFlightRunOnTerminalClose(input: {
+  executionRunId: string | null | undefined;
+  actorType: string;
+  actorRunId?: string | null;
+}) {
+  if (!input.executionRunId) return false;
+  const actorRunId = input.actorRunId?.trim();
+  if (input.actorType === "agent" && actorRunId && actorRunId === input.executionRunId) {
+    return false;
+  }
+  return true;
+}
+
 export function issueRoutes(db: Db, storage: StorageService) {
   const router = Router();
   const svc = issueService(db);
@@ -529,12 +542,21 @@ export function issueRoutes(db: Db, storage: StorageService) {
     const closedToTerminal =
       (issue.status === "done" || issue.status === "cancelled") &&
       existing.status !== issue.status;
-    if (closedToTerminal && existing.executionRunId) {
+    const executionRunIdToCancel = existing.executionRunId;
+    if (
+      closedToTerminal &&
+      executionRunIdToCancel &&
+      shouldCancelInFlightRunOnTerminalClose({
+        executionRunId: executionRunIdToCancel,
+        actorType: req.actor.type,
+        actorRunId: req.actor.runId,
+      })
+    ) {
       heartbeat
-        .cancelRun(existing.executionRunId)
+        .cancelRun(executionRunIdToCancel)
         .catch((err) =>
           logger.warn(
-            { err, issueId: id, runId: existing.executionRunId },
+            { err, issueId: id, runId: executionRunIdToCancel },
             "failed to cancel in-flight run on issue close",
           ),
         );
