@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, issues } from "@combyne/db";
-import { loadAssignedIssueQueue } from "../agent-queue.js";
+import { loadAssignedIssueQueue, loadNextFocusedIssue } from "../agent-queue.js";
 import { startTestDb, stopTestDb, type TestDbHandle } from "./_test-db.js";
 
 /**
@@ -127,6 +127,13 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
     expect(result.items.map((i) => i.status)).not.toContain("in_review");
     expect(result.body).not.toMatch(/awaiting review/);
     expect(result.body).toMatch(/todo item/);
+  });
+
+  it("selects one deterministic next focus issue for focused timer wakes", async () => {
+    const next = await loadNextFocusedIssue(handle.db, { companyId, agentId });
+    expect(next?.title).toBe("open high-priority");
+    expect(next?.isCurrent).toBe(true);
+    expect(next?.status).toBe("in_progress");
   });
 
   it("marks the currently-woken issue and surfaces it first", async () => {

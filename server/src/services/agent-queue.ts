@@ -51,6 +51,7 @@ export interface LoadAssignedQueueOptions {
 }
 
 const FOCUS_BODY_TRUNCATE = 512;
+const FOCUSED_TIMER_STATUSES = ["todo", "in_progress", "in_review"] as const;
 
 function renderDigestLine(item: AssignedIssueSummary): string {
   const ident = item.identifier ? `${item.identifier} — ` : "";
@@ -210,8 +211,60 @@ export async function loadAssignedIssueQueue(
   };
 }
 
+export async function loadNextFocusedIssue(
+  db: Db,
+  opts: { companyId: string; agentId: string },
+): Promise<AssignedIssueSummary | null> {
+  const rows = await db
+    .select({
+      id: issues.id,
+      identifier: issues.identifier,
+      title: issues.title,
+      status: issues.status,
+      priority: issues.priority,
+      awaitingUserSince: issues.awaitingUserSince,
+      updatedAt: issues.updatedAt,
+    })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, opts.companyId),
+        eq(issues.assigneeAgentId, opts.agentId),
+        inArray(issues.status, FOCUSED_TIMER_STATUSES as unknown as string[]),
+      ),
+    )
+    .orderBy(asc(issues.priority), asc(issues.createdAt))
+    .limit(100);
+
+  const sorted = [...rows].sort((a, b) => {
+    const pa = PRIORITY_ORDER[a.priority] ?? 99;
+    const pb = PRIORITY_ORDER[b.priority] ?? 99;
+    if (pa !== pb) return pa - pb;
+    const ua = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    const ub = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+    return ub - ua;
+  });
+
+  const row = sorted[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    identifier: row.identifier ?? null,
+    title: row.title,
+    status: row.status,
+    priority: row.priority,
+    awaitingUserSince: row.awaitingUserSince
+      ? new Date(row.awaitingUserSince).toISOString()
+      : null,
+    awaiting: row.status === "awaiting_user",
+    isCurrent: true,
+    updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : null,
+  };
+}
+
 export const __internals = {
   OPEN_STATUSES,
   PRIORITY_ORDER,
   FOCUS_DIRECTIVE,
+  FOCUSED_TIMER_STATUSES,
 };

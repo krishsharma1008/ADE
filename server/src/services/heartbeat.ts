@@ -23,7 +23,11 @@ import { getPendingHandoffBrief, markHandoffConsumed } from "./agent-handoff.js"
 import { acceptedWorkService } from "./accepted-work.js";
 import { memoryService } from "./memory.js";
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
-import { loadAssignedIssueQueue } from "./agent-queue.js";
+import { loadAssignedIssueQueue, loadNextFocusedIssue } from "./agent-queue.js";
+import {
+  resolveAgentContextProfile,
+  type AgentContextProfile,
+} from "./agent-context-profile.js";
 import {
   composeAndApplyBudget,
   contextBudgetComposerEnabled,
@@ -249,6 +253,69 @@ export type ResolvedWorkspaceForRun = {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function contextSectionNames(context: Record<string, unknown>): string[] {
+  const sections: string[] = [];
+  const hasBody = (key: string, field = "body") =>
+    Boolean(readNonEmptyString(parseObject(context[key])?.[field]));
+  if (hasBody("combyneBootstrapAnalysis", "preamble")) sections.push("bootstrap");
+  if (hasBody("combyneHandoffBrief", "brief")) sections.push("handoff");
+  if (hasBody("combyneMemoryPreamble")) sections.push("memory");
+  if (hasBody("combyneLongTermMemoryPreamble")) sections.push("longTermMemory");
+  if (hasBody("combyneAcceptedWorkBrief")) sections.push("acceptedWork");
+  if (hasBody("combyneHirePlaybook")) sections.push("hire");
+  const hasFocus = hasBody("combyneFocusDirective");
+  if (hasFocus) sections.push("focus");
+  const queue = parseObject(context.combyneAssignedIssues);
+  const queueBody = hasFocus
+    ? readNonEmptyString(queue?.digestBody)
+    : readNonEmptyString(queue?.digestBody) ?? readNonEmptyString(queue?.body);
+  if (queueBody) {
+    sections.push("queue");
+  }
+  if (parseObject(context.combyneCompanyProjects)) sections.push("projects");
+  if (hasBody("combyneStandingSummary")) sections.push("standing");
+  if (hasBody("combyneWorkingSummary")) sections.push("working");
+  if (hasBody("combyneRecentTurns")) sections.push("recentTurns");
+  if (hasBody("combyneToolResults")) sections.push("toolResults");
+  return sections;
+}
+
+function setContextPolicy(
+  context: Record<string, unknown>,
+  input: {
+    profile: AgentContextProfile;
+    focusIssueId: string | null;
+    focusIssueSource: string | null;
+    queueDigest: "included" | "omitted" | "none";
+  },
+) {
+  context.combyneContextPolicy = {
+    contextProfile: input.profile,
+    contextFocusIssueId: input.focusIssueId,
+    focusIssueSource: input.focusIssueSource,
+    queueDigest: input.queueDigest,
+    includedSections: contextSectionNames(context),
+  };
+}
+
+function buildContextAuditSnapshot(
+  base: Record<string, unknown> | null | undefined,
+  context: Record<string, unknown>,
+): Record<string, unknown> {
+  const policy = parseObject(context.combyneContextPolicy);
+  return {
+    ...(base ?? {}),
+    issueId: readNonEmptyString(context.issueId) ?? readNonEmptyString(base?.issueId),
+    taskId: readNonEmptyString(context.taskId) ?? readNonEmptyString(base?.taskId),
+    taskKey: readNonEmptyString(context.taskKey) ?? readNonEmptyString(base?.taskKey),
+    contextProfile: readNonEmptyString(policy?.contextProfile),
+    contextFocusIssueId: readNonEmptyString(policy?.contextFocusIssueId),
+    contextFocusIssueSource: readNonEmptyString(policy?.focusIssueSource),
+    contextQueueDigest: readNonEmptyString(policy?.queueDigest),
+    contextIncludedSections: contextSectionNames(context),
+  };
 }
 
 export function resolveRuntimeSessionParamsForWorkspace(input: {
@@ -1430,7 +1497,36 @@ export function heartbeatService(db: Db) {
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
-    const memoryIssueId = readNonEmptyString(context.issueId);
+    const contextProfile = await resolveAgentContextProfile(db, {
+      id: agent.id,
+      companyId: agent.companyId,
+      role: agent.role,
+      permissions: parseObject(agent.permissions),
+      adapterConfig: parseObject(agent.adapterConfig),
+    });
+    let memoryIssueId = readNonEmptyString(context.issueId);
+    let focusIssueSource: string | null = memoryIssueId ? "context" : null;
+    let queueDigestPolicy: "included" | "omitted" | "none" =
+      contextProfile === "focused" ? "none" : "included";
+    if (contextProfile === "focused" && !memoryIssueId && run.invocationSource === "timer") {
+      const nextIssue = await loadNextFocusedIssue(db, {
+        companyId: agent.companyId,
+        agentId: agent.id,
+      });
+      if (nextIssue) {
+        memoryIssueId = nextIssue.id;
+        focusIssueSource = "timer_next_actionable";
+        context.issueId = nextIssue.id;
+        context.taskId = nextIssue.id;
+        context.taskKey = nextIssue.identifier ?? nextIssue.id;
+      }
+    }
+    setContextPolicy(context, {
+      profile: contextProfile,
+      focusIssueId: memoryIssueId ?? null,
+      focusIssueSource,
+      queueDigest: queueDigestPolicy,
+    });
     const acceptedWorkSvc = acceptedWorkService(db);
     void acceptedWorkSvc
       .maybeReconcileGitHubCompany(agent.companyId)
@@ -1501,65 +1597,69 @@ export function heartbeatService(db: Db) {
       logger.debug({ err, agentId: agent.id }, "failed to load pending handoff");
     }
     void pendingHandoffId;
-    try {
-      const memoryRows = await loadRecentMemory(db, {
-        companyId: agent.companyId,
-        agentId: agent.id,
-        issueId: memoryIssueId ?? null,
-        limit: 8,
-      });
-      if (memoryRows.length > 0) {
-        const preamble = memoryRows
-          .map((row) => {
-            const header = row.title ? `## ${row.title}` : `## ${row.scope}/${row.kind}`;
-            return `${header}\n${row.body}`;
-          })
-          .join("\n\n");
-        const capped = preamble.length > 16000 ? `${preamble.slice(0, 16000)}\n…(truncated)` : preamble;
-        context.combyneMemoryPreamble = {
-          body: capped,
-          entryCount: memoryRows.length,
-          scope: memoryIssueId ? "issue" : "agent",
-        };
-      }
-    } catch (err) {
-      logger.debug({ err, agentId: agent.id, runId }, "failed to load agent memory preamble");
-    }
-    try {
-      const acceptedWorkEventId = readNonEmptyString(context.acceptedWorkEventId);
-      const events = await acceptedWorkSvc.pendingForManager(
-        agent.companyId,
-        agent.id,
-        acceptedWorkEventId ?? null,
-      );
-      if (events.length > 0) {
-        const body = await acceptedWorkSvc.buildBrief(agent.companyId, events);
-        if (body) {
-          context.combyneAcceptedWorkBrief = {
-            body,
-            eventIds: events.map((event) => event.id),
+    if (contextProfile !== "focused" || memoryIssueId) {
+      try {
+        const memoryRows = await loadRecentMemory(db, {
+          companyId: agent.companyId,
+          agentId: agent.id,
+          issueId: memoryIssueId ?? null,
+          limit: 8,
+        });
+        if (memoryRows.length > 0) {
+          const preamble = memoryRows
+            .map((row) => {
+              const header = row.title ? `## ${row.title}` : `## ${row.scope}/${row.kind}`;
+              return `${header}\n${row.body}`;
+            })
+            .join("\n\n");
+          const capped = preamble.length > 16000 ? `${preamble.slice(0, 16000)}\n…(truncated)` : preamble;
+          context.combyneMemoryPreamble = {
+            body: capped,
+            entryCount: memoryRows.length,
+            scope: memoryIssueId ? "issue" : "agent",
           };
-          try {
-            await appendTranscriptEntry(db, {
-              companyId: agent.companyId,
-              agentId: agent.id,
-              runId: run.id,
-              issueId: memoryIssueId ?? null,
-              seq: 0,
-              role: "system",
-              contentKind: "accepted_work_brief",
-              content: {
-                eventIds: events.map((event) => event.id),
-                body,
-              },
-            });
-          } catch (err) {
-            logger.debug({ err, agentId: agent.id, runId }, "failed to transcript accepted work brief");
+        }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId }, "failed to load agent memory preamble");
+      }
+    }
+    if (contextProfile !== "focused") {
+      try {
+        const acceptedWorkEventId = readNonEmptyString(context.acceptedWorkEventId);
+        const events = await acceptedWorkSvc.pendingForManager(
+          agent.companyId,
+          agent.id,
+          acceptedWorkEventId ?? null,
+        );
+        if (events.length > 0) {
+          const body = await acceptedWorkSvc.buildBrief(agent.companyId, events);
+          if (body) {
+            context.combyneAcceptedWorkBrief = {
+              body,
+              eventIds: events.map((event) => event.id),
+            };
+            try {
+              await appendTranscriptEntry(db, {
+                companyId: agent.companyId,
+                agentId: agent.id,
+                runId: run.id,
+                issueId: memoryIssueId ?? null,
+                seq: 0,
+                role: "system",
+                contentKind: "accepted_work_brief",
+                content: {
+                  eventIds: events.map((event) => event.id),
+                  body,
+                },
+              });
+            } catch (err) {
+              logger.debug({ err, agentId: agent.id, runId }, "failed to transcript accepted work brief");
+            }
           }
         }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId }, "failed to load accepted work brief");
       }
-    } catch (err) {
-      logger.debug({ err, agentId: agent.id, runId }, "failed to load accepted work brief");
     }
     if (memoryIssueId) {
       try {
@@ -1743,17 +1843,49 @@ export function heartbeatService(db: Db) {
         focusIssueBody = focusRow?.description ?? null;
       }
 
-      const queue = await loadAssignedIssueQueue(db, {
-        companyId: agent.companyId,
-        agentId: agent.id,
-        currentIssueId: memoryIssueId ?? null,
-        currentIssueBody: focusIssueBody,
-        focusMode,
-        includeReviewIssues: run.invocationSource !== "timer" || Boolean(memoryIssueId),
-      });
-      context.combyneAssignedIssues = queue;
+      const queue =
+        contextProfile === "focused" && !memoryIssueId
+          ? {
+              items: [],
+              totalOpen: 0,
+              awaitingCount: 0,
+              body: "",
+              focusBody: "",
+              digestBody: "",
+              directive: null,
+              focusItem: null,
+              currentIssueMissing: false,
+            }
+          : await loadAssignedIssueQueue(db, {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              currentIssueId: memoryIssueId ?? null,
+              currentIssueBody: focusIssueBody,
+              focusMode,
+              includeReviewIssues:
+                contextProfile === "focused" ||
+                run.invocationSource !== "timer" ||
+                Boolean(memoryIssueId),
+              limit: contextProfile === "focused" ? 100 : undefined,
+            });
 
-      if (queue.focusBody && queue.directive) {
+      if (contextProfile === "focused") {
+        const focusOnlyItems = queue.focusItem ? [queue.focusItem] : [];
+        context.combyneAssignedIssues = {
+          ...queue,
+          items: focusOnlyItems,
+          totalOpen: focusOnlyItems.length,
+          awaitingCount: focusOnlyItems.filter((item) => item.awaiting).length,
+          body: queue.focusBody,
+          digestBody: "",
+        };
+        queueDigestPolicy = queue.focusItem ? "omitted" : "none";
+      } else {
+        context.combyneAssignedIssues = queue;
+        queueDigestPolicy = queue.digestBody ? "included" : "none";
+      }
+
+      if (queue.focusBody && queue.directive && memoryIssueId) {
         context.combyneFocusDirective = {
           body: queue.focusBody,
           directive: queue.directive,
@@ -1774,10 +1906,17 @@ export function heartbeatService(db: Db) {
             runId,
             issueId: queue.focusItem.id,
             bodyChars: queue.focusBody.length,
+            contextProfile,
           },
           "agent_queue.focus_section_rendered",
         );
       }
+      setContextPolicy(context, {
+        profile: contextProfile,
+        focusIssueId: memoryIssueId ?? null,
+        focusIssueSource,
+        queueDigest: queueDigestPolicy,
+      });
     } catch (err) {
       logger.debug({ err, agentId: agent.id, runId }, "failed to load assigned issue queue");
     }
@@ -1785,20 +1924,28 @@ export function heartbeatService(db: Db) {
     // Surface Combyne-managed project workspaces to the adapter so it can
     // ls/read/write across them — same fix as the terminal preamble,
     // mirrored here so heartbeat runs don't ask "project not found" either.
-    try {
-      const overview = await loadCompanyProjectOverview(db, agent.companyId);
-      if (overview.items.length > 0) {
-        context.combyneCompanyProjects = overview;
-        const dirs: string[] = [];
-        for (const project of overview.items) {
-          for (const ws of project.workspaces) {
-            if (ws.cwd && !dirs.includes(ws.cwd)) dirs.push(ws.cwd);
+    if (contextProfile !== "focused") {
+      try {
+        const overview = await loadCompanyProjectOverview(db, agent.companyId);
+        if (overview.items.length > 0) {
+          context.combyneCompanyProjects = overview;
+          const dirs: string[] = [];
+          for (const project of overview.items) {
+            for (const ws of project.workspaces) {
+              if (ws.cwd && !dirs.includes(ws.cwd)) dirs.push(ws.cwd);
+            }
           }
+          if (dirs.length > 0) context.combyneProjectWorkspaceDirs = dirs.slice(0, 10);
+          setContextPolicy(context, {
+            profile: contextProfile,
+            focusIssueId: memoryIssueId ?? null,
+            focusIssueSource,
+            queueDigest: queueDigestPolicy,
+          });
         }
-        if (dirs.length > 0) context.combyneProjectWorkspaceDirs = dirs.slice(0, 10);
+      } catch (err) {
+        logger.debug({ err, companyId: agent.companyId, runId }, "failed to load project overview");
       }
-    } catch (err) {
-      logger.debug({ err, companyId: agent.companyId, runId }, "failed to load project overview");
     }
 
     // Hire-agent playbook — fires when the current issue reads as a hire
@@ -1862,6 +2009,12 @@ export function heartbeatService(db: Db) {
         logger.debug({ err, agentId: agent.id, runId }, "failed to inspect git state for issue");
       }
     }
+    setContextPolicy(context, {
+      profile: contextProfile,
+      focusIssueId: memoryIssueId ?? null,
+      focusIssueSource,
+      queueDigest: queueDigestPolicy,
+    });
     const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
     const previousSessionDisplayId = truncateDisplayId(
       taskSessionForRun?.sessionDisplayId ??
@@ -1888,6 +2041,10 @@ export function heartbeatService(db: Db) {
         .set({
           startedAt,
           sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
+          contextSnapshot: buildContextAuditSnapshot(
+            run.contextSnapshot as Record<string, unknown> | null | undefined,
+            context,
+          ),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id))
@@ -2009,18 +2166,20 @@ export function heartbeatService(db: Db) {
           : undefined;
         const summarizerEnabled = summarizerCfg?.enabled !== false;
         if (summarizerEnabled) {
-          const standingLatest = await loadLatestSummary(db, {
-            agentId: agent.id,
-            scopeKind: "standing",
-            scopeId: null,
-          });
-          if (standingLatest?.content) {
-            context.combyneStandingSummary = {
-              body: standingLatest.content,
-              summaryId: standingLatest.id,
-              cutoffOrdinal: Number(standingLatest.cutoffSeq),
-              createdAt: standingLatest.createdAt.toISOString(),
-            };
+          if (contextProfile !== "focused") {
+            const standingLatest = await loadLatestSummary(db, {
+              agentId: agent.id,
+              scopeKind: "standing",
+              scopeId: null,
+            });
+            if (standingLatest?.content) {
+              context.combyneStandingSummary = {
+                body: standingLatest.content,
+                summaryId: standingLatest.id,
+                cutoffOrdinal: Number(standingLatest.cutoffSeq),
+                createdAt: standingLatest.createdAt.toISOString(),
+              };
+            }
           }
 
           if (memoryIssueId) {
@@ -2043,29 +2202,31 @@ export function heartbeatService(db: Db) {
           // Recent raw turns since the most relevant cutoff. Prefer the
           // working cutoff when an issue is in focus (keeps the block
           // ticket-scoped); fall back to the standing cutoff.
-          const scopeForRecent: SummaryScope = memoryIssueId ? "working" : "standing";
-          const recent = await unsummarizedTokensFor(db, {
-            companyId: agent.companyId,
-            agentId: agent.id,
-            scope: scopeForRecent,
-            issueId: memoryIssueId ?? null,
-            model: summarizerModelName,
-            calibrationRatio,
-            pruningMode,
-          });
-          if (recent.entries.length > 0) {
-            const rendered = renderRecentTurns(recent.entries, summarizerModelName, {
-              maxTokens: RECENT_TURNS_MAX_TOKENS,
+          if (contextProfile !== "focused" || memoryIssueId) {
+            const scopeForRecent: SummaryScope = memoryIssueId ? "working" : "standing";
+            const recent = await unsummarizedTokensFor(db, {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              scope: scopeForRecent,
+              issueId: memoryIssueId ?? null,
+              model: summarizerModelName,
               calibrationRatio,
+              pruningMode,
             });
-            if (rendered.body) {
-              context.combyneRecentTurns = {
-                body: rendered.body,
-                tokens: rendered.tokens,
-                turnCount: rendered.turnCount,
-                sinceOrdinal: recent.cutoffOrdinal,
-                scope: scopeForRecent,
-              };
+            if (recent.entries.length > 0) {
+              const rendered = renderRecentTurns(recent.entries, summarizerModelName, {
+                maxTokens: RECENT_TURNS_MAX_TOKENS,
+                calibrationRatio,
+              });
+              if (rendered.body) {
+                context.combyneRecentTurns = {
+                  body: rendered.body,
+                  tokens: rendered.tokens,
+                  turnCount: rendered.turnCount,
+                  sinceOrdinal: recent.cutoffOrdinal,
+                  scope: scopeForRecent,
+                };
+              }
             }
           }
         }
@@ -2075,6 +2236,22 @@ export function heartbeatService(db: Db) {
           "summarizer.preamble_load_failed",
         );
       }
+      setContextPolicy(context, {
+        profile: contextProfile,
+        focusIssueId: memoryIssueId ?? null,
+        focusIssueSource,
+        queueDigest: queueDigestPolicy,
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: buildContextAuditSnapshot(
+            run.contextSnapshot as Record<string, unknown> | null | undefined,
+            context,
+          ),
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, currentRun.id));
 
       // Round 3 Phase 5 — composer-enabled mode. Opt-in via
       // COMBYNE_CONTEXT_BUDGET_ENABLED=1. When on, the composer runs
@@ -2158,6 +2335,13 @@ export function heartbeatService(db: Db) {
             snapshot.previousCachePrefixHash = composerRef.previousCachePrefixHash;
           }
           snapshot.pruningMode = pruningMode;
+          snapshot.contextPolicy = {
+            profile: contextProfile,
+            focusIssueId: memoryIssueId ?? null,
+            focusIssueSource,
+            queueDigest: queueDigestPolicy,
+            includedSections: contextSectionNames(context),
+          };
           promptBudgetRef.snapshot = snapshot;
           await persistRunBudget(db, currentRun.id, snapshot);
           logger.debug(

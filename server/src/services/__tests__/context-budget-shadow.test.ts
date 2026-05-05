@@ -51,6 +51,21 @@ describe("buildPreambleSectionsFromContext", () => {
     expect(queue?.content).toBe("NEW_DIGEST");
   });
 
+  it("does not fall back to legacy queue body when focus policy omits digest", () => {
+    const sections = buildPreambleSectionsFromContext({
+      combyneFocusDirective: { body: "FOCUS_ONLY", directive: "stay focused" },
+      combyneAssignedIssues: {
+        digestBody: "",
+        body: "FOCUS_ONLY\n\n## Other open issues\n- OTHER_ISSUE_SHOULD_NOT_LEAK",
+      },
+    });
+    expect(sections.find((s) => s.name === "focus")?.content).toBe("FOCUS_ONLY");
+    expect(sections.find((s) => s.name === "queue")).toBeUndefined();
+    expect(sections.map((s) => s.content).join("\n")).not.toContain(
+      "OTHER_ISSUE_SHOULD_NOT_LEAK",
+    );
+  });
+
   it("emits standing (cache-stable) and working (vary) from summarizer fields", () => {
     const sections = buildPreambleSectionsFromContext({
       combyneStandingSummary: { body: "STANDING_BODY", cutoffOrdinal: 42 },

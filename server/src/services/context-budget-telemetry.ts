@@ -48,6 +48,7 @@ export interface BudgetSnapshot {
   cacheHit?: boolean;
   previousCachePrefixHash?: string | null;
   pruningMode?: "additive" | "aggressive";
+  contextPolicy?: Record<string, unknown>;
 }
 
 export function summarizeComposed(
@@ -431,11 +432,13 @@ export function buildPreambleSectionsFromContext(
   }
 
   const assigned = readObject(context.combyneAssignedIssues);
-  const digestBody = readString(assigned?.digestBody) ?? readString(assigned?.body);
-  if (digestBody) {
+  const digestBody = readString(assigned?.digestBody);
+  const legacyBody = readString(assigned?.body);
+  const queueBody = focusBody ? digestBody : digestBody ?? legacyBody;
+  if (queueBody) {
     out.push({
       name: "queue",
-      content: digestBody,
+      content: queueBody,
       priority: 3,
       cacheStable: false,
       truncationStrategy: "tail",

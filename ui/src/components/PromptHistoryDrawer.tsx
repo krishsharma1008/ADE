@@ -49,6 +49,12 @@ export function PromptHistoryDrawer({ runId, companyPrefix, onClose }: PromptHis
   const userReplyBody = (ctx.userReplyBody as string) ?? null;
   const issueIdInCtx = (ctx.issueId as string) ?? null;
   const commentIdInCtx = (ctx.commentId as string) ?? null;
+  const contextProfile = (ctx.contextProfile as string) ?? null;
+  const contextFocusIssueId = (ctx.contextFocusIssueId as string) ?? null;
+  const contextQueueDigest = (ctx.contextQueueDigest as string) ?? null;
+  const contextIncludedSections = Array.isArray(ctx.contextIncludedSections)
+    ? ctx.contextIncludedSections.filter((section): section is string => typeof section === "string")
+    : [];
 
   const fmt = (iso: string | null) =>
     iso ? new Date(iso).toLocaleString("en-US", { hour12: false }) : "—";
@@ -118,6 +124,27 @@ export function PromptHistoryDrawer({ runId, companyPrefix, onClose }: PromptHis
                   <dd className="font-mono">{fmt(run?.startedAt ?? null)}</dd>
                   <dt className="text-muted-foreground">Finished</dt>
                   <dd className="font-mono">{fmt(run?.finishedAt ?? null)}</dd>
+                  {contextProfile && (
+                    <>
+                      <dt className="text-muted-foreground">Context</dt>
+                      <dd className="font-mono">
+                        {contextProfile}
+                        {contextQueueDigest ? ` · queue ${contextQueueDigest}` : ""}
+                      </dd>
+                    </>
+                  )}
+                  {contextFocusIssueId && (
+                    <>
+                      <dt className="text-muted-foreground">Focus issue</dt>
+                      <dd className="font-mono">{contextFocusIssueId.slice(0, 8)}</dd>
+                    </>
+                  )}
+                  {contextIncludedSections.length > 0 && (
+                    <>
+                      <dt className="text-muted-foreground">Sections</dt>
+                      <dd className="font-mono">{contextIncludedSections.join(", ")}</dd>
+                    </>
+                  )}
                   {commentIdInCtx && issueIdInCtx && (
                     <>
                       <dt className="text-muted-foreground">Comment</dt>
