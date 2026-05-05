@@ -1231,7 +1231,7 @@ export function issueService(db: Db) {
             isNull(issueComments.answeredAt),
           ),
         );
-      return row?.count ?? 0;
+      return Number(row?.count ?? 0);
     },
 
     createAttachment: async (input: {

@@ -5,6 +5,7 @@ import { X } from "lucide-react";
 import { createIssueDetailPath } from "../lib/issueDetailBreadcrumb";
 import { cn } from "../lib/utils";
 import { StatusIcon } from "./StatusIcon";
+import { IssueNeedsResponseBadge } from "./IssueNeedsResponseBadge";
 
 type UnreadState = "hidden" | "visible" | "fading";
 
@@ -65,6 +66,11 @@ export function IssueRow({
         <span className="line-clamp-2 text-sm sm:order-2 sm:min-w-0 sm:flex-1 sm:truncate sm:line-clamp-none">
           {issue.title}
         </span>
+        {issue.status === "awaiting_user" ? (
+          <span className="sm:hidden">
+            <IssueNeedsResponseBadge issue={issue} compact />
+          </span>
+        ) : null}
         <span className="flex items-center gap-2 sm:order-1 sm:shrink-0">
           {desktopLeadingSpacer ? (
             <span className="hidden w-3.5 shrink-0 sm:block" />
@@ -89,8 +95,11 @@ export function IssueRow({
           ) : null}
         </span>
       </span>
-      {(desktopTrailing || trailingMeta) ? (
+      {(desktopTrailing || trailingMeta || issue.status === "awaiting_user") ? (
         <span className="ml-auto hidden shrink-0 items-center gap-2 sm:order-3 sm:flex sm:gap-3">
+          {issue.status === "awaiting_user" ? (
+            <IssueNeedsResponseBadge issue={issue} compact />
+          ) : null}
           {desktopTrailing}
           {trailingMeta ? (
             <span className="text-xs text-muted-foreground">{trailingMeta}</span>

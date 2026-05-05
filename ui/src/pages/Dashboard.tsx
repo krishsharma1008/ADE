@@ -17,6 +17,7 @@ import { StatusIcon } from "../components/StatusIcon";
 import { PriorityIcon } from "../components/PriorityIcon";
 import { ActivityRow } from "../components/ActivityRow";
 import { Identity } from "../components/Identity";
+import { IssueNeedsResponseBadge } from "../components/IssueNeedsResponseBadge";
 import { timeAgo } from "../lib/timeAgo";
 import { cn, formatCents } from "../lib/utils";
 import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard } from "lucide-react";
@@ -323,10 +324,15 @@ export function Dashboard() {
 
                         {/* Right column on mobile: title + metadata stacked */}
                         <span className="flex min-w-0 flex-1 flex-col gap-1 sm:contents">
-                          <span className="line-clamp-2 text-sm sm:order-2 sm:flex-1 sm:min-w-0 sm:line-clamp-none sm:truncate">
-                            {issue.title}
-                          </span>
-                          <span className="flex items-center gap-2 sm:order-1 sm:shrink-0">
+	                          <span className="line-clamp-2 text-sm sm:order-2 sm:flex-1 sm:min-w-0 sm:line-clamp-none sm:truncate">
+	                            {issue.title}
+	                          </span>
+	                          {issue.status === "awaiting_user" && (
+	                            <span className="sm:hidden">
+	                              <IssueNeedsResponseBadge issue={issue} compact />
+	                            </span>
+	                          )}
+	                          <span className="flex items-center gap-2 sm:order-1 sm:shrink-0">
                             <span className="hidden sm:inline-flex"><PriorityIcon priority={issue.priority} /></span>
                             <span className="hidden sm:inline-flex"><StatusIcon status={issue.status} /></span>
                             <span className="text-xs font-mono text-muted-foreground">
@@ -339,10 +345,15 @@ export function Dashboard() {
                                 : null;
                             })()}
                             <span className="text-xs text-muted-foreground sm:hidden">&middot;</span>
-                            <span className="text-xs text-muted-foreground shrink-0 sm:order-last">
-                              {timeAgo(issue.updatedAt)}
-                            </span>
-                          </span>
+	                            <span className="text-xs text-muted-foreground shrink-0 sm:order-last">
+	                              {timeAgo(issue.updatedAt)}
+	                            </span>
+	                            {issue.status === "awaiting_user" && (
+	                              <span className="hidden sm:inline-flex">
+	                                <IssueNeedsResponseBadge issue={issue} compact />
+	                              </span>
+	                            )}
+	                          </span>
                         </span>
                       </div>
                     </Link>

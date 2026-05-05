@@ -50,6 +50,10 @@ export function shouldCancelInFlightRunOnTerminalClose(input: {
   return true;
 }
 
+export function statusAfterUserResponse(input: { assigneeAgentId?: string | null; assigneeUserId?: string | null }) {
+  return input.assigneeAgentId || input.assigneeUserId ? "in_progress" : "todo";
+}
+
 export function issueRoutes(db: Db, storage: StorageService) {
   const router = Router();
   const svc = issueService(db);
@@ -813,7 +817,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
     const remaining = await svc.countOpenQuestions(id);
     let updated = issue;
     if (remaining === 0 && issue.status === "awaiting_user") {
-      updated = (await svc.update(id, { status: "in_progress" })) ?? issue;
+      updated = (await svc.update(id, { status: statusAfterUserResponse(issue) })) ?? issue;
       if (issue.assigneeAgentId) {
         try {
           await heartbeat.wakeup(issue.assigneeAgentId, {
@@ -1199,7 +1203,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     if (isAwaitingUser && actor.actorType === "user") {
-      const resumed = await svc.update(id, { status: "in_progress" });
+      const resumed = await svc.update(id, { status: statusAfterUserResponse(issue) });
       if (resumed) {
         currentIssue = resumed;
         resumedFromAwaitingUser = true;

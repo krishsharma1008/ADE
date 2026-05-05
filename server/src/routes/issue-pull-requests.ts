@@ -13,6 +13,22 @@ export function issuePullRequestRoutes(db: Db) {
   const heartbeat = heartbeatService(db);
   const acceptedWork = acceptedWorkService(db);
 
+  async function getIssueByIdOrIdentifier(rawIssueId: string) {
+    if (/^[A-Z]+-\d+$/i.test(rawIssueId)) {
+      const byIdentifier = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.identifier, rawIssueId.toUpperCase()))
+        .then((rows) => rows[0] ?? null);
+      if (byIdentifier) return byIdentifier;
+    }
+    return db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, rawIssueId))
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function wakeAcceptedWorkManager(event: { id: string; managerAgentId: string | null }) {
     if (!event.managerAgentId) return;
     await heartbeat.wakeup(event.managerAgentId, {
@@ -32,7 +48,7 @@ export function issuePullRequestRoutes(db: Db) {
 
   router.get("/issues/:issueId/pull-requests", async (req, res) => {
     const issueId = req.params.issueId as string;
-    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    const issue = await getIssueByIdOrIdentifier(issueId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
@@ -43,7 +59,7 @@ export function issuePullRequestRoutes(db: Db) {
 
   router.post("/issues/:issueId/pull-requests", validate(issuePullRequestUpsertSchema), async (req, res) => {
     const issueId = req.params.issueId as string;
-    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    const issue = await getIssueByIdOrIdentifier(issueId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;

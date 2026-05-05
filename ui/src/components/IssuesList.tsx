@@ -12,6 +12,7 @@ import { StatusIcon } from "./StatusIcon";
 import { PriorityIcon } from "./PriorityIcon";
 import { EmptyState } from "./EmptyState";
 import { Identity } from "./Identity";
+import { IssueNeedsResponseBadge } from "./IssueNeedsResponseBadge";
 import { PageSkeleton } from "./PageSkeleton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,7 +25,7 @@ import type { Issue } from "@combyne/shared";
 
 /* ── Helpers ── */
 
-const statusOrder = ["in_progress", "todo", "backlog", "in_review", "blocked", "done", "cancelled"];
+export const statusOrder = ["in_progress", "awaiting_user", "todo", "backlog", "in_review", "blocked", "done", "cancelled"];
 const priorityOrder = ["critical", "high", "medium", "low"];
 const operationalOriginKinds = new Set(["routine_execution", "terminal_session"]);
 
@@ -60,9 +61,10 @@ const defaultViewState: IssueViewState = {
   includeRoutineRuns: false,
 };
 
-const quickFilterPresets = [
+export const quickFilterPresets = [
   { label: "All", statuses: [] as string[] },
-  { label: "Active", statuses: ["todo", "in_progress", "in_review", "blocked"] },
+  { label: "Active", statuses: ["todo", "in_progress", "in_review", "awaiting_user", "blocked"] },
+  { label: "Needs Response", statuses: ["awaiting_user"] },
   { label: "Backlog", statuses: ["backlog"] },
   { label: "Done", statuses: ["done", "cancelled"] },
 ];
@@ -626,11 +628,16 @@ export function IssuesList({
                   {/* Right column on mobile: title + metadata stacked */}
                   <span className="flex min-w-0 flex-1 flex-col gap-1 sm:contents">
                     {/* Title line */}
-                    <span className="line-clamp-2 text-sm sm:order-2 sm:flex-1 sm:min-w-0 sm:line-clamp-none sm:truncate">
-                      {issue.title}
-                    </span>
+	                    <span className="line-clamp-2 text-sm sm:order-2 sm:flex-1 sm:min-w-0 sm:line-clamp-none sm:truncate">
+	                      {issue.title}
+	                    </span>
+	                    {issue.status === "awaiting_user" && (
+	                      <span className="sm:hidden">
+	                        <IssueNeedsResponseBadge issue={issue} compact />
+	                      </span>
+	                    )}
 
-                    {/* Metadata line */}
+	                    {/* Metadata line */}
                     <span className="flex items-center gap-2 sm:order-1 sm:shrink-0">
                       {/* Spacer matching caret width so status icon aligns with group title (hidden on mobile) */}
                       <span className="w-3.5 shrink-0 hidden sm:block" />
@@ -661,8 +668,11 @@ export function IssuesList({
                   </span>
 
                   {/* Desktop-only trailing content */}
-                  <span className="hidden sm:flex sm:order-3 items-center gap-2 sm:gap-3 shrink-0 ml-auto">
-                    {(issue.labels ?? []).length > 0 && (
+	                  <span className="hidden sm:flex sm:order-3 items-center gap-2 sm:gap-3 shrink-0 ml-auto">
+	                    {issue.status === "awaiting_user" && (
+	                      <IssueNeedsResponseBadge issue={issue} compact />
+	                    )}
+	                    {(issue.labels ?? []).length > 0 && (
                       <span className="hidden md:flex items-center gap-1 max-w-[240px] overflow-hidden">
                         {(issue.labels ?? []).slice(0, 3).map((label) => (
                           <span

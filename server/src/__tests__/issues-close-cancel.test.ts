@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { shouldCancelInFlightRunOnTerminalClose } from "../routes/issues.js";
+import { shouldCancelInFlightRunOnTerminalClose, statusAfterUserResponse } from "../routes/issues.js";
 
 describe("issue terminal close run cancellation", () => {
   it("does not cancel the same agent run that closes its own issue", () => {
@@ -40,5 +40,16 @@ describe("issue terminal close run cancellation", () => {
         actorRunId: null,
       }),
     ).toBe(false);
+  });
+});
+
+describe("statusAfterUserResponse", () => {
+  it("resumes assigned issues into active work", () => {
+    expect(statusAfterUserResponse({ assigneeAgentId: "agent-1" })).toBe("in_progress");
+    expect(statusAfterUserResponse({ assigneeUserId: "user-1" })).toBe("in_progress");
+  });
+
+  it("returns unassigned waiting issues to todo instead of failing in_progress validation", () => {
+    expect(statusAfterUserResponse({ assigneeAgentId: null, assigneeUserId: null })).toBe("todo");
   });
 });

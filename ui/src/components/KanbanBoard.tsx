@@ -21,6 +21,7 @@ import {
 import { StatusIcon } from "./StatusIcon";
 import { PriorityIcon } from "./PriorityIcon";
 import { Identity } from "./Identity";
+import { IssueNeedsResponseBadge } from "./IssueNeedsResponseBadge";
 import type { Issue } from "@combyne/shared";
 
 const boardStatuses = [
@@ -28,6 +29,7 @@ const boardStatuses = [
   "todo",
   "in_progress",
   "in_review",
+  "awaiting_user",
   "blocked",
   "done",
   "cancelled",
@@ -163,6 +165,11 @@ function KanbanCard({
           )}
         </div>
         <p className="text-sm leading-snug line-clamp-2 mb-2">{issue.title}</p>
+        {issue.status === "awaiting_user" && (
+          <div className="mb-2">
+            <IssueNeedsResponseBadge issue={issue} compact />
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <PriorityIcon priority={issue.priority} />
           {issue.assigneeAgentId && (() => {
