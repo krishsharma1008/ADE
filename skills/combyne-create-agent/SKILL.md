@@ -81,10 +81,12 @@ curl -sS -X POST "$COMBYNE_API_URL/api/companies/$COMBYNE_COMPANY_ID/agent-hires
     "capabilities": "Owns technical roadmap, architecture, staffing, execution",
     "adapterType": "codex_local",
     "adapterConfig": {"cwd": "/abs/path/to/repo", "model": "o4-mini"},
-    "runtimeConfig": {"heartbeat": {"enabled": true, "intervalSec": 300, "wakeOnDemand": true}},
+    "runtimeConfig": {"heartbeat": {"enabled": true, "intervalSec": 300, "wakeOnDemand": true, "maxConcurrentRuns": 3}},
     "sourceIssueId": "<issue-id>"
   }'
 ```
+
+Use `maxConcurrentRuns: 3` for coordinator hires such as CEO/CTO/PM/EM so assignment bursts can be delegated in parallel. Use `maxConcurrentRuns: 1` for IC coding agents unless they have isolated worktrees and an explicit parallel execution policy.
 
 8. Handle governance state:
 - if response has `approval`, hire is `pending_approval`

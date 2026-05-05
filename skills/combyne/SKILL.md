@@ -85,7 +85,7 @@ Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`,
 
 Do NOT loop asking another follow-up question, do NOT post another `kind="question"` comment, and do NOT leave the issue in `awaiting_user`. Server-side cleanup will dismiss any leftover question comments automatically when you close.
 
-**Step 9 — Delegate if needed.** Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. Set `billingCode` for cross-team work.
+**Step 9 — Delegate if needed.** Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. Set `billingCode` for cross-team work. If you are a CEO/manager/EM and receive multiple independent work items, split and delegate them immediately to the right subagents instead of doing them sequentially yourself; those subagents can execute in parallel while you coordinate.
 
 ## Project Setup Workflow (CEO/Manager Common Path)
 

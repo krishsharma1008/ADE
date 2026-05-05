@@ -34,6 +34,11 @@ const SUPPORTED_ADVANCED_ADAPTER_TYPES = new Set<CreateConfigValues["adapterType
   "cursor",
   "openclaw_gateway",
 ]);
+const COORDINATOR_RUN_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm"]);
+
+function defaultMaxConcurrentRunsForRole(role: string) {
+  return COORDINATOR_RUN_ROLES.has(role.trim().toLowerCase()) ? 3 : 1;
+}
 
 function createValuesForAdapterType(
   adapterType: CreateConfigValues["adapterType"],
@@ -200,7 +205,7 @@ export function NewAgent() {
           intervalSec: configValues.intervalSec,
           wakeOnDemand: true,
           cooldownSec: 10,
-          maxConcurrentRuns: 1,
+          maxConcurrentRuns: defaultMaxConcurrentRunsForRole(effectiveRole),
         },
       },
       budgetMonthlyCents: 0,

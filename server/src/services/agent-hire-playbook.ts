@@ -107,6 +107,8 @@ export function buildHirePlaybook(opts: BuildHirePlaybookOptions): string {
     `}`,
     "```",
     ``,
+    `When \`runtimeConfig.heartbeat.maxConcurrentRuns\` is omitted, Combyne defaults coordinator hires such as CEO/CTO/PM/EM to 3 concurrent runs and IC coding/QA/devops agents to 1. Override it only when the board explicitly asks for stricter or broader execution.`,
+    ``,
     `## Step 3 — Explain the hire`,
     ``,
     `Post a comment on this issue (not a question) summarising _why_ this hire, _what they'll own_, and their first week of work. The board approver will read this alongside the approval.`,

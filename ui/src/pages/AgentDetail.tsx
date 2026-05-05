@@ -80,6 +80,11 @@ const REDACTED_ENV_VALUE = "***REDACTED***";
 const SECRET_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
+const COORDINATOR_RUN_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm"]);
+
+function defaultMaxConcurrentRunsForRole(role: string | null | undefined) {
+  return COORDINATOR_RUN_ROLES.has((role ?? "").trim().toLowerCase()) ? 3 : 1;
+}
 
 function shouldRedactSecretValue(key: string, value: unknown): boolean {
   if (SECRET_ENV_KEY_RE.test(key)) return true;
@@ -965,7 +970,11 @@ function ConfigSummary({
                     const hb = (agent.runtimeConfig as Record<string, unknown>).heartbeat as Record<string, unknown>;
                     if (!hb.enabled) return <span className="text-muted-foreground">Disabled</span>;
                     const sec = Number(hb.intervalSec) || 300;
-                    const maxConcurrentRuns = Math.max(1, Math.floor(Number(hb.maxConcurrentRuns) || 1));
+                    const defaultMaxConcurrentRuns = defaultMaxConcurrentRunsForRole(agent.role);
+                    const maxConcurrentRuns = Math.max(
+                      1,
+                      Math.floor(Number(hb.maxConcurrentRuns) || defaultMaxConcurrentRuns),
+                    );
                     const intervalLabel = sec >= 60 ? `${Math.round(sec / 60)} min` : `${sec}s`;
                     return (
                       <span>

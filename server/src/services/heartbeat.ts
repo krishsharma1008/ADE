@@ -79,7 +79,9 @@ import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
+const HEARTBEAT_COORDINATOR_MAX_CONCURRENT_RUNS_DEFAULT = 3;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
+const COORDINATOR_HEARTBEAT_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
 const DEFERRED_WAKE_CONTEXT_KEY = "_combyneWakeContext";
 const SMALL_TASK_MAX_TURNS_DEFAULT = 30;
 const SMALL_TASK_TIMEOUT_SEC_DEFAULT = 20 * 60;
@@ -163,10 +165,48 @@ function appendExcerpt(prev: string, chunk: string) {
   return appendWithCap(prev, chunk, MAX_EXCERPT_BYTES);
 }
 
-function normalizeMaxConcurrentRuns(value: unknown) {
-  const parsed = Math.floor(asNumber(value, HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT));
-  if (!Number.isFinite(parsed)) return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
+function hasExplicitMaxConcurrentRuns(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return true;
+  if (typeof value === "string" && value.trim().length > 0 && Number.isFinite(Number(value.trim()))) return true;
+  return false;
+}
+
+export function defaultMaxConcurrentRunsForAgent(agent: {
+  role?: string | null;
+  permissions?: Record<string, unknown> | null;
+}) {
+  const role = typeof agent.role === "string" ? agent.role.trim().toLowerCase() : "";
+  const canCreateAgents =
+    !!agent.permissions &&
+    typeof agent.permissions === "object" &&
+    (agent.permissions as Record<string, unknown>).canCreateAgents === true;
+  if (COORDINATOR_HEARTBEAT_ROLES.has(role) || canCreateAgents) {
+    return HEARTBEAT_COORDINATOR_MAX_CONCURRENT_RUNS_DEFAULT;
+  }
+  return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
+}
+
+function normalizeMaxConcurrentRuns(value: unknown, fallback: number) {
+  const raw = typeof value === "string" ? Number(value.trim()) : value;
+  const parsed = Math.floor(asNumber(raw, fallback));
+  if (!Number.isFinite(parsed)) return fallback;
   return Math.max(HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT, Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed));
+}
+
+export function resolveHeartbeatMaxConcurrentRuns(
+  heartbeat: Record<string, unknown>,
+  agent: {
+    role?: string | null;
+    permissions?: Record<string, unknown> | null;
+  },
+) {
+  const fallback = defaultMaxConcurrentRunsForAgent(agent);
+  return normalizeMaxConcurrentRuns(
+    heartbeat.maxConcurrentRuns,
+    hasExplicitMaxConcurrentRuns(heartbeat.maxConcurrentRuns)
+      ? HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT
+      : fallback,
+  );
 }
 
 function envPositiveInt(name: string, fallback: number): number {
@@ -1083,7 +1123,7 @@ export function heartbeatService(db: Db) {
       enabled: asBoolean(heartbeat.enabled, true),
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
-      maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
+      maxConcurrentRuns: resolveHeartbeatMaxConcurrentRuns(heartbeat, agent),
     };
   }
 
@@ -2503,6 +2543,7 @@ export function heartbeatService(db: Db) {
             : outcome === "timed_out"
               ? "timed_out"
               : "failed";
+      const cancelledError = latestRun?.error ?? "Run cancelled";
 
       const usageJson =
         adapterResult.usage || adapterResult.costUsd != null
@@ -2557,6 +2598,8 @@ export function heartbeatService(db: Db) {
         error:
           outcome === "succeeded"
             ? null
+            : outcome === "cancelled"
+              ? cancelledError
             : adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
         errorCode:
           outcome === "timed_out"
@@ -2580,7 +2623,7 @@ export function heartbeatService(db: Db) {
 
       await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
         finishedAt: new Date(),
-        error: adapterResult.errorMessage ?? null,
+        error: outcome === "cancelled" ? cancelledError : adapterResult.errorMessage ?? null,
       });
 
       const finalizedRun = await getRun(run.id);

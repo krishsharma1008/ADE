@@ -94,6 +94,11 @@ const emptyOverlay: Overlay = {
 
 /** Stable empty object used as fallback for missing env config to avoid new-object-per-render. */
 const EMPTY_ENV: Record<string, EnvBinding> = {};
+const COORDINATOR_RUN_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm"]);
+
+function defaultMaxConcurrentRunsForRole(role: string | null | undefined) {
+  return COORDINATOR_RUN_ROLES.has((role ?? "").trim().toLowerCase()) ? 3 : 1;
+}
 
 function isOverlayDirty(o: Overlay): boolean {
   return (
@@ -268,6 +273,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const config = !isCreate ? ((props.agent.adapterConfig ?? {}) as Record<string, unknown>) : {};
   const runtimeConfig = !isCreate ? ((props.agent.runtimeConfig ?? {}) as Record<string, unknown>) : {};
   const heartbeat = !isCreate ? ((runtimeConfig.heartbeat ?? {}) as Record<string, unknown>) : {};
+  const defaultMaxConcurrentRuns = !isCreate ? defaultMaxConcurrentRunsForRole(props.agent.role) : 1;
 
   const adapterType = isCreate
     ? props.values.adapterType
@@ -837,7 +843,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   value={eff(
                     "heartbeat",
                     "maxConcurrentRuns",
-                    Number(heartbeat.maxConcurrentRuns ?? 1),
+                    Number(heartbeat.maxConcurrentRuns ?? defaultMaxConcurrentRuns),
                   )}
                   onCommit={(v) => mark("heartbeat", "maxConcurrentRuns", v)}
                   immediate
