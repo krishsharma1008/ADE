@@ -4,6 +4,7 @@ import path from "node:path";
 import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
+  activityLog,
   agents,
   agentRuntimeState,
   agentTaskSessions,
@@ -94,6 +95,14 @@ const SERVER_HOST_ID = process.env.COMBYNE_HOST_ID ?? `${os.hostname()}:${proces
 const SERVER_RESTART_GENERATION = Number(process.env.COMBYNE_RESTART_GENERATION ?? 0);
 
 const AUTO_CLOSE_SUCCESS_STATUSES = new Set(["todo", "in_progress"]);
+const TOKEN_PAUSE_COMMENT_PREFIXES = [
+  "Run paused after crossing the small-task token threshold",
+  "Run paused after crossing the small-task active-token threshold",
+];
+
+function autoCloseManualIssueRunsEnabled(): boolean {
+  return asBoolean(process.env.COMBYNE_AUTO_CLOSE_MANUAL_ISSUES, false);
+}
 
 export async function autoCloseIssueAfterSuccessfulRun(
   db: Db,
@@ -103,6 +112,7 @@ export async function autoCloseIssueAfterSuccessfulRun(
     runId: string;
     issueId: string;
     questionResult?: ExtractedQuestionsResult | null;
+    allowAutoClose?: boolean;
   },
 ): Promise<{ closed: boolean; reason: string }> {
   const issue = await db
@@ -144,6 +154,14 @@ export async function autoCloseIssueAfterSuccessfulRun(
     .then((rows) => rows[0] ?? null);
   if (openQuestion) return { closed: false, reason: "open_questions" };
 
+  if (
+    !input.allowAutoClose &&
+    issue.originKind !== "routine_execution" &&
+    !autoCloseManualIssueRunsEnabled()
+  ) {
+    return { closed: false, reason: "manual_auto_close_disabled" };
+  }
+
   const updated = await issueService(db).update(issue.id, { status: "done" });
   if (!updated) return { closed: false, reason: "update_failed" };
 
@@ -163,6 +181,80 @@ export async function autoCloseIssueAfterSuccessfulRun(
   });
 
   return { closed: true, reason: "successful_run_without_questions" };
+}
+
+export async function reopenIssuesAutoClosedAfterTokenPause(
+  db: Db,
+  opts: { limit?: number } = {},
+): Promise<{ reopened: number }> {
+  const candidates = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      assigneeAgentId: issues.assigneeAgentId,
+    })
+    .from(issues)
+    .where(eq(issues.status, "done"))
+    .orderBy(desc(issues.updatedAt))
+    .limit(opts.limit ?? 200);
+
+  let reopened = 0;
+  for (const issue of candidates) {
+    const autoClose = await db
+      .select({ id: activityLog.id, runId: activityLog.runId, createdAt: activityLog.createdAt })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          eq(activityLog.action, "issue.auto_closed"),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!autoClose) continue;
+
+    const pauseComment = await db
+      .select({ id: issueComments.id, createdAt: issueComments.createdAt })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, issue.companyId),
+          eq(issueComments.issueId, issue.id),
+          sql`(${issueComments.body} like ${`${TOKEN_PAUSE_COMMENT_PREFIXES[0]}%`} or ${issueComments.body} like ${`${TOKEN_PAUSE_COMMENT_PREFIXES[1]}%`})`,
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!pauseComment || autoClose.createdAt <= pauseComment.createdAt) continue;
+
+    const updated = await issueService(db).update(issue.id, { status: "in_progress" });
+    if (!updated) continue;
+
+    reopened++;
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: "issue.reopened_after_token_pause_autoclose",
+      entityType: "issue",
+      entityId: issue.id,
+      agentId: issue.assigneeAgentId,
+      runId: autoClose.runId,
+      details: {
+        previousStatus: "done",
+        nextStatus: "in_progress",
+        reason: "token_pause_autoclose_repair",
+        autoCloseActivityId: autoClose.id,
+        pauseCommentId: pauseComment.id,
+      },
+    });
+  }
+
+  return { reopened };
 }
 
 function appendExcerpt(prev: string, chunk: string) {
@@ -3015,6 +3107,7 @@ export function heartbeatService(db: Db) {
             runId: finalizedRun.id,
             issueId: runIssueId,
             questionResult,
+            allowAutoClose: false,
           }).catch((err) => {
             logger.debug(
               { err, runId: finalizedRun.id, issueId: runIssueId },
@@ -3860,6 +3953,8 @@ export function heartbeatService(db: Db) {
 
     reapOrphanedRuns,
     reapOrphanedIssueLocks,
+    reopenIssuesAutoClosedAfterTokenPause: (opts?: { limit?: number }) =>
+      reopenIssuesAutoClosedAfterTokenPause(db, opts),
     forceUnlockIssue,
 
     tickTimers: async (now = new Date()) => {

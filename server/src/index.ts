@@ -715,6 +715,19 @@ export async function startServer(): Promise<StartedServer> {
     void heartbeat.reapOrphanedIssueLocks().catch((err) => {
       logger.error({ err }, "startup reap of orphaned issue locks failed");
     });
+    void heartbeat
+      .reopenIssuesAutoClosedAfterTokenPause()
+      .then((result) => {
+        if (result.reopened > 0) {
+          logger.warn(
+            { reopened: result.reopened },
+            "startup repair reopened issues auto-closed after token pauses",
+          );
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "startup repair of token-pause auto-closed issues failed");
+      });
 
     // Round 3 Phase 12 — run auto-close sweep on a slower cadence. 15-min
     // tick is enough: thresholds are user-configured in hours/days.
