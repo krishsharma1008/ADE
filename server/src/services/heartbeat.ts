@@ -87,7 +87,7 @@ const COORDINATOR_HEARTBEAT_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "
 const DEFERRED_WAKE_CONTEXT_KEY = "_combyneWakeContext";
 const SMALL_TASK_MAX_TURNS_DEFAULT = 30;
 const SMALL_TASK_TIMEOUT_SEC_DEFAULT = 20 * 60;
-const SMALL_TASK_TOKEN_PAUSE_THRESHOLD_DEFAULT = 80_000;
+const SMALL_TASK_TOKEN_PAUSE_THRESHOLD_DEFAULT = 1_000_000;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__combyne_repo_only__";
 const SERVER_HOST_ID = process.env.COMBYNE_HOST_ID ?? `${os.hostname()}:${process.pid}`;
@@ -242,8 +242,76 @@ function withSmallCodingTaskControls(
   };
 }
 
-function smallTaskTokenPauseThreshold(): number {
+export type SmallTaskTokenPauseMode = "off" | "soft" | "hard";
+
+export type SmallTaskTokenUsage = {
+  freshInputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  activeTokens: number;
+};
+
+export function smallTaskTokenPauseThreshold(): number {
   return envPositiveInt("COMBYNE_SMALL_TASK_TOKEN_PAUSE_THRESHOLD", SMALL_TASK_TOKEN_PAUSE_THRESHOLD_DEFAULT);
+}
+
+export function smallTaskTokenPauseMode(): SmallTaskTokenPauseMode {
+  const raw = String(process.env.COMBYNE_SMALL_TASK_TOKEN_PAUSE_MODE ?? "soft")
+    .trim()
+    .toLowerCase();
+  if (raw === "off" || raw === "disabled" || raw === "false" || raw === "0") return "off";
+  if (raw === "hard" || raw === "pause" || raw === "strict") return "hard";
+  return "soft";
+}
+
+export function computeSmallTaskTokenUsage(usage: Record<string, unknown> | null | undefined): SmallTaskTokenUsage {
+  const source = usage ?? {};
+  const freshInputTokens = asNumber(source.inputTokens, asNumber(source.input_tokens, 0));
+  const cachedInputTokens = asNumber(
+    source.cachedInputTokens,
+    asNumber(source.cached_input_tokens, asNumber(source.cache_read_input_tokens, 0)),
+  );
+  const outputTokens = asNumber(source.outputTokens, asNumber(source.output_tokens, 0));
+  const totalTokens = freshInputTokens + cachedInputTokens + outputTokens;
+  return {
+    freshInputTokens,
+    cachedInputTokens,
+    outputTokens,
+    totalTokens,
+    activeTokens: freshInputTokens + outputTokens,
+  };
+}
+
+export function evaluateSmallTaskTokenBudget(input: {
+  adapterType: string;
+  context: Record<string, unknown>;
+  usage: Record<string, unknown> | null | undefined;
+}): {
+  applies: boolean;
+  mode: SmallTaskTokenPauseMode;
+  threshold: number;
+  exceeded: boolean;
+  hardPause: boolean;
+  softNotice: boolean;
+  usage: SmallTaskTokenUsage;
+} {
+  const mode = smallTaskTokenPauseMode();
+  const threshold = smallTaskTokenPauseThreshold();
+  const usage = computeSmallTaskTokenUsage(input.usage);
+  const applies =
+    input.adapterType === "claude_local" &&
+    Boolean(readNonEmptyString(input.context.issueId) ?? readNonEmptyString(input.context.taskId));
+  const exceeded = applies && mode !== "off" && usage.activeTokens >= threshold;
+  return {
+    applies,
+    mode,
+    threshold,
+    exceeded,
+    hardPause: exceeded && mode === "hard",
+    softNotice: exceeded && mode === "soft",
+    usage,
+  };
 }
 
 async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T>) {
@@ -2613,15 +2681,11 @@ export function heartbeatService(db: Db) {
               ...(adapterResult.billingType ? { billingType: adapterResult.billingType } : {}),
             } as Record<string, unknown>)
           : null;
-      const usageForBudget = (adapterResult.usage ?? {}) as Record<string, unknown>;
-      const runTokenTotal =
-        asNumber(usageForBudget.inputTokens, asNumber(usageForBudget.input_tokens, 0)) +
-        asNumber(usageForBudget.cachedInputTokens, asNumber(usageForBudget.cached_input_tokens, asNumber(usageForBudget.cache_read_input_tokens, 0))) +
-        asNumber(usageForBudget.outputTokens, asNumber(usageForBudget.output_tokens, 0));
-      const pauseForSmallTaskBudget =
-        agent.adapterType === "claude_local" &&
-        Boolean(readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId)) &&
-        runTokenTotal >= smallTaskTokenPauseThreshold();
+      const smallTaskBudget = evaluateSmallTaskTokenBudget({
+        adapterType: agent.adapterType,
+        context,
+        usage: (adapterResult.usage ?? {}) as Record<string, unknown>,
+      });
 
       // Round 3 Phase 3 — close the calibration loop. Compares our
       // pre-run estimate with the adapter-reported actual usage.inputTokens
@@ -2896,7 +2960,24 @@ export function heartbeatService(db: Db) {
             }
           }
         }
-        if (pauseForSmallTaskBudget && runIssueId) {
+        if (smallTaskBudget.exceeded && runIssueId) {
+          logger.warn(
+            {
+              runId: finalizedRun.id,
+              issueId: runIssueId,
+              mode: smallTaskBudget.mode,
+              threshold: smallTaskBudget.threshold,
+              activeTokens: smallTaskBudget.usage.activeTokens,
+              freshInputTokens: smallTaskBudget.usage.freshInputTokens,
+              cachedInputTokens: smallTaskBudget.usage.cachedInputTokens,
+              outputTokens: smallTaskBudget.usage.outputTokens,
+              totalTokens: smallTaskBudget.usage.totalTokens,
+            },
+            "small-task token threshold crossed",
+          );
+        }
+
+        if (smallTaskBudget.hardPause && runIssueId) {
           try {
             const issueRow = await db
               .select({ status: issues.status })
@@ -2910,15 +2991,16 @@ export function heartbeatService(db: Db) {
                 authorAgentId: null,
                 authorUserId: null,
                 body:
-                  `Run paused after crossing the small-task token threshold. ` +
-                  `Reported tokens: ${runTokenTotal}; threshold: ${smallTaskTokenPauseThreshold()}. ` +
+                  `Run paused after crossing the small-task active-token threshold. ` +
+                  `Active tokens: ${smallTaskBudget.usage.activeTokens}; cached input tokens: ${smallTaskBudget.usage.cachedInputTokens}; ` +
+                  `total reported tokens: ${smallTaskBudget.usage.totalTokens}; threshold: ${smallTaskBudget.threshold}. ` +
                   `Review the run before waking the agent again or raise the per-agent limit for this issue.`,
               });
               await issueService(db).update(runIssueId, {
                 status: "awaiting_user",
                 latestUserFacingAgentMessage:
                   latestUserFacingAgentMessage ??
-                  `Run paused after crossing the small-task token threshold. Reported tokens: ${runTokenTotal}; threshold: ${smallTaskTokenPauseThreshold()}.`,
+                  `Run paused after crossing the small-task active-token threshold. Active tokens: ${smallTaskBudget.usage.activeTokens}; cached input tokens: ${smallTaskBudget.usage.cachedInputTokens}; total reported tokens: ${smallTaskBudget.usage.totalTokens}; threshold: ${smallTaskBudget.threshold}.`,
               });
             }
           } catch (err) {
@@ -2926,7 +3008,7 @@ export function heartbeatService(db: Db) {
           }
         }
 
-        if (runIssueId && outcome === "succeeded" && !pauseForSmallTaskBudget) {
+        if (runIssueId && outcome === "succeeded" && !smallTaskBudget.hardPause) {
           await autoCloseIssueAfterSuccessfulRun(db, {
             companyId: finalizedRun.companyId,
             agentId: finalizedRun.agentId,
