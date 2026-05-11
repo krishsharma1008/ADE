@@ -339,6 +339,32 @@ export function buildPreambleSectionsFromContext(
 ): PreambleSection[] {
   const out: PreambleSection[] = [];
 
+  const coordinator = readObject(context.combyneCoordinatorGuidance);
+  const coordinatorBody = readString(coordinator?.body);
+  if (coordinatorBody) {
+    out.push({
+      name: "coordinator",
+      content: coordinatorBody,
+      priority: 0,
+      cacheStable: false,
+      truncationStrategy: "tail",
+      maxTokens: 1_200,
+    });
+  }
+
+  const bukuPrePush = readObject(context.combyneBukuPrePushGovernance);
+  const bukuPrePushBody = readString(bukuPrePush?.body);
+  if (bukuPrePushBody) {
+    out.push({
+      name: "bukuPrePush",
+      content: bukuPrePushBody,
+      priority: 0,
+      cacheStable: false,
+      truncationStrategy: "tail",
+      maxTokens: 1_200,
+    });
+  }
+
   const bootstrap = readObject(context.combyneBootstrapAnalysis);
   const bootstrapBody = readString(bootstrap?.preamble);
   if (bootstrapBody) {
@@ -624,6 +650,14 @@ function writeSectionBackToContext(
   };
 
   switch (section.name) {
+    case "coordinator":
+      if (section.dropped) delete context.combyneCoordinatorGuidance;
+      else patch("combyneCoordinatorGuidance", ["body"], section.content);
+      break;
+    case "bukuPrePush":
+      if (section.dropped) delete context.combyneBukuPrePushGovernance;
+      else patch("combyneBukuPrePushGovernance", ["body"], section.content);
+      break;
     case "bootstrap":
       // Bootstrap lives in two places (analysis + hire playbook). Rewrite
       // whichever is shorter to stay conservative.
@@ -674,6 +708,22 @@ function writeSectionBackToContext(
     // the structured object shape.
     case "projects":
       if (section.dropped) delete context.combyneCompanyProjects;
+      break;
+    case "standing":
+      if (section.dropped) delete context.combyneStandingSummary;
+      else patch("combyneStandingSummary", ["body"], section.content);
+      break;
+    case "working":
+      if (section.dropped) delete context.combyneWorkingSummary;
+      else patch("combyneWorkingSummary", ["body"], section.content);
+      break;
+    case "recentTurns":
+      if (section.dropped) delete context.combyneRecentTurns;
+      else patch("combyneRecentTurns", ["body"], section.content);
+      break;
+    case "toolResults":
+      if (section.dropped) delete context.combyneToolResults;
+      else patch("combyneToolResults", ["body"], section.content);
       break;
     default:
       // Unknown section — composer shouldn't have produced it. Skip.

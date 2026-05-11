@@ -19,6 +19,10 @@ export interface LiveRunForIssue {
   agentName: string;
   adapterType: string;
   issueId?: string | null;
+  wakeupRequestId?: string | null;
+  queueReason?: "agent_concurrency" | "issue_execution_lock" | "deferred_issue_execution" | "waiting_for_worker" | null;
+  blockedByRunId?: string | null;
+  queueReasonText?: string | null;
 }
 
 export const heartbeatsApi = {

@@ -42,6 +42,9 @@ export interface HeartbeatRun {
   retryOfRunId: string | null;
   processLossRetryCount: number;
   contextSnapshot: Record<string, unknown> | null;
+  queueReason?: "agent_concurrency" | "issue_execution_lock" | "deferred_issue_execution" | "waiting_for_worker" | null;
+  blockedByRunId?: string | null;
+  queueReasonText?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -16,6 +16,16 @@ function runTone(status: string) {
   return "text-yellow-500";
 }
 
+function canExportQaReport(run: QaTestRun) {
+  return run.status !== "queued" && run.status !== "running";
+}
+
+function qaReportDisabledTitle(run: QaTestRun) {
+  return canExportQaReport(run)
+    ? undefined
+    : "Report export is available after QA records a final result.";
+}
+
 function downloadExport(result: { filename?: string; content?: string; contentType?: string }) {
   if (!result.content) return;
   const blob = new Blob([result.content], { type: result.contentType ?? "text/plain" });
@@ -161,7 +171,8 @@ export function QaIssuePanel({ issue }: { issue: Issue }) {
                     size="sm"
                     variant="outline"
                     onClick={() => exportRun.mutate({ runId: run.id, format: "pdf" })}
-                    disabled={exportRun.isPending}
+                    disabled={exportRun.isPending || !canExportQaReport(run)}
+                    title={qaReportDisabledTitle(run)}
                   >
                     <Download className="mr-1.5 h-3.5 w-3.5" />
                     PDF
@@ -170,7 +181,8 @@ export function QaIssuePanel({ issue }: { issue: Issue }) {
                     size="sm"
                     variant="outline"
                     onClick={() => exportRun.mutate({ runId: run.id, format: "csv" })}
-                    disabled={exportRun.isPending}
+                    disabled={exportRun.isPending || !canExportQaReport(run)}
+                    title={qaReportDisabledTitle(run)}
                   >
                     CSV
                   </Button>
@@ -178,7 +190,8 @@ export function QaIssuePanel({ issue }: { issue: Issue }) {
                     size="sm"
                     variant="outline"
                     onClick={() => exportRun.mutate({ runId: run.id, format: "jira" })}
-                    disabled={exportRun.isPending}
+                    disabled={exportRun.isPending || !canExportQaReport(run)}
+                    title={qaReportDisabledTitle(run)}
                   >
                     Jira
                   </Button>
@@ -194,6 +207,11 @@ export function QaIssuePanel({ issue }: { issue: Issue }) {
               <div className={cn("mt-2 text-xs font-medium", runTone(run.status))}>
                 {run.summary ?? `${run.status.replace("_", " ")} via ${run.runnerType}`}
               </div>
+              {!canExportQaReport(run) && (
+                <div className="mt-1 text-[11px] text-muted-foreground">
+                  Report export becomes available after QA records a final result.
+                </div>
+              )}
             </div>
           ))
         )}

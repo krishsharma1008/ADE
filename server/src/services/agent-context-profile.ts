@@ -18,6 +18,10 @@ function canCreateAgents(permissions: Record<string, unknown> | null | undefined
   return permissions?.canCreateAgents === true;
 }
 
+function canAssignCompanyTasks(permissions: Record<string, unknown> | null | undefined) {
+  return permissions?.canAssignTasks === true && permissions.taskAssignmentScope === "company";
+}
+
 export async function resolveAgentContextProfile(
   db: Db,
   agent: {
@@ -34,7 +38,7 @@ export async function resolveAgentContextProfile(
   }
 
   const role = agent.role.trim().toLowerCase();
-  if (COORDINATOR_ROLES.has(role) || canCreateAgents(agent.permissions)) {
+  if (COORDINATOR_ROLES.has(role) || canCreateAgents(agent.permissions) || canAssignCompanyTasks(agent.permissions)) {
     return "coordinator";
   }
 

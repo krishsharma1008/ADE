@@ -19,6 +19,7 @@ import {
 import { extractProjectMentionIds } from "@combyne/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { createHandoff } from "./agent-handoff.js";
+import { notifyParentOnChildStatus } from "./issue-parent-notifications.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -103,6 +104,13 @@ type IssueActiveRunRow = {
 };
 type IssueWithLabels = IssueRow & { labels: IssueLabelRow[]; labelIds: string[] };
 type IssueWithLabelsAndRun = IssueWithLabels & { activeRun: IssueActiveRunRow | null };
+type IssueUpdateOptions = {
+  parentNotificationActor?: {
+    actorType: "user" | "agent" | "system";
+    actorId: string | null;
+  };
+  suppressParentNotification?: boolean;
+};
 type IssueUserCommentStats = {
   issueId: string;
   myLastCommentAt: Date | null;
@@ -720,7 +728,11 @@ export function issueService(db: Db) {
       });
     },
 
-    update: async (id: string, data: Partial<typeof issues.$inferInsert> & { labelIds?: string[] }) => {
+    update: async (
+      id: string,
+      data: Partial<typeof issues.$inferInsert> & { labelIds?: string[] },
+      options: IssueUpdateOptions = {},
+    ) => {
       const existing = await db
         .select()
         .from(issues)
@@ -821,6 +833,14 @@ export function issueService(db: Db) {
           issueId: id,
           fromAgentId: existing.assigneeAgentId ?? null,
           toAgentId: issueData.assigneeAgentId,
+        });
+      }
+
+      if (result && issueData.status && issueData.status !== existing.status && !options.suppressParentNotification) {
+        await notifyParentOnChildStatus(db, {
+          child: result,
+          previousStatus: existing.status,
+          actor: options.parentNotificationActor ?? { actorType: "system", actorId: null },
         });
       }
 

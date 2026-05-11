@@ -629,37 +629,7 @@ export function IssueDetail() {
   }, [issue?.latestUserFacingAgentMessage, linkedRuns]);
 
   const extractedQuestions = useMemo<string[]>(() => {
-    const haystack = latestRunText;
-    if (!haystack) return [];
-    const qs: string[] = [];
-    const seen = new Set<string>();
-    const push = (raw: string) => {
-      const t = raw
-        .trim()
-        .replace(/^[-*•\s]+/, "")
-        .replace(/^\*\*/, "")
-        .replace(/\*\*$/, "")
-        .replace(/\*\*/g, "")
-        .trim();
-      if (t.length < 8) return;
-      if (!t.endsWith("?")) return;
-      if (seen.has(t)) return;
-      seen.add(t);
-      qs.push(t);
-    };
-    // 1. Numbered / lettered list items ending with "?" — highest signal.
-    const listRe = /^[\s\-*]*(?:\d+[.)]|[a-zA-Z][.)])\s+(.{6,}\?)\s*$/gm;
-    let m: RegExpExecArray | null;
-    while ((m = listRe.exec(haystack))) push(m[1]);
-    // 2. Any sentence ending in "?" anywhere in the prose.
-    //    Splits on sentence boundaries (. ! ? + whitespace) or newlines.
-    const sentenceRe = /([^.!?\n]{8,400}\?)/g;
-    while ((m = sentenceRe.exec(haystack))) push(m[1]);
-    // 3. Bare-line fallback: whole line ends with "?".
-    if (qs.length === 0) {
-      for (const line of haystack.split(/\n+/)) push(line);
-    }
-    return qs.slice(0, 20);
+    return extractAwaitingUserQuestions(latestRunText);
   }, [latestRunText]);
 
   const continueTerminal = useMutation({
@@ -932,14 +902,18 @@ export function IssueDetail() {
 	            <div className="font-medium">
 	              {issue.originKind === "terminal_session"
 	                ? "Terminal session idled out"
-	                : "Agent is waiting, but no structured question was captured"}
+	                : extractedQuestions.length > 0
+                    ? "Agent is waiting for your input"
+                    : "Run needs review before the agent can continue"}
 	            </div>
 	            <div className="text-xs opacity-80">
 	              {issue.originKind === "terminal_session"
 	                ? "Click Continue to reopen the terminal with the prior session's context."
-	                : issue.latestUserFacingAgentMessage
-                    ? "The agent's latest user-facing message is shown below. Reply to resume the agent."
-                    : "No persisted user-facing message was captured. Review the latest run if needed, then reply below to resume the agent."}
+	                : extractedQuestions.length > 0
+                    ? "The agent's latest message contained user-input items. Answer them below to resume the agent."
+                    : issue.latestUserFacingAgentMessage
+                      ? "No clear question was captured from the agent's latest message. Open the run to inspect the blocker before resuming."
+                      : "No structured question or user-facing message was captured. Open the run to inspect the blocker before resuming."}
 	              {issue.awaitingUserSince ? ` Waiting since ${new Date(issue.awaitingUserSince).toLocaleString()}.` : ""}
 	            </div>
 	          </div>
@@ -986,7 +960,7 @@ export function IssueDetail() {
       {issue.assigneeAgentId &&
         issue.originKind !== "terminal_session" &&
         openQuestions.length === 0 &&
-        (issue.status === "awaiting_user" || extractedQuestions.length > 0) &&
+        extractedQuestions.length > 0 &&
         !hasLiveRuns && (
           <ReplyAndWakeCard
             issueStatus={issue.status}
@@ -1593,6 +1567,83 @@ export function IssueDetail() {
   );
 }
 
+const AWAITING_USER_HEADER_RE =
+  /^#{1,6}\s+(?:open\s+questions?|clarifying\s+questions?|questions?\s+for\s+(?:the\s+)?user|questions?\s+pending|decision\s+(?:needed|required)|needs?\s+(?:user\s+)?input|input\s+(?:needed|required)|blockers?|blocked|cannot\s+proceed|action\s+required|clarifications?|clarification\s+(?:needed|required)|notes?)\b/i;
+const AWAITING_USER_INTENT_RE =
+  /\b(?:need|needs|needed|requires?|required|missing|blocked|cannot proceed|waiting on|choose|decide|decision|confirm|provide|input|clarify|clarification|which|whether)\b/i;
+const AWAITING_USER_PLEASANTRY_RE =
+  /^(?:do you (?:want|need)|would you like|want me to|shall i|should i (?:also )?(?:do|continue|proceed|keep|move|go)|anything else|need anything)\b/i;
+
+function stripQuestionBullet(line: string) {
+  const cleaned = line.trim().replace(/^\*\*|\*\*$/g, "").replace(/\*\*/g, "").trim();
+  const match = cleaned.match(/^(?:[-*+]\s+|\(\d+\)\s*|\d+[.)]\s+|[a-zA-Z][.)]\s+|Q\d+[:.)]\s*)(.*)$/i);
+  return (match?.[1] ?? cleaned).trim();
+}
+
+function extractAwaitingUserQuestions(text: string) {
+  if (!text.trim()) return [];
+  const lines = text.split(/\r?\n/);
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  const push = (raw: string) => {
+    const value = raw.trim();
+    if (value.length < 8) return;
+    if (AWAITING_USER_PLEASANTRY_RE.test(value)) return;
+    const key = value.toLowerCase().replace(/\s+/g, " ");
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(value);
+  };
+
+  let section: string[] = [];
+  const flush = () => {
+    const meaningful = section.map(stripQuestionBullet).filter(Boolean);
+    section = [];
+    if (meaningful.length === 0) return;
+    const firstQuestion = meaningful.find((line) => line.endsWith("?"));
+    if (firstQuestion) {
+      const options = meaningful
+        .filter((line) => line !== firstQuestion && !line.endsWith("?"))
+        .slice(0, 6)
+        .map((line) => `- ${line}`);
+      push([firstQuestion, ...options].join("\n"));
+      return;
+    }
+    if (meaningful.some((line) => AWAITING_USER_INTENT_RE.test(line))) {
+      const [lead, ...rest] = meaningful;
+      push([`Please clarify: ${lead}`, ...rest.slice(0, 6).map((line) => `- ${line}`)].join("\n"));
+    }
+  };
+
+  let inside = false;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (AWAITING_USER_HEADER_RE.test(line)) {
+      flush();
+      inside = true;
+      continue;
+    }
+    if (inside && /^#{1,6}\s+/.test(line)) {
+      flush();
+      inside = false;
+      continue;
+    }
+    if (inside) section.push(line);
+  }
+  flush();
+
+  if (out.length === 0) {
+    for (const rawLine of lines) {
+      const value = stripQuestionBullet(rawLine);
+      if (value.endsWith("?")) push(value);
+    }
+  }
+
+  return out.slice(0, 20);
+}
+
 function ReplyAndWakeCard({
   issueStatus,
   pending,
@@ -1690,7 +1741,7 @@ function ReplyAndWakeCard({
               key={i}
               className="rounded border border-amber-500/30 bg-background/60 px-3 py-2"
             >
-              <div className="text-sm font-medium text-foreground">
+              <div className="whitespace-pre-wrap text-sm font-medium text-foreground">
                 <span className="mr-1.5 text-amber-700 dark:text-amber-300">{i + 1}.</span>
                 {q}
               </div>

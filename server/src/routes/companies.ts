@@ -9,7 +9,7 @@ import {
 } from "@combyne/shared";
 import { forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
-import { accessService, companyPortabilityService, companyService, logActivity } from "../services/index.js";
+import { accessService, companyPortabilityService, companyService, heartbeatService, logActivity } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 
 export function companyRoutes(db: Db) {
@@ -17,6 +17,7 @@ export function companyRoutes(db: Db) {
   const svc = companyService(db);
   const portability = companyPortabilityService(db);
   const access = accessService(db);
+  const heartbeat = heartbeatService(db);
 
   router.get("/", async (req, res) => {
     assertBoard(req);
@@ -143,19 +144,23 @@ export function companyRoutes(db: Db) {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const company = await svc.update(companyId, req.body);
+    const archiveRequested = req.body.status === "archived";
+    const company = archiveRequested ? await svc.archive(companyId) : await svc.update(companyId, req.body);
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;
     }
+    const shutdown = archiveRequested
+      ? await heartbeat.cancelActiveForCompany(companyId, "Cancelled because company was archived")
+      : null;
     await logActivity(db, {
       companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
-      action: "company.updated",
+      action: archiveRequested ? "company.archived" : "company.updated",
       entityType: "company",
       entityId: companyId,
-      details: req.body,
+      details: shutdown ? { ...req.body, ...shutdown } : req.body,
     });
     res.json(company);
   });
@@ -169,6 +174,10 @@ export function companyRoutes(db: Db) {
       res.status(404).json({ error: "Company not found" });
       return;
     }
+    const shutdown = await heartbeat.cancelActiveForCompany(
+      companyId,
+      "Cancelled because company was archived",
+    );
     await logActivity(db, {
       companyId,
       actorType: "user",
@@ -176,6 +185,7 @@ export function companyRoutes(db: Db) {
       action: "company.archived",
       entityType: "company",
       entityId: companyId,
+      details: shutdown,
     });
     res.json(company);
   });

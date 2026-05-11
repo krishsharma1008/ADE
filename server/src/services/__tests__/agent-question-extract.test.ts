@@ -143,6 +143,37 @@ The Google Sheet is inaccessible.
       const out = extractQuestionsFromText(text);
       expect(out).toEqual([]);
     });
+
+    it("extracts decision-needed sections even without a question mark", () => {
+      const text = `
+### Decision needed
+Use API v1 or v2 for the lender payload
+- API v1
+- API v2
+      `;
+      const out = extractQuestionsFromText(text);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain("Please clarify: Use API v1 or v2");
+      expect(out[0]).toContain("- API v1");
+    });
+
+    it("extracts note-style input while ignoring ordinary notes", () => {
+      const needsInput = extractQuestionsFromText(`
+### Notes
+Need user confirmation on whether spouse income is mandatory
+- Treat as required
+- Treat as optional
+      `);
+      expect(needsInput).toHaveLength(1);
+      expect(needsInput[0]).toContain("spouse income");
+
+      const ordinaryNotes = extractQuestionsFromText(`
+### Notes
+Implementation complete.
+Tests pass locally.
+      `);
+      expect(ordinaryNotes).toEqual([]);
+    });
   });
 
   describe("extractAndPostQuestions (DB integration)", () => {

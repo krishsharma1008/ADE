@@ -92,7 +92,7 @@ export function PluginPage() {
   useEffect(() => {
     if (pageSlot) {
       setBreadcrumbs([
-        { label: "Plugins", href: "/instance/settings/plugins" },
+        { label: "Plugins", href: "/plugins" },
         { label: pageSlot.pluginDisplayName },
       ]);
     }
@@ -131,7 +131,7 @@ export function PluginPage() {
       return <NotFoundPage scope="board" />;
     }
     // No page slot: redirect to plugin settings where plugin info is always shown
-    const settingsPath = pluginId ? `/instance/settings/plugins/${pluginId}` : "/instance/settings/plugins";
+    const settingsPath = pluginId ? `/plugins/${pluginId}/settings` : "/plugins";
     return <Navigate to={settingsPath} replace />;
   }
 

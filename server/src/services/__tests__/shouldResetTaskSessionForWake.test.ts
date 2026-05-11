@@ -36,15 +36,39 @@ describe("shouldResetTaskSessionForWake (Phase C4 rollback lever)", () => {
     ).toBe(true);
   });
 
-  it("always resets for timer wakes (cold scheduled run)", () => {
+  it("resets for timer wakes without issue scope", () => {
     expect(shouldResetTaskSessionForWake({ wakeSource: "timer" })).toBe(true);
   });
 
-  it("resets for manual on-demand invokes", () => {
+  it("does not reset for issue-scoped timer wakes", () => {
+    expect(shouldResetTaskSessionForWake({ wakeSource: "timer", issueId: "issue-1" })).toBe(false);
+  });
+
+  it("resets for manual on-demand invokes without issue scope", () => {
     expect(
       shouldResetTaskSessionForWake({
         wakeSource: "on_demand",
         wakeTriggerDetail: "manual",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not reset for manual issue follow-ups", () => {
+    expect(
+      shouldResetTaskSessionForWake({
+        wakeSource: "on_demand",
+        wakeTriggerDetail: "manual",
+        taskKey: "ADE-123",
+      }),
+    ).toBe(false);
+  });
+
+  it("resets when a fresh session is explicitly requested", () => {
+    expect(
+      shouldResetTaskSessionForWake({
+        wakeSource: "timer",
+        issueId: "issue-1",
+        freshSession: true,
       }),
     ).toBe(true);
   });

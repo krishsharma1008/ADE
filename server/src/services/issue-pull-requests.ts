@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, ne } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { approvals, issueApprovals, issueComments, issuePullRequests, issues } from "@combyne/db";
 import type {
@@ -16,10 +16,14 @@ import { integrationService } from "./integrations.js";
 import { createSonarQubeClient } from "./sonarqube.js";
 import { issueService } from "./issues.js";
 import { approvalService } from "./approvals.js";
+import { heartbeatService } from "./heartbeat.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
 const DEFAULT_MERGE_BASE_BRANCHES = ["main", "master", "development", "develop"];
 const MERGE_METHODS = new Set(["merge", "squash", "rebase"]);
+const PR_FEEDBACK_RECONCILE_INTERVAL_MS =
+  Number(process.env.COMBYNE_PR_FEEDBACK_RECONCILE_INTERVAL_MS) || 2 * 60 * 1000;
+const prFeedbackReconcileThrottle = new Map<string, number>();
 
 function now() {
   return new Date();
@@ -287,21 +291,104 @@ export function issuePullRequestService(db: Db) {
   async function sendFeedback(id: string, opts: { requestedByActorType: "user" | "agent" | "system"; requestedByActorId: string | null }) {
     const status = await reconcile(id);
     const row = status.pullRequest as unknown as typeof issuePullRequests.$inferSelect;
-    if (status.blockers.length === 0) return { status, sent: false };
+    if (status.blockers.length === 0) return { status, sent: false, commentId: null as string | null };
     const hash = feedbackHash(status.feedback);
-    if (row.lastFeedbackHash === hash && row.feedbackStatus === "sent") return { status, sent: false };
-    await db.insert(issueComments).values({
-      companyId: row.companyId,
-      issueId: row.issueId,
-      authorAgentId: null,
-      authorUserId: opts.requestedByActorType === "user" ? opts.requestedByActorId : null,
-      body: status.feedback,
-    });
+    if (row.lastFeedbackHash === hash && row.feedbackStatus === "sent") {
+      return { status, sent: false, commentId: null as string | null };
+    }
+    const [comment] = await db
+      .insert(issueComments)
+      .values({
+        companyId: row.companyId,
+        issueId: row.issueId,
+        authorAgentId: null,
+        authorUserId: opts.requestedByActorType === "user" ? opts.requestedByActorId : null,
+        body: status.feedback,
+        kind: "system",
+      })
+      .returning({ id: issueComments.id });
     await db
       .update(issuePullRequests)
       .set({ feedbackStatus: "sent", lastFeedbackHash: hash, lastFeedbackAt: now(), updatedAt: now() })
       .where(eq(issuePullRequests.id, row.id));
-    return { status, sent: true };
+    return { status, sent: true, commentId: comment?.id ?? null };
+  }
+
+  async function dispatchFeedbackToAssignee(
+    id: string,
+    opts: { requestedByActorType: "user" | "agent" | "system"; requestedByActorId: string | null },
+  ) {
+    const result = await sendFeedback(id, opts);
+    const row = result.status.pullRequest as unknown as typeof issuePullRequests.$inferSelect;
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, row.issueId))
+      .then((rows) => rows[0] ?? null);
+    let wakeRunId: string | null = null;
+    if (issue?.assigneeAgentId && result.sent && result.status.blockers.length > 0) {
+      const wake = await heartbeatService(db).wakeup(issue.assigneeAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "pr_feedback",
+        payload: {
+          issueId: row.issueId,
+          issuePullRequestId: row.id,
+          commentId: result.commentId,
+          feedback: result.status.feedback,
+        },
+        requestedByActorType: opts.requestedByActorType,
+        requestedByActorId: opts.requestedByActorId,
+        contextSnapshot: {
+          issueId: row.issueId,
+          taskId: row.issueId,
+          commentId: result.commentId,
+          wakeCommentId: result.commentId,
+          wakeReason: "pr_feedback",
+          issuePullRequestId: row.id,
+          prFeedback: result.status.feedback,
+        },
+      });
+      wakeRunId = wake?.id ?? null;
+    }
+    return { ...result, wakeRunId };
+  }
+
+  async function dispatchFeedbackForCompany(companyId: string) {
+    const rows = await db
+      .select({ id: issuePullRequests.id })
+      .from(issuePullRequests)
+      .where(and(eq(issuePullRequests.companyId, companyId), ne(issuePullRequests.mergeStatus, "merged")))
+      .orderBy(asc(issuePullRequests.updatedAt))
+      .limit(50);
+
+    let scanned = 0;
+    let sent = 0;
+    let woken = 0;
+    for (const row of rows) {
+      scanned++;
+      try {
+        const result = await dispatchFeedbackToAssignee(row.id, {
+          requestedByActorType: "system",
+          requestedByActorId: "issue-pr-reconcile",
+        });
+        if (result.sent) sent++;
+        if (result.wakeRunId) woken++;
+      } catch (_err) {
+        // Per-PR soft failure keeps one bad integration response from
+        // blocking feedback dispatch for the rest of the company.
+      }
+    }
+    return { scanned, sent, woken };
+  }
+
+  async function maybeDispatchFeedbackForCompany(companyId: string) {
+    const last = prFeedbackReconcileThrottle.get(companyId) ?? 0;
+    if (Date.now() - last < PR_FEEDBACK_RECONCILE_INTERVAL_MS) {
+      return { skipped: true as const, scanned: 0, sent: 0, woken: 0 };
+    }
+    prFeedbackReconcileThrottle.set(companyId, Date.now());
+    return { skipped: false as const, ...(await dispatchFeedbackForCompany(companyId)) };
   }
 
   async function merge(id: string, input: { approvalId?: string | null; expectedHeadSha?: string | null; mergeMethod?: "merge" | "squash" | "rebase"; decidedByUserId: string; decisionNote?: string | null }) {
@@ -432,6 +519,9 @@ export function issuePullRequestService(db: Db) {
 
     reconcile,
     sendFeedback,
+    dispatchFeedbackToAssignee,
+    dispatchFeedbackForCompany,
+    maybeDispatchFeedbackForCompany,
     merge,
   };
 }

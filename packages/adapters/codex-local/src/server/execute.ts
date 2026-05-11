@@ -356,6 +356,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (acceptedWorkBody.length > 0) {
     preambleSegments.push(`# Accepted work memory task\n\n${acceptedWorkBody}`);
   }
+  const coordinatorGuidance = parseObject(context.combyneCoordinatorGuidance);
+  const coordinatorGuidanceBody = asString(coordinatorGuidance.body, "").trim();
+  if (coordinatorGuidanceBody.length > 0) {
+    preambleSegments.push(coordinatorGuidanceBody);
+  }
+  const bukuPrePushGovernance = parseObject(context.combyneBukuPrePushGovernance);
+  const bukuPrePushGovernanceBody = asString(bukuPrePushGovernance.body, "").trim();
+  if (bukuPrePushGovernanceBody.length > 0) {
+    preambleSegments.push(bukuPrePushGovernanceBody);
+  }
   const assigned = parseObject(context.combyneAssignedIssues);
   const digestBody = asString(assigned.digestBody, "").trim();
   const legacyBody = asString(assigned.body, "").trim();

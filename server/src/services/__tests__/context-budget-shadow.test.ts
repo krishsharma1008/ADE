@@ -264,6 +264,36 @@ describe("composeAndApplyBudget", () => {
     expect(newMem.length).toBeLessThan(originalLength);
   });
 
+  it("writes budgeted summarizer and tool surfaces back into context", () => {
+    const standing = "standing fact ".repeat(5000);
+    const working = "working state ".repeat(5000);
+    const recentTurns = "recent turn ".repeat(5000);
+    const toolResults = "tool result ".repeat(5000);
+    const context: Record<string, unknown> = {
+      combyneStandingSummary: { body: standing },
+      combyneWorkingSummary: { body: working },
+      combyneRecentTurns: { body: recentTurns },
+      combyneToolResults: { body: toolResults },
+    };
+
+    const out = composeAndApplyBudget(context, {
+      adapterType: "pi-local",
+      adapterConfig: { contextBudgetTokens: 250 },
+      model: "claude-sonnet-4-6",
+    });
+
+    expect(out).not.toBeNull();
+    expect(out!.applied).toBe(true);
+    const nextStanding = (context.combyneStandingSummary as { body?: string } | undefined)?.body ?? "";
+    const nextWorking = (context.combyneWorkingSummary as { body?: string } | undefined)?.body ?? "";
+    const nextRecentTurns = (context.combyneRecentTurns as { body?: string } | undefined)?.body ?? "";
+    const nextToolResults = (context.combyneToolResults as { body?: string } | undefined)?.body ?? "";
+    expect(nextStanding.length).toBeLessThan(standing.length);
+    expect(nextWorking.length).toBeLessThan(working.length);
+    expect(nextRecentTurns.length).toBeLessThan(recentTurns.length);
+    expect(nextToolResults.length).toBeLessThan(toolResults.length);
+  });
+
   it("deletes combyneFocusDirective when the focus section was dropped wholesale", () => {
     // Use a budget so tiny that even "preserve" focus gets dropped by the
     // caller. The composer won't drop a "preserve" strategy on its own — it

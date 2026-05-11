@@ -44,7 +44,7 @@ describe("agent context profile resolver", () => {
     await expect(resolveAgentContextProfile(handle.db, devops)).resolves.toBe("focused");
   });
 
-  it("classifies CEO, EM, direct-report managers, and hiring-capable agents as coordinators", async () => {
+  it("classifies CEO, EM, direct-report managers, hiring-capable, and company-assignment agents as coordinators", async () => {
     const [ceo] = await handle.db
       .insert(agents)
       .values({ companyId, name: "CEO", role: "ceo", adapterType: "process" })
@@ -76,11 +76,22 @@ describe("agent context profile resolver", () => {
         adapterType: "process",
       })
       .returning();
+    const [companyAssigner] = await handle.db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "Company Assigner",
+        role: "engineer",
+        permissions: { canAssignTasks: true, taskAssignmentScope: "company" },
+        adapterType: "process",
+      })
+      .returning();
 
     await expect(resolveAgentContextProfile(handle.db, ceo)).resolves.toBe("coordinator");
     await expect(resolveAgentContextProfile(handle.db, em)).resolves.toBe("coordinator");
     await expect(resolveAgentContextProfile(handle.db, lead)).resolves.toBe("coordinator");
     await expect(resolveAgentContextProfile(handle.db, hiringCapable)).resolves.toBe("coordinator");
+    await expect(resolveAgentContextProfile(handle.db, companyAssigner)).resolves.toBe("coordinator");
   });
 
   it("honors explicit adapterConfig contextProfile overrides", async () => {

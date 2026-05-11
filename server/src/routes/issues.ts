@@ -28,6 +28,8 @@ import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { createHandoff } from "../services/agent-handoff.js";
 import { captureIssueContextRefs } from "../services/issue-context-refs.js";
+import { extractAndPostQuestions, extractQuestionsFromText } from "../services/agent-question-extract.js";
+import { notifyParentOnChildAgentComment } from "../services/issue-parent-notifications.js";
 
 const MAX_ATTACHMENT_BYTES = Number(process.env.COMBYNE_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
@@ -583,9 +585,25 @@ export function issueRoutes(db: Db, storage: StorageService) {
       (updateFields as typeof updateFields & { blockedSource?: "human" | "agent" | "system"; blockedReason?: string | null }).blockedReason =
         commentBody?.slice(0, 1000) ?? existing.blockedReason ?? null;
     }
+    if (req.actor.type === "agent" && updateFields.status === "awaiting_user") {
+      const questions = commentBody ? extractQuestionsFromText(commentBody, 1) : [];
+      if (questions.length === 0) {
+        res.status(422).json({
+          error:
+            "Agents must use /ask-user or include a structured Open questions / Blocker question when moving an issue to awaiting_user",
+        });
+        return;
+      }
+    }
+    const actor = getActorInfo(req);
     let issue;
     try {
-      issue = await svc.update(id, updateFields);
+      issue = await svc.update(id, updateFields, {
+        parentNotificationActor: {
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+        },
+      });
     } catch (err) {
       if (err instanceof HttpError && err.status === 422) {
         logger.warn(
@@ -649,7 +667,6 @@ export function issueRoutes(db: Db, storage: StorageService) {
       }
     }
 
-    const actor = getActorInfo(req);
     const hasFieldChanges = Object.keys(previous).length > 0;
     await logActivity(db, {
       companyId: issue.companyId,
@@ -700,6 +717,32 @@ export function issueRoutes(db: Db, storage: StorageService) {
         text: comment.body,
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      if (issue.status === "awaiting_user" && actor.agentId) {
+        await extractAndPostQuestions(db, {
+          companyId: issue.companyId,
+          agentId: actor.agentId,
+          issueId: issue.id,
+          sourceText: comment.body,
+        });
+      }
+    }
+
+    if (
+      commentBody &&
+      comment &&
+      !(["done", "blocked", "awaiting_user"].includes(issue.status) && existing.status !== issue.status)
+    ) {
+      await notifyParentOnChildAgentComment(db, {
+        child: issue,
+        commentId: comment.id,
+        commentBody: comment.body,
+        actorAgentId: actor.agentId,
+        actor: {
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+        },
       });
     }
 
@@ -848,7 +891,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
       kind: "question",
       choices: choices && choices.length > 0 ? choices : null,
     });
-    const updated = await svc.update(id, { status: "awaiting_user" });
+    const updated = await svc.update(id, { status: "awaiting_user" }, {
+      parentNotificationActor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+      },
+    });
 
     await logActivity(db, {
       companyId: issue.companyId,
@@ -1343,6 +1391,17 @@ export function issueRoutes(db: Db, storage: StorageService) {
       text: comment.body,
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+    });
+
+    await notifyParentOnChildAgentComment(db, {
+      child: currentIssue,
+      commentId: comment.id,
+      commentBody: comment.body,
+      actorAgentId: actor.agentId,
+      actor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+      },
     });
 
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.

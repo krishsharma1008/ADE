@@ -291,6 +291,10 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
         agentName: activeRun.agentName,
         adapterType: activeRun.adapterType,
         issueId,
+        wakeupRequestId: activeRun.wakeupRequestId,
+        queueReason: activeRun.queueReason,
+        blockedByRunId: activeRun.blockedByRunId,
+        queueReasonText: activeRun.queueReasonText,
       });
     }
     return [...deduped.values()].sort(
@@ -565,6 +569,11 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
                 {run.id.slice(0, 8)}
               </Link>
               <StatusBadge status={run.status} />
+              {run.status === "queued" && run.queueReasonText && (
+                <span className="min-w-0 truncate text-[10px] text-amber-600 dark:text-amber-300">
+                  {run.queueReasonText}
+                </span>
+              )}
               <div className="ml-auto flex items-center gap-2">
                 <button
                   onClick={() => handleCancelRun(run.id)}

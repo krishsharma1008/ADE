@@ -34,7 +34,7 @@ const SUPPORTED_ADVANCED_ADAPTER_TYPES = new Set<CreateConfigValues["adapterType
   "cursor",
   "openclaw_gateway",
 ]);
-const COORDINATOR_RUN_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm"]);
+const COORDINATOR_RUN_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
 
 function defaultMaxConcurrentRunsForRole(role: string) {
   return COORDINATOR_RUN_ROLES.has(role.trim().toLowerCase()) ? 3 : 1;

@@ -127,6 +127,12 @@ Human auth tables (`users`, `sessions`, and provider-specific auth artifacts) ar
 
 Invariant: every business record belongs to exactly one company.
 
+Archive semantics:
+
+- archiving a company also pauses its invokable agents
+- queued or running heartbeat work for the company is cancelled
+- new timer or on-demand wakes are skipped while the company is not `active`
+
 ## 7.2 `agents`
 
 - `id` uuid pk

@@ -97,17 +97,31 @@ describe("shouldResetTaskSessionForWake", () => {
     expect(shouldResetTaskSessionForWake({ wakeReason: "issue_assigned" })).toBe(false);
   });
 
-  it("resets session context on timer heartbeats", () => {
+  it("resets session context on timer heartbeats without issue scope", () => {
     expect(shouldResetTaskSessionForWake({ wakeSource: "timer" })).toBe(true);
   });
 
-  it("resets session context on manual on-demand invokes", () => {
+  it("keeps session context on issue-scoped timer heartbeats", () => {
+    expect(shouldResetTaskSessionForWake({ wakeSource: "timer", issueId: "issue-1" })).toBe(false);
+  });
+
+  it("resets session context on manual on-demand invokes without issue scope", () => {
     expect(
       shouldResetTaskSessionForWake({
         wakeSource: "on_demand",
         wakeTriggerDetail: "manual",
       }),
     ).toBe(true);
+  });
+
+  it("keeps session context on manual issue follow-ups", () => {
+    expect(
+      shouldResetTaskSessionForWake({
+        wakeSource: "on_demand",
+        wakeTriggerDetail: "manual",
+        taskId: "issue-1",
+      }),
+    ).toBe(false);
   });
 
   it("does not reset session context on mention wake comment", () => {

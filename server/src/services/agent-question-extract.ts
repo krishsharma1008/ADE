@@ -28,19 +28,33 @@ const MAX_QUESTION_LENGTH = 1500;
 const QUESTION_SECTION_HEADERS = [
   /^#{1,6}\s+open\s+questions?\b/i,
   /^#{1,6}\s+clarifying\s+questions?\b/i,
+  /^#{1,6}\s+clarifications?\b/i,
+  /^#{1,6}\s+clarification\s+(?:needed|required)\b/i,
   /^#{1,6}\s+questions?\s+for\s+(?:the\s+)?user\b/i,
   /^#{1,6}\s+questions?\s+pending\b/i,
-  /^\*\*open\s+questions?\*\*/i,
+  /^#{1,6}\s+decision\s+(?:needed|required)\b/i,
+  /^#{1,6}\s+needs?\s+input\b/i,
+  /^\*\*(?:open\s+questions?|clarifying\s+questions?|clarifications?|clarification\s+(?:needed|required)|decision\s+(?:needed|required)|needs?\s+input)\*\*/i,
 ];
 
 const USER_INPUT_SECTION_HEADERS = [
   /^#{1,6}\s+blockers?\b/i,
   /^#{1,6}\s+blocked\b/i,
   /^#{1,6}\s+needs?\s+user\s+input\b/i,
+  /^#{1,6}\s+needs?\s+input\b/i,
+  /^#{1,6}\s+input\s+(?:needed|required)\b/i,
   /^#{1,6}\s+waiting\s+on\s+(?:the\s+)?user\b/i,
   /^#{1,6}\s+cannot\s+proceed\b/i,
   /^#{1,6}\s+action\s+required\b/i,
-  /^\*\*(?:blockers?|blocked|needs?\s+user\s+input|waiting\s+on\s+(?:the\s+)?user|cannot\s+proceed|action\s+required)\*\*/i,
+  /^#{1,6}\s+decision\s+(?:needed|required)\b/i,
+  /^#{1,6}\s+clarifications?\b/i,
+  /^#{1,6}\s+clarification\s+(?:needed|required)\b/i,
+  /^#{1,6}\s+notes?\b/i,
+  /^\*\*(?:blockers?|blocked|needs?\s+(?:user\s+)?input|input\s+(?:needed|required)|waiting\s+on\s+(?:the\s+)?user|cannot\s+proceed|action\s+required|decision\s+(?:needed|required)|clarifications?|clarification\s+(?:needed|required)|notes?)\*\*/i,
+];
+
+const USER_INPUT_INTENT_PATTERNS: RegExp[] = [
+  /\b(?:need|needs|needed|requires?|required|choose|decide|decision|confirm|provide|input|clarify|clarification|which|whether)\b/i,
 ];
 
 // Trailing pleasantries / permission-seekers that look like questions but
@@ -129,13 +143,15 @@ export function extractQuestionsFromText(
 function extractUserInputSectionQuestions(lines: string[]): string[] {
   let insideSection = false;
   let currentSection: string[] = [];
+  let currentHeader = "";
   const out: string[] = [];
 
   const flush = () => {
     if (currentSection.length === 0) return;
-    const prompt = buildUserInputQuestion(currentSection);
+    const prompt = buildUserInputQuestion(currentSection, currentHeader);
     if (prompt) out.push(prompt);
     currentSection = [];
+    currentHeader = "";
   };
 
   for (const rawLine of lines) {
@@ -144,6 +160,7 @@ function extractUserInputSectionQuestions(lines: string[]): string[] {
     if (isUserInputHeader) {
       flush();
       insideSection = true;
+      currentHeader = line;
       continue;
     }
     if (insideSection && /^#{1,6}\s+/.test(line)) {
@@ -159,7 +176,7 @@ function extractUserInputSectionQuestions(lines: string[]): string[] {
   return out;
 }
 
-function buildUserInputQuestion(sectionLines: string[]): string {
+function buildUserInputQuestion(sectionLines: string[], header = ""): string {
   const trimmedLines = sectionLines.map((line) => line.trim()).filter(Boolean);
   if (trimmedLines.length === 0) return "";
 
@@ -171,6 +188,10 @@ function buildUserInputQuestion(sectionLines: string[]): string {
     const strippedBullet = stripBullet(line);
     const normalized = strippedBullet || line.replace(/^\*\*|\*\*$/g, "").trim();
     if (!normalized) continue;
+    if (!sawQuestion && strippedBullet && questionLines.length > 0) {
+      optionLines.push(`- ${normalized}`);
+      continue;
+    }
     if (!sawQuestion) {
       questionLines.push(normalized);
       if (normalized.includes("?")) sawQuestion = true;
@@ -185,9 +206,17 @@ function buildUserInputQuestion(sectionLines: string[]): string {
     }
   }
 
-  if (!questionLines.some((line) => line.includes("?"))) return "";
+  const hasQuestionMark = questionLines.some((line) => line.includes("?"));
+  const hasStrongHeaderIntent = /\b(?:decision|input|clarification|clarifying)\b/i.test(header);
+  const hasInputIntent = trimmedLines.some((line) =>
+    USER_INPUT_INTENT_PATTERNS.some((pattern) => pattern.test(line)),
+  );
+  if (!hasQuestionMark && !hasStrongHeaderIntent && !hasInputIntent) return "";
 
-  const prompt = [...questionLines, ...optionLines].join("\n").trim();
+  const promptLines = hasQuestionMark
+    ? [...questionLines, ...optionLines]
+    : [`Please clarify: ${questionLines.join(" ")}`, ...optionLines];
+  const prompt = promptLines.join("\n").trim();
   return prompt.length > MAX_QUESTION_LENGTH ? `${prompt.slice(0, MAX_QUESTION_LENGTH - 1).trimEnd()}…` : prompt;
 }
 

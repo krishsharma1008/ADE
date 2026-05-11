@@ -393,8 +393,8 @@ export function CompanySettings() {
         </div>
         <div className="space-y-3 rounded-md border border-destructive/40 bg-destructive/5 px-4 py-4">
           <p className="text-sm text-muted-foreground">
-            Archive this company to hide it from the sidebar. This persists in
-            the database.
+            Archive this company to hide it from the sidebar, pause its agents,
+            and cancel queued or running agent work. This persists in the database.
           </p>
           <div className="flex items-center gap-2">
             <Button
@@ -407,7 +407,7 @@ export function CompanySettings() {
               onClick={() => {
                 if (!selectedCompanyId) return;
                 const confirmed = window.confirm(
-                  `Archive company "${selectedCompany.name}"? It will be hidden from the sidebar.`
+                  `Archive company "${selectedCompany.name}"? It will be hidden from the sidebar, and queued or running agent work will be cancelled.`
                 );
                 if (!confirmed) return;
                 const nextCompany =

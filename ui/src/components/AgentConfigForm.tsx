@@ -94,7 +94,7 @@ const emptyOverlay: Overlay = {
 
 /** Stable empty object used as fallback for missing env config to avoid new-object-per-render. */
 const EMPTY_ENV: Record<string, EnvBinding> = {};
-const COORDINATOR_RUN_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm"]);
+const COORDINATOR_RUN_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
 
 function defaultMaxConcurrentRunsForRole(role: string | null | undefined) {
   return COORDINATOR_RUN_ROLES.has((role ?? "").trim().toLowerCase()) ? 3 : 1;

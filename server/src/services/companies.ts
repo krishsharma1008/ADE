@@ -1,4 +1,4 @@
-import { eq, count } from "drizzle-orm";
+import { and, eq, count, notInArray } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   companies,
@@ -99,12 +99,38 @@ export function companyService(db: Db) {
         .then((rows) => rows[0] ?? null),
 
     archive: (id: string) =>
-      db
-        .update(companies)
-        .set({ status: "archived", updatedAt: new Date() })
-        .where(eq(companies.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null),
+      db.transaction(async (tx) => {
+        const now = new Date();
+        const company = await tx
+          .update(companies)
+          .set({
+            status: "archived",
+            pauseReason: "system",
+            pausedAt: now,
+            updatedAt: now,
+          })
+          .where(eq(companies.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!company) return null;
+
+        await tx
+          .update(agents)
+          .set({
+            status: "paused",
+            pauseReason: "system",
+            pausedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(agents.companyId, id),
+              notInArray(agents.status, ["terminated", "pending_approval"]),
+            ),
+          );
+
+        return company;
+      }),
 
     remove: (id: string) =>
       db.transaction(async (tx) => {

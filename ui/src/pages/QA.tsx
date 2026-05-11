@@ -126,6 +126,16 @@ function statusTone(status: string) {
   return "text-yellow-500";
 }
 
+function canExportQaReport(run: QaTestRun) {
+  return run.status !== "queued" && run.status !== "running";
+}
+
+function qaReportDisabledTitle(run: QaTestRun) {
+  return canExportQaReport(run)
+    ? undefined
+    : "Report export is available after QA records a final result.";
+}
+
 function requestError(error: unknown) {
   return error instanceof Error ? error.message : "Request failed";
 }
@@ -789,17 +799,44 @@ export function QA() {
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    <Button size="sm" variant="outline" onClick={() => exportRun.mutate({ run, format: "pdf" })}>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => exportRun.mutate({ run, format: "pdf" })}
+                      disabled={exportRun.isPending || !canExportQaReport(run)}
+                      title={qaReportDisabledTitle(run)}
+                    >
                       <Download className="mr-1.5 h-3.5 w-3.5" />
                       PDF
                     </Button>
-                    <Button size="sm" variant="outline" onClick={() => exportRun.mutate({ run, format: "csv" })}>CSV</Button>
-                    <Button size="sm" variant="outline" onClick={() => exportRun.mutate({ run, format: "jira" })}>Jira</Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => exportRun.mutate({ run, format: "csv" })}
+                      disabled={exportRun.isPending || !canExportQaReport(run)}
+                      title={qaReportDisabledTitle(run)}
+                    >
+                      CSV
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => exportRun.mutate({ run, format: "jira" })}
+                      disabled={exportRun.isPending || !canExportQaReport(run)}
+                      title={qaReportDisabledTitle(run)}
+                    >
+                      Jira
+                    </Button>
                   </div>
                 </div>
                 <div className={cn("mt-2 text-xs font-medium", statusTone(run.status))}>
                   {run.summary ?? run.conclusion}
                 </div>
+                {!canExportQaReport(run) && (
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    Report export becomes available after QA records a final result.
+                  </div>
+                )}
               </div>
             ))
           )}

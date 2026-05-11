@@ -2,7 +2,7 @@ import { Router, type Request } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@combyne/db";
-import { agents as agentsTable, companies, heartbeatRuns, transcriptSummaries } from "@combyne/db";
+import { agentWakeupRequests, agents as agentsTable, companies, heartbeatRuns, issues, transcriptSummaries } from "@combyne/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
   createAgentKeySchema,
@@ -29,6 +29,7 @@ import {
   logActivity,
   secretService,
 } from "../services/index.js";
+import { resolveHeartbeatMaxConcurrentRuns } from "../services/heartbeat.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { findServerAdapter, listAdapterModels } from "../adapters/index.js";
@@ -183,6 +184,102 @@ export function agentRoutes(db: Db) {
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : null;
+  }
+
+  async function explainQueueForRun(run: {
+    id: string;
+    status: string;
+    agentId: string;
+    wakeupRequestId?: string | null;
+    contextSnapshot?: Record<string, unknown> | null;
+    issueId?: string | null;
+  }) {
+    if (run.status !== "queued") {
+      return { queueReason: null, blockedByRunId: null, queueReasonText: null };
+    }
+
+    const context = asRecord(run.contextSnapshot);
+    const issueId = asNonEmptyString(run.issueId) ?? asNonEmptyString(context?.issueId);
+
+    if (issueId) {
+      const issue = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (issue?.executionRunId && issue.executionRunId !== run.id) {
+        return {
+          queueReason: "issue_execution_lock" as const,
+          blockedByRunId: issue.executionRunId,
+          queueReasonText: "Waiting for another run to release this issue's execution lock.",
+        };
+      }
+    }
+
+    if (run.wakeupRequestId) {
+      const request = await db
+        .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, run.wakeupRequestId))
+        .then((rows) => rows[0] ?? null);
+      if (request?.status === "deferred_issue_execution" || request?.reason === "issue_execution_promoted") {
+        return {
+          queueReason: "deferred_issue_execution" as const,
+          blockedByRunId: null,
+          queueReasonText: "Promoted after waiting behind another issue-scoped run.",
+        };
+      }
+    }
+
+    const agent = await db
+      .select({
+        role: agentsTable.role,
+        permissions: agentsTable.permissions,
+        runtimeConfig: agentsTable.runtimeConfig,
+      })
+      .from(agentsTable)
+      .where(eq(agentsTable.id, run.agentId))
+      .then((rows) => rows[0] ?? null);
+    const running = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running")))
+      .then((rows) => Number(rows[0]?.count ?? 0));
+    const heartbeatConfig = asRecord(asRecord(agent?.runtimeConfig)?.heartbeat) ?? {};
+    const maxConcurrentRuns = resolveHeartbeatMaxConcurrentRuns(heartbeatConfig, {
+      role: agent?.role ?? null,
+      permissions: asRecord(agent?.permissions) ?? {},
+    });
+
+    if (running >= maxConcurrentRuns) {
+      return {
+        queueReason: "agent_concurrency" as const,
+        blockedByRunId: null,
+        queueReasonText: `Waiting for this agent to free a run slot (${running}/${maxConcurrentRuns} running).`,
+      };
+    }
+
+    return {
+      queueReason: "waiting_for_worker" as const,
+      blockedByRunId: null,
+      queueReasonText: "Queued and waiting for the local worker loop to claim it.",
+    };
+  }
+
+  async function withQueueExplanations<T extends {
+    id: string;
+    status: string;
+    agentId: string;
+    wakeupRequestId?: string | null;
+    contextSnapshot?: Record<string, unknown> | null;
+    issueId?: string | null;
+  }>(runs: T[]) {
+    return Promise.all(
+      runs.map(async (run) => ({
+        ...run,
+        ...(await explainQueueForRun(run)),
+      })),
+    );
   }
 
   function parseBooleanLike(value: unknown): boolean | null {
@@ -1364,7 +1461,7 @@ export function agentRoutes(db: Db) {
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const runs = await heartbeat.list(companyId, agentId, limit);
-    res.json(runs);
+    res.json(await withQueueExplanations(runs));
   });
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {
@@ -1383,6 +1480,7 @@ export function agentRoutes(db: Db) {
       finishedAt: heartbeatRuns.finishedAt,
       createdAt: heartbeatRuns.createdAt,
       agentId: heartbeatRuns.agentId,
+      wakeupRequestId: heartbeatRuns.wakeupRequestId,
       agentName: agentsTable.name,
       adapterType: agentsTable.adapterType,
       issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
@@ -1416,11 +1514,11 @@ export function agentRoutes(db: Db) {
         .orderBy(desc(heartbeatRuns.createdAt))
         .limit(minCount - liveRuns.length);
 
-      res.json([...liveRuns, ...recentRuns]);
+      res.json(await withQueueExplanations([...liveRuns, ...recentRuns]));
       return;
     }
 
-    res.json(liveRuns);
+    res.json(await withQueueExplanations(liveRuns));
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
@@ -1546,6 +1644,7 @@ export function agentRoutes(db: Db) {
         finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
         agentId: heartbeatRuns.agentId,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
         agentName: agentsTable.name,
         adapterType: agentsTable.adapterType,
       })
@@ -1560,7 +1659,7 @@ export function agentRoutes(db: Db) {
       )
       .orderBy(desc(heartbeatRuns.createdAt));
 
-    res.json(liveRuns);
+    res.json(await withQueueExplanations(liveRuns));
   });
 
   router.get("/issues/:issueId/active-run", async (req, res) => {
@@ -1598,8 +1697,9 @@ export function agentRoutes(db: Db) {
       return;
     }
 
+    const [annotated] = await withQueueExplanations([run]);
     res.json({
-      ...run,
+      ...annotated,
       agentId: agent.id,
       agentName: agent.name,
       adapterType: agent.adapterType,

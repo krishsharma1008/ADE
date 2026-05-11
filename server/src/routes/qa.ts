@@ -221,7 +221,10 @@ export function qaRoutes(db: Db) {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
-      action: "qa.feedback.submitted_for_approval",
+      action:
+        feedback.status === "pending_qa_approval"
+          ? "qa.feedback.submitted_for_approval"
+          : "qa.feedback.sent_to_dev",
       entityType: "qa_feedback_event",
       entityId: feedback.id,
       details: {
@@ -229,7 +232,7 @@ export function qaRoutes(db: Db) {
         issueId: detail.run.issueId,
         toAgentId: feedback.toAgentId,
         status: feedback.status,
-        developerVisible: false,
+        developerVisible: feedback.status !== "pending_qa_approval",
       },
     });
     res.json(feedback);

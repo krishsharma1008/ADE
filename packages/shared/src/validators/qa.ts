@@ -149,6 +149,7 @@ export const qaFeedbackSendSchema = z.object({
   severity: z.string().optional(),
   createBugIssue: z.boolean().optional(),
   wakeDeveloper: z.boolean().optional(),
+  requiresApproval: z.boolean().optional(),
 });
 export type QaFeedbackSend = z.infer<typeof qaFeedbackSendSchema>;
 

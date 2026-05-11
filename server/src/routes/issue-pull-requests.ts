@@ -94,7 +94,10 @@ export function issuePullRequestRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, row.companyId);
-    res.json(await svc.reconcile(id));
+    res.json(await svc.dispatchFeedbackToAssignee(id, {
+      requestedByActorType: "system",
+      requestedByActorId: "issue-pr-reconcile",
+    }));
   });
 
   router.post("/issue-pull-requests/:id/wake-feedback", async (req, res) => {
@@ -107,30 +110,10 @@ export function issuePullRequestRoutes(db: Db) {
     }
     assertCompanyAccess(req, row.companyId);
     const actor = getActorInfo(req);
-    const result = await svc.sendFeedback(id, {
+    const result = await svc.dispatchFeedbackToAssignee(id, {
       requestedByActorType: actor.actorType,
       requestedByActorId: actor.actorId,
     });
-    const issue = await db.select().from(issues).where(eq(issues.id, row.issueId)).then((rows) => rows[0] ?? null);
-    let wakeRunId: string | null = null;
-    if (issue?.assigneeAgentId && result.sent && result.status.blockers.length > 0) {
-      const wake = await heartbeat.wakeup(issue.assigneeAgentId, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "pr_feedback",
-        payload: { issueId: row.issueId, issuePullRequestId: row.id, feedback: result.status.feedback },
-        requestedByActorType: actor.actorType,
-        requestedByActorId: actor.actorId,
-        contextSnapshot: {
-          issueId: row.issueId,
-          taskId: row.issueId,
-          wakeReason: "pr_feedback",
-          issuePullRequestId: row.id,
-          prFeedback: result.status.feedback,
-        },
-      });
-      wakeRunId = wake?.id ?? null;
-    }
     await logActivity(db, {
       companyId: row.companyId,
       actorType: actor.actorType,
@@ -138,9 +121,9 @@ export function issuePullRequestRoutes(db: Db) {
       action: "issue_pr.feedback_wakeup",
       entityType: "issue_pull_request",
       entityId: row.id,
-      details: { issueId: row.issueId, sent: result.sent, wakeRunId },
+      details: { issueId: row.issueId, sent: result.sent, wakeRunId: result.wakeRunId },
     });
-    res.json({ ...result, wakeRunId });
+    res.json(result);
   });
 
   router.post("/issue-pull-requests/:id/merge", validate(issuePullRequestMergeSchema), async (req, res) => {

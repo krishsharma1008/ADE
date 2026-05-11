@@ -81,7 +81,7 @@ const REDACTED_ENV_VALUE = "***REDACTED***";
 const SECRET_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
-const COORDINATOR_RUN_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm"]);
+const COORDINATOR_RUN_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
 
 function defaultMaxConcurrentRunsForRole(role: string | null | undefined) {
   return COORDINATOR_RUN_ROLES.has((role ?? "").trim().toLowerCase()) ? 3 : 1;
@@ -824,6 +824,11 @@ function LatestRunCard({ runs, agentId }: { runs: HeartbeatRun[]; agentId: strin
         {summary && (
           <div className="overflow-hidden max-h-16">
             <MarkdownBody className="[&>*:first-child]:mt-0 [&>*:last-child]:mb-0">{summary}</MarkdownBody>
+          </div>
+        )}
+        {run.status === "queued" && run.queueReasonText && (
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 dark:text-amber-300">
+            {run.queueReasonText}
           </div>
         )}
       </Link>
@@ -1676,6 +1681,11 @@ function RunDetail({ run, agentRouteId, adapterType }: { run: HeartbeatRun; agen
                 </Button>
               )}
             </div>
+            {run.status === "queued" && run.queueReasonText && (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 dark:text-amber-300">
+                {run.queueReasonText}
+              </div>
+            )}
             {resumeRun.isError && (
               <div className="text-xs text-destructive">
                 {resumeRun.error instanceof Error ? resumeRun.error.message : "Failed to resume run"}

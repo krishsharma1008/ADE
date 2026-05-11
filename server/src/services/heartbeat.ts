@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   activityLog,
@@ -9,6 +9,7 @@ import {
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  companies,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -23,6 +24,7 @@ import { appendTranscriptEntry, type TranscriptRole } from "./agent-transcripts.
 import { loadRecentMemory, summarizeRunAndPersist } from "./agent-memory.js";
 import { getPendingHandoffBrief, markHandoffConsumed } from "./agent-handoff.js";
 import { acceptedWorkService } from "./accepted-work.js";
+import { issuePullRequestService } from "./issue-pull-requests.js";
 import { memoryService } from "./memory.js";
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
 import { loadAssignedIssueQueue, loadNextFocusedIssue } from "./agent-queue.js";
@@ -267,19 +269,78 @@ function hasExplicitMaxConcurrentRuns(value: unknown) {
   return false;
 }
 
+function hasCompanyAssignmentPermission(permissions: Record<string, unknown> | null | undefined) {
+  return permissions?.canAssignTasks === true && permissions.taskAssignmentScope === "company";
+}
+
 export function defaultMaxConcurrentRunsForAgent(agent: {
   role?: string | null;
   permissions?: Record<string, unknown> | null;
 }) {
   const role = typeof agent.role === "string" ? agent.role.trim().toLowerCase() : "";
-  const canCreateAgents =
-    !!agent.permissions &&
-    typeof agent.permissions === "object" &&
-    (agent.permissions as Record<string, unknown>).canCreateAgents === true;
-  if (COORDINATOR_HEARTBEAT_ROLES.has(role) || canCreateAgents) {
+  const permissions =
+    !!agent.permissions && typeof agent.permissions === "object"
+      ? (agent.permissions as Record<string, unknown>)
+      : null;
+  const canCreateAgents = permissions?.canCreateAgents === true;
+  const canAssignCompanyTasks = hasCompanyAssignmentPermission(permissions);
+  if (COORDINATOR_HEARTBEAT_ROLES.has(role) || canCreateAgents || canAssignCompanyTasks) {
     return HEARTBEAT_COORDINATOR_MAX_CONCURRENT_RUNS_DEFAULT;
   }
   return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
+}
+
+function buildCoordinatorGuidance(agent: {
+  role?: string | null;
+  permissions?: Record<string, unknown> | null;
+}) {
+  const role = typeof agent.role === "string" ? agent.role.trim().toLowerCase() : "";
+  const permissions =
+    !!agent.permissions && typeof agent.permissions === "object"
+      ? (agent.permissions as Record<string, unknown>)
+      : null;
+  const isCoordinator =
+    COORDINATOR_HEARTBEAT_ROLES.has(role) ||
+    permissions?.canCreateAgents === true ||
+    hasCompanyAssignmentPermission(permissions);
+  if (!isCoordinator) return null;
+  return [
+    "## Coordinator execution guidance",
+    "",
+    "- Default to hands-off execution for small tasks. Do not wait for a human nudge after child/reviewer/QA feedback.",
+    "- If a child agent asks a question and the answer is available from parent issue context, comments, QA/review feedback, repo state, or company memory, answer or route it yourself and wake the relevant assignee.",
+    "- Parallelize independent work across available agents, but keep same-issue code changes serialized by the issue execution lock.",
+    "- Ask the user only for genuinely missing product/business decisions or credentials that are not present in context.",
+    "- Before push/merge, verify child issues, review feedback, QA feedback, and open questions are closed or explicitly assigned.",
+  ].join("\n");
+}
+
+function buildBukuPrePushGovernance(input: {
+  cwd: string;
+  repoUrl: string | null;
+  repoRef: string | null;
+  context: Record<string, unknown>;
+}) {
+  const contextText = JSON.stringify(input.context).slice(0, 12_000).toLowerCase();
+  const haystack = [input.cwd, input.repoUrl, input.repoRef, contextText].filter(Boolean).join(" ").toLowerCase();
+  const looksLikeBuku =
+    haystack.includes("/buku") ||
+    haystack.includes("bukuwarung") ||
+    haystack.includes("buku-warung") ||
+    haystack.includes("buku-code-development") ||
+    haystack.includes("buku repo");
+  if (!looksLikeBuku) return null;
+  return [
+    "## Buku pre-push governance",
+    "",
+    "This run is in or references a Buku repo/skill. Before any push, the EM/developer must verify the repo-local pre-push checks:",
+    "",
+    "- Run formatting first, including `./gradlew spotlessApply` when Gradle/Spotless is present.",
+    "- Run compile and tests appropriate to the repo, including `./gradlew clean compileJava compileTestJava check --no-daemon` or the Maven equivalent when applicable.",
+    "- Run static checks present in the repo, such as `spotlessCheck`, `checkstyleMain`, `pmdMain`, `spotbugsMain`, plus repo-local package scripts such as Prettier/lint when present.",
+    "- Scan for secrets, debug prints, commented-out code, and migration/backward-compatibility issues before push.",
+    "- Do not bypass hooks or push until these checks are either passing or explicitly documented with a blocker.",
+  ].join("\n");
 }
 
 function normalizeMaxConcurrentRuns(value: unknown, fallback: number) {
@@ -459,7 +520,7 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-function deriveLatestUserFacingAgentMessage(sourceText: string, resultJson: unknown): string | null {
+export function deriveLatestUserFacingAgentMessage(sourceText: string, resultJson: unknown): string | null {
   const extracted = extractQuestionsFromText(sourceText, 1)[0];
   if (extracted) return extracted;
 
@@ -471,16 +532,15 @@ function deriveLatestUserFacingAgentMessage(sourceText: string, resultJson: unkn
     readNonEmptyString(result?.final);
   if (structured) return structured.slice(0, 4000);
 
-  const trimmed = sourceText.trim();
-  if (!trimmed) return null;
-  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  return lines.slice(-24).join("\n").slice(0, 4000);
+  return null;
 }
 
 function contextSectionNames(context: Record<string, unknown>): string[] {
   const sections: string[] = [];
   const hasBody = (key: string, field = "body") =>
     Boolean(readNonEmptyString(parseObject(context[key])?.[field]));
+  if (hasBody("combyneCoordinatorGuidance")) sections.push("coordinator");
+  if (hasBody("combyneBukuPrePushGovernance")) sections.push("bukuPrePush");
   if (hasBody("combyneBootstrapAnalysis", "preamble")) sections.push("bootstrap");
   if (hasBody("combyneHandoffBrief", "brief")) sections.push("handoff");
   if (hasBody("combyneIssueContextRefs")) sections.push("issueContextRefs");
@@ -656,30 +716,52 @@ function resetSessionOnAssignEnabled(): boolean {
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
+  const hasIssueScope =
+    Boolean(readNonEmptyString(contextSnapshot?.issueId)) ||
+    Boolean(readNonEmptyString(contextSnapshot?.taskId)) ||
+    Boolean(readNonEmptyString(contextSnapshot?.taskKey));
+  if (
+    asBoolean(contextSnapshot?.freshSession, false) ||
+    asBoolean(contextSnapshot?.resetTaskSession, false)
+  ) {
+    return true;
+  }
+
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned" && resetSessionOnAssignEnabled()) return true;
 
   const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
-  if (wakeSource === "timer") return true;
+  if (wakeSource === "timer") return !hasIssueScope;
 
   const wakeTriggerDetail = readNonEmptyString(contextSnapshot?.wakeTriggerDetail);
-  return wakeSource === "on_demand" && wakeTriggerDetail === "manual";
+  return wakeSource === "on_demand" && wakeTriggerDetail === "manual" && !hasIssueScope;
 }
 
 function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
+  if (
+    asBoolean(contextSnapshot?.freshSession, false) ||
+    asBoolean(contextSnapshot?.resetTaskSession, false)
+  ) {
+    return "a fresh session was explicitly requested";
+  }
+
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned" && resetSessionOnAssignEnabled()) {
     return "wake reason is issue_assigned (rollback lever active)";
   }
 
+  const hasIssueScope =
+    Boolean(readNonEmptyString(contextSnapshot?.issueId)) ||
+    Boolean(readNonEmptyString(contextSnapshot?.taskId)) ||
+    Boolean(readNonEmptyString(contextSnapshot?.taskKey));
   const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
-  if (wakeSource === "timer") return "wake source is timer";
+  if (wakeSource === "timer" && !hasIssueScope) return "wake source is timer without issue scope";
 
   const wakeTriggerDetail = readNonEmptyString(contextSnapshot?.wakeTriggerDetail);
-  if (wakeSource === "on_demand" && wakeTriggerDetail === "manual") {
-    return "this is a manual invoke";
+  if (wakeSource === "on_demand" && wakeTriggerDetail === "manual" && !hasIssueScope) {
+    return "this is a manual invoke without issue scope";
   }
   return null;
 }
@@ -1326,6 +1408,44 @@ export function heartbeatService(db: Db) {
     return Number(count ?? 0);
   }
 
+  async function getCompanyStatus(companyId: string) {
+    const [company] = await db
+      .select({ status: companies.status })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .limit(1);
+    return company?.status ?? null;
+  }
+
+  async function isCompanyActive(companyId: string) {
+    return (await getCompanyStatus(companyId)) === "active";
+  }
+
+  function isAgentStatusInvokable(status: string) {
+    return status !== "paused" && status !== "terminated" && status !== "pending_approval";
+  }
+
+  async function cancelRunBecauseCompanyInactive(
+    run: typeof heartbeatRuns.$inferSelect,
+    reason = "Cancelled because company is not active",
+  ) {
+    const cancelledRun = await setRunStatus(run.id, "cancelled", {
+      finishedAt: new Date(),
+      error: reason,
+      errorCode: "company_not_active",
+    });
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+      finishedAt: new Date(),
+      error: reason,
+    });
+    const running = runningProcesses.get(run.id);
+    if (running) {
+      running.child.kill("SIGTERM");
+      runningProcesses.delete(run.id);
+    }
+    if (cancelledRun) await releaseIssueExecutionAndPromote(cancelledRun);
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
     if (run.status !== "queued") return run;
     const claimedAt = new Date();
@@ -1676,6 +1796,8 @@ export function heartbeatService(db: Db) {
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
+      if (!isAgentStatusInvokable(agent.status)) return [];
+      if (!(await isCompanyActive(agent.companyId))) return [];
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
@@ -1710,6 +1832,11 @@ export function heartbeatService(db: Db) {
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
 
+    if (!(await isCompanyActive(run.companyId))) {
+      await cancelRunBecauseCompanyInactive(run);
+      return;
+    }
+
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
@@ -1717,6 +1844,11 @@ export function heartbeatService(db: Db) {
         return;
       }
       run = claimed;
+    }
+
+    if (!(await isCompanyActive(run.companyId))) {
+      await cancelRunBecauseCompanyInactive(run);
+      return;
     }
 
     const agent = await getAgent(run.agentId);
@@ -1797,6 +1929,11 @@ export function heartbeatService(db: Db) {
       .catch((err) => {
         logger.debug({ err, companyId: agent.companyId }, "accepted-work heartbeat reconciliation failed");
       });
+    void issuePullRequestService(db)
+      .maybeDispatchFeedbackForCompany(agent.companyId)
+      .catch((err) => {
+        logger.debug({ err, companyId: agent.companyId }, "issue-pr feedback reconciliation failed");
+      });
     let pendingHandoffId: string | null = null;
     try {
       const handoff = await getPendingHandoffBrief(db, agent.id, memoryIssueId ?? null);
@@ -1827,16 +1964,10 @@ export function heartbeatService(db: Db) {
         } catch (err) {
           logger.debug({ err, agentId: agent.id, runId }, "failed to transcript handoff brief");
         }
-        try {
-          await markHandoffConsumed(db, handoff.id);
-        } catch (err) {
-          logger.debug({ err, handoffId: handoff.id }, "failed to mark handoff consumed");
-        }
       }
     } catch (err) {
       logger.debug({ err, agentId: agent.id }, "failed to load pending handoff");
     }
-    void pendingHandoffId;
     if (contextProfile !== "focused" || memoryIssueId) {
       try {
         const memoryRows = await loadRecentMemory(db, {
@@ -2055,6 +2186,34 @@ export function heartbeatService(db: Db) {
       repoUrl: resolvedWorkspace.repoUrl,
       repoRef: resolvedWorkspace.repoRef,
     };
+    context.combyneSessionReuse = {
+      taskKey,
+      resetTaskSession,
+      resetReason: sessionResetReason,
+      hadTaskSession: Boolean(taskSession),
+      usedTaskSession: Boolean(taskSessionForRun),
+      previousSessionDisplayId:
+        taskSessionForRun?.sessionDisplayId ??
+        readNonEmptyString(previousSessionParams?.sessionId) ??
+        null,
+    };
+    const coordinatorGuidance = buildCoordinatorGuidance(agent);
+    if (coordinatorGuidance) {
+      context.combyneCoordinatorGuidance = {
+        body: coordinatorGuidance,
+      };
+    }
+    const bukuPrePushGovernance = buildBukuPrePushGovernance({
+      cwd: resolvedWorkspace.cwd,
+      repoUrl: resolvedWorkspace.repoUrl,
+      repoRef: resolvedWorkspace.repoRef,
+      context,
+    });
+    if (bukuPrePushGovernance) {
+      context.combyneBukuPrePushGovernance = {
+        body: bukuPrePushGovernance,
+      };
+    }
     context.combyneWorkspaces = resolvedWorkspace.workspaceHints;
     if (resolvedWorkspace.projectId && !readNonEmptyString(context.projectId)) {
       context.projectId = resolvedWorkspace.projectId;
@@ -2315,9 +2474,41 @@ export function heartbeatService(db: Db) {
       const runningAgent = await db
         .update(agents)
         .set({ status: "running", updatedAt: new Date() })
-        .where(eq(agents.id, agent.id))
+        .where(
+          and(
+            eq(agents.id, agent.id),
+            notInArray(agents.status, ["paused", "terminated", "pending_approval"]),
+            sql`exists (
+              select 1
+              from ${companies}
+              where ${companies.id} = ${agents.companyId}
+                and ${companies.status} = 'active'
+            )`,
+          ),
+        )
         .returning()
         .then((rows) => rows[0] ?? null);
+
+      if (!runningAgent) {
+        const latestRun = await getRun(run.id);
+        if (latestRun?.status === "queued" || latestRun?.status === "running") {
+          if (!(await isCompanyActive(latestRun.companyId))) {
+            await cancelRunBecauseCompanyInactive(latestRun);
+          } else {
+            const cancelledRun = await setRunStatus(latestRun.id, "cancelled", {
+              finishedAt: new Date(),
+              error: "Cancelled because agent is not invokable",
+              errorCode: "agent_not_invokable",
+            });
+            await setWakeupStatus(latestRun.wakeupRequestId, "cancelled", {
+              finishedAt: new Date(),
+              error: "Cancelled because agent is not invokable",
+            });
+            if (cancelledRun) await releaseIssueExecutionAndPromote(cancelledRun);
+          }
+        }
+        return;
+      }
 
       if (runningAgent) {
         publishLiveEvent({
@@ -2750,6 +2941,20 @@ export function heartbeatService(db: Db) {
         outcome = "failed";
       }
 
+      if (
+        pendingHandoffId &&
+        (outcome === "succeeded" ||
+          adapterResult.exitCode !== null ||
+          adapterResult.signal !== null ||
+          adapterResult.timedOut)
+      ) {
+        try {
+          await markHandoffConsumed(db, pendingHandoffId);
+        } catch (err) {
+          logger.debug({ err, handoffId: pendingHandoffId }, "failed to mark handoff consumed");
+        }
+      }
+
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
         logSummary = await runLogStore.finalize(handle);
@@ -3039,7 +3244,7 @@ export function heartbeatService(db: Db) {
                 issueId: runIssueId,
                 sourceText,
               });
-              if ((questionResult.posted > 0 || questionResult.skippedExisting > 0) && latestUserFacingAgentMessage) {
+              if (latestUserFacingAgentMessage) {
                 await issueService(db).update(runIssueId, {
                   latestUserFacingAgentMessage,
                 });
@@ -3262,12 +3467,29 @@ export function heartbeatService(db: Db) {
           .where(eq(agents.id, deferred.agentId))
           .then((rows) => rows[0] ?? null);
 
+        const companyActive = await tx
+          .select({ id: companies.id })
+          .from(companies)
+          .where(and(eq(companies.id, issue.companyId), eq(companies.status, "active")))
+          .then((rows) => rows.length > 0);
+
+        if (!companyActive) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Deferred wake cancelled because company is not active",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
+
         if (
           !deferredAgent ||
           deferredAgent.companyId !== issue.companyId ||
-          deferredAgent.status === "paused" ||
-          deferredAgent.status === "terminated" ||
-          deferredAgent.status === "pending_approval"
+          !isAgentStatusInvokable(deferredAgent.status)
         ) {
           await tx
             .update(agentWakeupRequests)
@@ -3387,15 +3609,6 @@ export function heartbeatService(db: Db) {
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
 
-    if (
-      agent.status === "paused" ||
-      agent.status === "terminated" ||
-      agent.status === "pending_approval"
-    ) {
-      throw conflict("Agent is not invokable in its current state", { status: agent.status });
-    }
-
-    const policy = parseHeartbeatPolicy(agent);
     const writeSkippedRequest = async (reason: string) => {
       await db.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
@@ -3411,6 +3624,18 @@ export function heartbeatService(db: Db) {
         finishedAt: new Date(),
       });
     };
+
+    const companyStatus = await getCompanyStatus(agent.companyId);
+    if (companyStatus !== "active") {
+      await writeSkippedRequest(companyStatus ? `company.${companyStatus}` : "company.not_found");
+      return null;
+    }
+
+    if (!isAgentStatusInvokable(agent.status)) {
+      throw conflict("Agent is not invokable in its current state", { status: agent.status });
+    }
+
+    const policy = parseHeartbeatPolicy(agent);
 
     if (source === "timer" && !policy.enabled) {
       await writeSkippedRequest("heartbeat.disabled");
@@ -3964,7 +4189,11 @@ export function heartbeatService(db: Db) {
       let skipped = 0;
 
       for (const agent of allAgents) {
-        if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
+        if (!isAgentStatusInvokable(agent.status)) continue;
+        if (!(await isCompanyActive(agent.companyId))) {
+          skipped += 1;
+          continue;
+        }
         const policy = parseHeartbeatPolicy(agent);
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 
@@ -4062,6 +4291,55 @@ export function heartbeatService(db: Db) {
       }
 
       return runs.length;
+    },
+
+    cancelActiveForCompany: async (companyId: string, reason = "Cancelled because company is not active") => {
+      const now = new Date();
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running"])));
+
+      for (const run of runs) {
+        await setRunStatus(run.id, "cancelled", {
+          finishedAt: now,
+          error: reason,
+          errorCode: "company_not_active",
+        });
+
+        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+          finishedAt: now,
+          error: reason,
+        });
+
+        const running = runningProcesses.get(run.id);
+        if (running) {
+          running.child.kill("SIGTERM");
+          runningProcesses.delete(run.id);
+        }
+        await releaseIssueExecutionAndPromote(run);
+      }
+
+      const cancelledWakeups = await db
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          error: reason,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+
+      return {
+        cancelledRuns: runs.length,
+        cancelledWakeups: cancelledWakeups.length,
+      };
     },
 
     getActiveRunForAgent: async (agentId: string) => {

@@ -1,6 +1,6 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, approvals, companies, issuePullRequests, issues } from "@combyne/db";
+import { agents, approvals, companies, companyIntegrations, heartbeatRuns, issueComments, issuePullRequests, issues } from "@combyne/db";
 import { issuePullRequestService } from "../issue-pull-requests.js";
 import { startTestDb, stopTestDb, type TestDbHandle } from "./_test-db.js";
 
@@ -32,6 +32,9 @@ describe("issue pull request service", () => {
       })
       .returning();
     issueId = issue.id;
+    await handle.db
+      .insert(heartbeatRuns)
+      .values({ companyId, agentId, status: "running", invocationSource: "on_demand" });
   }, 60_000);
 
   afterAll(async () => {
@@ -100,5 +103,104 @@ describe("issue pull request service", () => {
       .from(approvals)
       .where(eq(approvals.id, first.approvalId!));
     expect((updatedApproval.payload as Record<string, unknown>).expectedHeadSha).toBe("def456");
+  });
+
+  it("dispatches changed PR feedback to the assignee idempotently", async () => {
+    const svc = issuePullRequestService(handle.db);
+    await handle.db
+      .insert(companyIntegrations)
+      .values({
+        companyId,
+        provider: "github",
+        enabled: "true",
+        config: {
+          baseUrl: "https://api.github.test",
+          owner: "combyne",
+          token: "test-token",
+          defaultRepo: "ade",
+        },
+      })
+      .onConflictDoNothing();
+
+    const pr = await svc.upsertForIssue({
+      companyId,
+      issueId,
+      requestedByAgentId: agentId,
+      repo: "ade",
+      pullNumber: 456,
+      pullUrl: "https://github.com/combyne/ade/pull/456",
+      title: "fix: review feedback",
+      baseBranch: "development",
+      headBranch: "fix/review-feedback",
+      headSha: "feed123",
+      mergeMethod: "squash",
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const href = String(url);
+      if (href.includes("/pulls/456/reviews")) {
+        return new Response(JSON.stringify([
+          {
+            id: 1,
+            user: { login: "reviewer" },
+            state: "CHANGES_REQUESTED",
+            body: "Please fix validation.",
+            submitted_at: "2026-05-06T00:00:00Z",
+          },
+        ]), { status: 200 });
+      }
+      if (href.includes("/commits/feed123/check-runs")) {
+        return new Response(JSON.stringify({ check_runs: [] }), { status: 200 });
+      }
+      if (href.includes("/pulls/456")) {
+        return new Response(JSON.stringify({
+          id: 456,
+          number: 456,
+          title: "fix: review feedback",
+          body: null,
+          state: "open",
+          draft: false,
+          user: { login: "engineer" },
+          head: { ref: "fix/review-feedback", sha: "feed123" },
+          base: { ref: "development" },
+          merged: false,
+          mergeable: true,
+          merge_commit_sha: null,
+          merged_at: null,
+          created_at: "2026-05-06T00:00:00Z",
+          updated_at: "2026-05-06T00:00:00Z",
+          html_url: "https://github.com/combyne/ade/pull/456",
+        }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    try {
+      const first = await svc.dispatchFeedbackToAssignee(pr.id, {
+        requestedByActorType: "system",
+        requestedByActorId: "test",
+      });
+      expect(first.sent).toBe(true);
+      expect(first.wakeRunId).toBeTruthy();
+
+      const comments = await handle.db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter((comment) => comment.body.includes("PR feedback for `ade#456`")).length).toBe(1);
+
+      const runs = await handle.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.some((run) => {
+        const context = run.contextSnapshot as Record<string, unknown> | null;
+        return context?.wakeReason === "pr_feedback" && context?.wakeCommentId;
+      })).toBe(true);
+
+      const second = await svc.dispatchFeedbackToAssignee(pr.id, {
+        requestedByActorType: "system",
+        requestedByActorId: "test",
+      });
+      expect(second.sent).toBe(false);
+      const deduped = await handle.db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(deduped.filter((comment) => comment.body.includes("PR feedback for `ade#456`")).length).toBe(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });

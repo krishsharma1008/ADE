@@ -38,6 +38,8 @@ import { PluginManager } from "./pages/PluginManager";
 import { PluginPage } from "./pages/PluginPage";
 import { PluginSettings } from "./pages/PluginSettings";
 import { InstanceSettings } from "./pages/InstanceSettings";
+import { InstanceGeneralSettings } from "./pages/InstanceGeneralSettings";
+import { InstanceExperimentalSettings } from "./pages/InstanceExperimentalSettings";
 import { CompanyExport } from "./pages/CompanyExport";
 import { CompanyImport } from "./pages/CompanyImport";
 import { ExecutionWorkspaceDetail } from "./pages/ExecutionWorkspaceDetail";
@@ -157,6 +159,9 @@ function boardRoutes() {
       <Route path="plugins/:pluginId" element={<PluginPage />} />
       <Route path="plugins/:pluginId/settings" element={<PluginSettings />} />
       <Route path="settings/instance" element={<InstanceSettings />} />
+      <Route path="settings/instance/heartbeats" element={<InstanceSettings />} />
+      <Route path="settings/instance/general" element={<InstanceGeneralSettings />} />
+      <Route path="settings/instance/experimental" element={<InstanceExperimentalSettings />} />
       <Route path="company/export" element={<CompanyExport />} />
       <Route path="company/export/*" element={<CompanyExport />} />
       <Route path="company/import" element={<CompanyImport />} />
@@ -253,16 +258,58 @@ export function App() {
 
         <Route element={<CloudAccessGate />}>
           <Route index element={<CompanyRootRedirect />} />
+          <Route path="docs" element={<Navigate to="/design-guide" replace />} />
+          <Route path="dashboard" element={<UnprefixedBoardRedirect />} />
           <Route path="companies" element={<UnprefixedBoardRedirect />} />
+          <Route path="company/settings" element={<UnprefixedBoardRedirect />} />
+          <Route path="integrations" element={<UnprefixedBoardRedirect />} />
+          <Route path="org" element={<UnprefixedBoardRedirect />} />
           <Route path="issues" element={<UnprefixedBoardRedirect />} />
+          <Route path="issues/all" element={<UnprefixedBoardRedirect />} />
+          <Route path="issues/active" element={<UnprefixedBoardRedirect />} />
+          <Route path="issues/backlog" element={<UnprefixedBoardRedirect />} />
+          <Route path="issues/done" element={<UnprefixedBoardRedirect />} />
+          <Route path="issues/recent" element={<UnprefixedBoardRedirect />} />
           <Route path="issues/:issueId" element={<UnprefixedBoardRedirect />} />
           <Route path="agents" element={<UnprefixedBoardRedirect />} />
+          <Route path="agents/all" element={<UnprefixedBoardRedirect />} />
+          <Route path="agents/active" element={<UnprefixedBoardRedirect />} />
+          <Route path="agents/paused" element={<UnprefixedBoardRedirect />} />
+          <Route path="agents/error" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/new" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/:agentId" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/:agentId/:tab" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/:agentId/runs/:runId" element={<UnprefixedBoardRedirect />} />
+          <Route path="goals" element={<UnprefixedBoardRedirect />} />
+          <Route path="goals/:goalId" element={<UnprefixedBoardRedirect />} />
+          <Route path="approvals" element={<UnprefixedBoardRedirect />} />
+          <Route path="approvals/pending" element={<UnprefixedBoardRedirect />} />
+          <Route path="approvals/all" element={<UnprefixedBoardRedirect />} />
+          <Route path="approvals/:approvalId" element={<UnprefixedBoardRedirect />} />
+          <Route path="costs" element={<UnprefixedBoardRedirect />} />
+          <Route path="activity" element={<UnprefixedBoardRedirect />} />
+          <Route path="inbox" element={<UnprefixedBoardRedirect />} />
+          <Route path="inbox/new" element={<UnprefixedBoardRedirect />} />
+          <Route path="inbox/all" element={<UnprefixedBoardRedirect />} />
+          <Route path="design-guide" element={<UnprefixedBoardRedirect />} />
+          <Route path="routines" element={<UnprefixedBoardRedirect />} />
+          <Route path="routines/:routineId" element={<UnprefixedBoardRedirect />} />
           <Route path="memory" element={<UnprefixedBoardRedirect />} />
           <Route path="qa" element={<UnprefixedBoardRedirect />} />
+          <Route path="skills" element={<UnprefixedBoardRedirect />} />
+          <Route path="skills/:skillId" element={<UnprefixedBoardRedirect />} />
+          <Route path="skills/:skillId/*" element={<UnprefixedBoardRedirect />} />
+          <Route path="plugins" element={<UnprefixedBoardRedirect />} />
+          <Route path="plugins/:pluginId" element={<UnprefixedBoardRedirect />} />
+          <Route path="plugins/:pluginId/settings" element={<UnprefixedBoardRedirect />} />
+          <Route path="settings/instance" element={<UnprefixedBoardRedirect />} />
+          <Route path="settings/instance/heartbeats" element={<UnprefixedBoardRedirect />} />
+          <Route path="settings/instance/general" element={<UnprefixedBoardRedirect />} />
+          <Route path="settings/instance/experimental" element={<UnprefixedBoardRedirect />} />
+          <Route path="company/export" element={<UnprefixedBoardRedirect />} />
+          <Route path="company/export/*" element={<UnprefixedBoardRedirect />} />
+          <Route path="company/import" element={<UnprefixedBoardRedirect />} />
+          <Route path="workspaces/:workspaceId" element={<UnprefixedBoardRedirect />} />
           <Route path="projects" element={<UnprefixedBoardRedirect />} />
           <Route path="projects/:projectId" element={<UnprefixedBoardRedirect />} />
           <Route path="projects/:projectId/overview" element={<UnprefixedBoardRedirect />} />

@@ -8,6 +8,7 @@ describe("heartbeat concurrency policy", () => {
   it("defaults coordinator roles to a small parallel delegation window", () => {
     expect(defaultMaxConcurrentRunsForAgent({ role: "ceo", permissions: {} })).toBe(3);
     expect(defaultMaxConcurrentRunsForAgent({ role: "pm", permissions: {} })).toBe(3);
+    expect(defaultMaxConcurrentRunsForAgent({ role: "em", permissions: {} })).toBe(3);
     expect(defaultMaxConcurrentRunsForAgent({ role: "manager", permissions: {} })).toBe(3);
   });
 
@@ -23,6 +24,21 @@ describe("heartbeat concurrency policy", () => {
         permissions: { canCreateAgents: true },
       }),
     ).toBe(3);
+  });
+
+  it("treats company-wide assignment permission as coordinator-style work", () => {
+    expect(
+      defaultMaxConcurrentRunsForAgent({
+        role: "engineer",
+        permissions: { canAssignTasks: true, taskAssignmentScope: "company" },
+      }),
+    ).toBe(3);
+    expect(
+      defaultMaxConcurrentRunsForAgent({
+        role: "engineer",
+        permissions: { canAssignTasks: true, taskAssignmentScope: "reports" },
+      }),
+    ).toBe(1);
   });
 
   it("respects explicit maxConcurrentRuns overrides", () => {

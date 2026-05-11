@@ -106,9 +106,12 @@ export const issuesApi = {
     api.delete<{ ok: true }>(`/issues/${id}/approvals/${approvalId}`),
   listPullRequests: (id: string) => api.get<IssuePullRequest[]>(`/issues/${id}/pull-requests`),
   reconcilePullRequest: (id: string) =>
-    api.post<IssuePullRequestStatus>(`/issue-pull-requests/${id}/reconcile`, {}),
+    api.post<{ status: IssuePullRequestStatus; sent: boolean; commentId: string | null; wakeRunId: string | null }>(
+      `/issue-pull-requests/${id}/reconcile`,
+      {},
+    ),
   wakePullRequestFeedback: (id: string) =>
-    api.post<{ status: IssuePullRequestStatus; sent: boolean; wakeRunId: string | null }>(
+    api.post<{ status: IssuePullRequestStatus; sent: boolean; commentId: string | null; wakeRunId: string | null }>(
       `/issue-pull-requests/${id}/wake-feedback`,
       {},
     ),

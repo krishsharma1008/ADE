@@ -14,6 +14,8 @@ const BOARD_ROUTE_ROOTS = new Set([
   "integrations",
   "design-guide",
   "routines",
+  "memory",
+  "qa",
   "skills",
   "plugins",
   "settings",
