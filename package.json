@@ -33,7 +33,8 @@
     "test:e2e:headed": "npx playwright test --config tests/e2e/playwright.config.ts --headed",
     "test:smoke": "npx playwright test --config tests/e2e/playwright.config.ts --grep @smoke",
     "test:regression": "npx playwright test --config tests/e2e/playwright.config.ts --grep @regression",
-    "audit:em-autonomy": "node scripts/em-autonomy-audit.mjs"
+    "audit:em-autonomy": "node scripts/em-autonomy-audit.mjs",
+    "audit:em-autonomy:wide-claude": "node scripts/em-autonomy-wide-claude-audit.mjs"
   },
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
