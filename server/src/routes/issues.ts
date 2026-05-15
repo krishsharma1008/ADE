@@ -3,6 +3,7 @@ import multer from "multer";
 import type { Db } from "@combyne/db";
 import {
   addIssueCommentSchema,
+  answerInternalQuestionSchema,
   createIssueAttachmentMetadataSchema,
   createIssueLabelSchema,
   checkoutIssueSchema,
@@ -21,6 +22,8 @@ import {
   issueService,
   logActivity,
   projectService,
+  answerInternalManagerQuestion,
+  routeAgentQuestionsToManager,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
@@ -38,6 +41,14 @@ const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
   "image/jpg",
   "image/webp",
   "image/gif",
+]);
+const USER_ESCALATION_CATEGORIES = new Set([
+  "credentials_access",
+  "approval_gate",
+  "destructive_action",
+  "budget_legal",
+  "product_decision",
+  "other_hard_blocker",
 ]);
 
 export function shouldCancelInFlightRunOnTerminalClose(input: {
@@ -585,6 +596,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       (updateFields as typeof updateFields & { blockedSource?: "human" | "agent" | "system"; blockedReason?: string | null }).blockedReason =
         commentBody?.slice(0, 1000) ?? existing.blockedReason ?? null;
     }
+    const actor = getActorInfo(req);
     if (req.actor.type === "agent" && updateFields.status === "awaiting_user") {
       const questions = commentBody ? extractQuestionsFromText(commentBody, 1) : [];
       if (questions.length === 0) {
@@ -594,8 +606,44 @@ export function issueRoutes(db: Db, storage: StorageService) {
         });
         return;
       }
+      if (actor.agentId) {
+        const routed = await routeAgentQuestionsToManager(db, {
+          companyId: existing.companyId,
+          issueId: existing.id,
+          askingAgentId: actor.agentId,
+          questions,
+          actor: {
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+          },
+        });
+        if (routed.routedToManager) {
+          await logActivity(db, {
+            companyId: existing.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "issue.internal_question_routed",
+            entityType: "issue",
+            entityId: existing.id,
+            details: {
+              routedToAgentId: routed.routedToAgentId,
+              routedCommentIds: routed.routedCommentIds,
+              source: "issue.update.awaiting_user",
+              requestedStatus: "awaiting_user",
+            },
+          });
+          res.json({
+            ...routed.issue,
+            routedToManager: true,
+            routedToAgentId: routed.routedToAgentId,
+            routedCommentId: routed.routedCommentIds[0] ?? null,
+          });
+          return;
+        }
+      }
     }
-    const actor = getActorInfo(req);
     let issue;
     try {
       issue = await svc.update(id, updateFields, {
@@ -862,6 +910,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
   router.post("/issues/:id/ask-user", async (req, res) => {
     const id = req.params.id as string;
     const question = typeof req.body?.question === "string" ? req.body.question.trim() : "";
+    const escalationCategory =
+      typeof req.body?.escalationCategory === "string" ? req.body.escalationCategory.trim() : null;
+    if (escalationCategory && !USER_ESCALATION_CATEGORIES.has(escalationCategory)) {
+      res.status(400).json({ error: "Invalid escalationCategory" });
+      return;
+    }
     const rawChoices = req.body?.choices;
     const choices = Array.isArray(rawChoices)
       ? rawChoices
@@ -883,6 +937,42 @@ export function issueRoutes(db: Db, storage: StorageService) {
     const actor = getActorInfo(req);
     if (actor.actorType !== "agent" || !actor.agentId) {
       res.status(403).json({ error: "Only agents may ask the user via this endpoint" });
+      return;
+    }
+
+    const routed = await routeAgentQuestionsToManager(db, {
+      companyId: issue.companyId,
+      issueId: issue.id,
+      askingAgentId: actor.agentId,
+      questions: [question],
+      choices: choices && choices.length > 0 ? choices : null,
+      actor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+      },
+    });
+    if (routed.routedToManager) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.internal_question_routed",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          routedToAgentId: routed.routedToAgentId,
+          routedCommentIds: routed.routedCommentIds,
+          source: "issue.ask_user",
+        },
+      });
+      res.status(202).json({
+        issue: routed.issue,
+        routedToManager: true,
+        routedToAgentId: routed.routedToAgentId,
+        routedCommentId: routed.routedCommentIds[0] ?? null,
+      });
       return;
     }
 
@@ -910,10 +1000,17 @@ export function issueRoutes(db: Db, storage: StorageService) {
       details: {
         commentId: comment.id,
         bodySnippet: question.slice(0, 200),
+        escalationCategory,
       },
     });
 
-    res.status(201).json({ comment, issue: updated ?? issue });
+    res.status(201).json({
+      comment,
+      issue: updated ?? issue,
+      routedToManager: false,
+      routedToAgentId: null,
+      routedCommentId: null,
+    });
   });
 
   router.post("/issues/:id/answer-question", async (req, res) => {
@@ -984,6 +1081,62 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
     res.status(201).json({ comment: answerComment, issue: updated, remainingOpenQuestions: remaining });
   });
+
+  router.post(
+    "/issues/:id/internal-questions/:commentId/answer",
+    validate(answerInternalQuestionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const commentId = req.params.commentId as string;
+      const issue = await svc.getById(id);
+      if (!issue) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, issue.companyId);
+
+      const actor = getActorInfo(req);
+      const result = await answerInternalManagerQuestion(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        questionCommentId: commentId,
+        answer: req.body.answer,
+        assumption: req.body.assumption === true,
+        actor: {
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+        },
+      });
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.internal_question_answered",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          questionCommentId: commentId,
+          answerCommentId: result.answerComment.id,
+          assumption: req.body.assumption === true,
+          remainingOpenQuestions: result.remainingOpen,
+          wakeRunId: result.wakeRunId,
+        },
+      });
+
+      res.status(201).json({
+        issue: result.issue,
+        questionComment: result.questionComment,
+        answerComment: result.answerComment,
+        remainingOpenQuestions: result.remainingOpen,
+        wakeRunId: result.wakeRunId,
+      });
+    },
+  );
 
   router.post("/issues/:id/delegate", async (req, res) => {
     const parentId = req.params.id as string;

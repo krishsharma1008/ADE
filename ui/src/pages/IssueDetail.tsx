@@ -13,6 +13,12 @@ import { useCompany } from "../context/CompanyContext";
 import { usePanel } from "../context/PanelContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
+import {
+  blockedIssueDescription,
+  blockedIssueTitle,
+  isOpenManagerQuestion,
+  isUserFacingQuestion,
+} from "../lib/issue-comments";
 import { useProjectOrder } from "../hooks/useProjectOrder";
 import { relativeTime, cn, formatTokens } from "../lib/utils";
 import { InlineEditor } from "../components/InlineEditor";
@@ -584,11 +590,30 @@ export function IssueDetail() {
     },
   });
 
+  const answerInternalQuestion = useMutation({
+    mutationFn: ({
+      commentId,
+      answer,
+      assumption,
+    }: {
+      commentId: string;
+      answer: string;
+      assumption: boolean;
+    }) => issuesApi.answerInternalQuestion(issueId!, commentId, { answer, assumption }),
+    onSuccess: () => {
+      invalidateIssue();
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
+    },
+  });
+
   const openQuestions = useMemo(
     () =>
-      (comments ?? []).filter(
-        (c) => c.kind === "question" && !c.answeredAt,
-      ),
+      (comments ?? []).filter(isUserFacingQuestion),
+    [comments],
+  );
+  const openManagerQuestions = useMemo(
+    () => (comments ?? []).filter(isOpenManagerQuestion),
     [comments],
   );
 
@@ -946,13 +971,10 @@ export function IssueDetail() {
           <HelpCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
             <div className="font-medium">
-              {issue.blockedSource === "human" ? "Blocked by board/user" : "Blocked"}
+              {blockedIssueTitle(issue, openManagerQuestions.length)}
             </div>
             <div className="text-xs opacity-80">
-              {issue.blockedSource === "human"
-                ? "Agent timers and normal assignment wakes will skip this issue until a human comment or status change reopens it."
-                : "This issue is blocked by the agent or system and should be reviewed before resuming."}
-              {issue.blockedReason ? ` Reason: ${issue.blockedReason}` : ""}
+              {blockedIssueDescription(issue, openManagerQuestions.length)}
             </div>
           </div>
         </div>
@@ -1299,6 +1321,9 @@ export function IssueDetail() {
             }}
             liveRunSlot={<LiveRunWidget issueId={issueId!} companyId={issue.companyId} />}
             onOpenPromptHistory={(runId) => setPromptHistoryRunId(runId)}
+            onAnswerInternalQuestion={(commentId, answer, assumption) =>
+              answerInternalQuestion.mutateAsync({ commentId, answer, assumption }).then(() => undefined)
+            }
           />
         </TabsContent>
 

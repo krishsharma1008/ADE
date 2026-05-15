@@ -308,9 +308,9 @@ function buildCoordinatorGuidance(agent: {
     "## Coordinator execution guidance",
     "",
     "- Default to hands-off execution for small tasks. Do not wait for a human nudge after child/reviewer/QA feedback.",
-    "- If a child agent asks a question and the answer is available from parent issue context, comments, QA/review feedback, repo state, or company memory, answer or route it yourself and wake the relevant assignee.",
+    "- If a child agent asks a question and the answer is available from parent issue context, comments, QA/review feedback, repo state, or company memory, answer it yourself with `POST /api/issues/{issueId}/internal-questions/{commentId}/answer` and body `{ \"answer\": \"...\", \"assumption\": true }` when you are choosing a reasonable default.",
+    "- Answer internal child questions before escalating. Escalate to the human only for credentials/access, approval gates, destructive actions, budget/legal risk, or a true product/business decision with no reasonable default.",
     "- Parallelize independent work across available agents, but keep same-issue code changes serialized by the issue execution lock.",
-    "- Ask the user only for genuinely missing product/business decisions or credentials that are not present in context.",
     "- Before push/merge, verify child issues, review feedback, QA feedback, and open questions are closed or explicitly assigned.",
   ].join("\n");
 }
@@ -2240,6 +2240,24 @@ export function heartbeatService(db: Db) {
           .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null);
         focusIssueBody = focusRow?.description ?? null;
+        const managerQuestionBody = readNonEmptyString(context.managerQuestionBody);
+        const managerAnswerBody = readNonEmptyString(context.managerAnswerBody);
+        const managerAction = readNonEmptyString(context.recommendedNextAction);
+        const internalContextLines: string[] = [];
+        if (managerQuestionBody) {
+          internalContextLines.push("## Internal manager question", managerQuestionBody);
+        }
+        if (managerAnswerBody) {
+          internalContextLines.push("## Manager answer / assumption", managerAnswerBody);
+        }
+        if (managerAction) {
+          internalContextLines.push("## Recommended next action", managerAction);
+        }
+        if (internalContextLines.length > 0) {
+          focusIssueBody = [focusIssueBody, internalContextLines.join("\n\n")]
+            .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
+            .join("\n\n");
+        }
       }
 
       const queue =
@@ -3244,7 +3262,7 @@ export function heartbeatService(db: Db) {
                 issueId: runIssueId,
                 sourceText,
               });
-              if (latestUserFacingAgentMessage) {
+              if (latestUserFacingAgentMessage && !questionResult.routedToManager) {
                 await issueService(db).update(runIssueId, {
                   latestUserFacingAgentMessage,
                 });

@@ -813,7 +813,7 @@ export function issueService(db: Db) {
             .where(
               and(
                 eq(issueComments.issueId, id),
-                eq(issueComments.kind, "question"),
+                inArray(issueComments.kind, ["question", "manager_question"]),
                 isNull(issueComments.answeredAt),
               ),
             );

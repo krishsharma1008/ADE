@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState, type ChangeEvent } from "re
 import { Link, useLocation } from "react-router-dom";
 import type { IssueComment, Agent } from "@combyne/shared";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import { Check, Copy, Paperclip } from "lucide-react";
 import { Identity } from "./Identity";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
@@ -10,6 +11,7 @@ import { MarkdownEditor, type MarkdownEditorRef, type MentionOption } from "./Ma
 import { StatusBadge } from "./StatusBadge";
 import { AgentIcon } from "./AgentIconPicker";
 import { formatDateTime } from "../lib/utils";
+import { timelineCommentLabel } from "../lib/issue-comments";
 
 interface CommentWithRunMeta extends IssueComment {
   runId?: string | null;
@@ -45,6 +47,7 @@ interface CommentThreadProps {
   currentAssigneeValue?: string;
   mentions?: MentionOption[];
   onOpenPromptHistory?: (runId: string) => void;
+  onAnswerInternalQuestion?: (commentId: string, answer: string, assumption: boolean) => Promise<void>;
 }
 
 const CLOSED_STATUSES = new Set(["done", "cancelled"]);
@@ -112,6 +115,80 @@ function CopyMarkdownButton({ text }: { text: string }) {
   );
 }
 
+function InternalQuestionAnswerAction({
+  comment,
+  onAnswer,
+}: {
+  comment: CommentWithRunMeta;
+  onAnswer?: (commentId: string, answer: string, assumption: boolean) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [answer, setAnswer] = useState("");
+  const [assumption, setAssumption] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!onAnswer || comment.kind !== "manager_question" || comment.answeredAt) return null;
+
+  const trimmed = answer.trim();
+
+  const submit = async () => {
+    if (!trimmed) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onAnswer(comment.id, trimmed, assumption);
+      setAnswer("");
+      setAssumption(true);
+      setOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to answer internal blocker");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <div className="mt-2">
+        <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+          Answer internally
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 rounded-md border border-border bg-muted/30 p-2.5 space-y-2">
+      <div className="text-xs font-medium text-muted-foreground">EM/manager answer</div>
+      <Textarea
+        value={answer}
+        onChange={(event) => setAnswer(event.target.value)}
+        placeholder="Answer from context, or document the default the child agent should use."
+        className="min-h-20 text-sm"
+      />
+      <label className="flex items-center gap-2 text-xs text-muted-foreground">
+        <input
+          type="checkbox"
+          checked={assumption}
+          onChange={(event) => setAssumption(event.target.checked)}
+          className="h-3.5 w-3.5 rounded border-border"
+        />
+        This is a documented assumption
+      </label>
+      {error && <div className="text-xs text-destructive">{error}</div>}
+      <div className="flex justify-end gap-2">
+        <Button variant="ghost" size="sm" onClick={() => setOpen(false)} disabled={submitting}>
+          Cancel
+        </Button>
+        <Button size="sm" onClick={submit} disabled={!trimmed || submitting}>
+          {submitting ? "Answering..." : "Answer & resume"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 type TimelineItem =
   | { kind: "comment"; id: string; createdAtMs: number; comment: CommentWithRunMeta }
   | { kind: "run"; id: string; createdAtMs: number; run: LinkedRunItem };
@@ -121,11 +198,13 @@ const TimelineList = memo(function TimelineList({
   agentMap,
   highlightCommentId,
   onOpenPromptHistory,
+  onAnswerInternalQuestion,
 }: {
   timeline: TimelineItem[];
   agentMap?: Map<string, Agent>;
   highlightCommentId?: string | null;
   onOpenPromptHistory?: (runId: string) => void;
+  onAnswerInternalQuestion?: (commentId: string, answer: string, assumption: boolean) => Promise<void>;
 }) {
   if (timeline.length === 0) {
     return <p className="text-sm text-muted-foreground">No comments or runs yet.</p>;
@@ -175,6 +254,7 @@ const TimelineList = memo(function TimelineList({
 
         const comment = item.comment;
         const isHighlighted = highlightCommentId === comment.id;
+        const label = timelineCommentLabel(comment);
         return (
           <div
             key={comment.id}
@@ -203,6 +283,12 @@ const TimelineList = memo(function TimelineList({
               </span>
             </div>
             <MarkdownBody className="text-sm">{comment.body}</MarkdownBody>
+            {label && (
+              <div className="mt-2 inline-flex rounded border border-border bg-accent/40 px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                {label}
+              </div>
+            )}
+            <InternalQuestionAnswerAction comment={comment} onAnswer={onAnswerInternalQuestion} />
             {comment.runId && (
               <div className="mt-2 pt-2 border-t border-border/60">
                 {comment.runAgentId ? (
@@ -241,6 +327,7 @@ export function CommentThread({
   currentAssigneeValue = "",
   mentions: providedMentions,
   onOpenPromptHistory,
+  onAnswerInternalQuestion,
 }: CommentThreadProps) {
   const [body, setBody] = useState("");
   const [reopen, setReopen] = useState(true);
@@ -371,6 +458,7 @@ export function CommentThread({
         agentMap={agentMap}
         highlightCommentId={highlightCommentId}
         onOpenPromptHistory={onOpenPromptHistory}
+        onAnswerInternalQuestion={onAnswerInternalQuestion}
       />
 
       {liveRunSlot}

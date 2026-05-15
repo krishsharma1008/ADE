@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { MemoryEntry, MemoryKind, MemoryStatus, UpdateMemoryEntry } from "@combyne/shared";
 import { Brain, Check, Edit2, GitPullRequest, Search, X } from "lucide-react";
@@ -14,6 +14,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { EmptyState } from "@/components/EmptyState";
+import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { memoryApi } from "../api/memory";
 import { queryKeys } from "../lib/queryKeys";
@@ -66,11 +67,16 @@ function payloadFromDraft(draft: MemoryDraft): UpdateMemoryEntry {
 }
 
 export function CompanyMemory() {
+  const { setBreadcrumbs } = useBreadcrumbs();
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
   const [query, setQuery] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<MemoryDraft | null>(null);
+
+  useEffect(() => {
+    setBreadcrumbs([{ label: "Memory" }]);
+  }, [setBreadcrumbs]);
 
   const workspaceQuery = useQuery({
     queryKey: queryKeys.memory.entries(selectedCompanyId!, "workspace"),

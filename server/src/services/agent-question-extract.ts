@@ -2,6 +2,7 @@ import { and, eq, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { issueComments, issues } from "@combyne/db";
 import { logger } from "../middleware/logger.js";
+import { routeAgentQuestionsToManager } from "./agent-question-routing.js";
 
 export interface ExtractedQuestionSource {
   companyId: string;
@@ -19,6 +20,9 @@ export interface ExtractedQuestionsResult {
   skippedDuplicates: number;
   skippedExisting: number;
   statusTransitioned: boolean;
+  routedToManager?: boolean;
+  routedToAgentId?: string | null;
+  routedCommentIds?: string[];
 }
 
 const DEFAULT_MAX_QUESTIONS = 10;
@@ -274,6 +278,31 @@ export async function extractAndPostQuestions(
     (TERMINAL_ISSUE_STATUSES as readonly string[]).includes(currentIssue.status)
   ) {
     return { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false };
+  }
+
+  const managerRoute = await routeAgentQuestionsToManager(db, {
+    companyId: input.companyId,
+    issueId: input.issueId,
+    askingAgentId: input.agentId,
+    questions: extracted,
+    actor: { actorType: "agent", actorId: input.agentId },
+  }).catch((err) => {
+    logger.warn(
+      { err, issueId: input.issueId, agentId: input.agentId },
+      "question-extractor: failed to route question to manager",
+    );
+    return null;
+  });
+  if (managerRoute?.routedToManager) {
+    return {
+      posted: managerRoute.routedCommentIds.length,
+      skippedDuplicates: 0,
+      skippedExisting: Math.max(0, extracted.length - managerRoute.routedCommentIds.length),
+      statusTransitioned: managerRoute.issue.status === "blocked",
+      routedToManager: true,
+      routedToAgentId: managerRoute.routedToAgentId,
+      routedCommentIds: managerRoute.routedCommentIds,
+    };
   }
 
   // Dedupe against already-open question comments on this issue so a

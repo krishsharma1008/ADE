@@ -138,6 +138,24 @@ Expected:
 - `/api/health` returns `{"status":"ok"}`
 - `/api/companies` returns a JSON array
 
+## EM Autonomy Audit
+
+To create an isolated company, copy the local Buku lending repos from `HEAD`, and run the repeatable EM autonomy scenarios:
+
+```sh
+pnpm audit:em-autonomy
+```
+
+Useful flags:
+
+- `--api-url http://127.0.0.1:3100/api`
+- `--root /tmp/combyne-em-autonomy-audit`
+- `--bnpl /path/to/fs-bnpl-service`
+- `--brick /path/to/fs-brick-service`
+- `--quality-checks` to run Gradle task discovery in the copied workspaces
+
+The script writes `em-autonomy-audit-report.md` and `.json` in the audit root. It never edits the original Buku repos.
+
 ## Reset Local Dev Database
 
 To wipe local dev data and start fresh:

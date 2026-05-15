@@ -9,6 +9,12 @@ export { issueService, type IssueFilters } from "./issues.js";
 export { issueApprovalService } from "./issue-approvals.js";
 export { issuePlanService } from "./issue-plans.js";
 export { issuePullRequestService } from "./issue-pull-requests.js";
+export {
+  answerInternalManagerQuestion,
+  isCoordinatorAgent,
+  routeAgentQuestionsToManager,
+  type AgentQuestionRouteResult,
+} from "./agent-question-routing.js";
 export { goalService } from "./goals.js";
 export { activityService, type ActivityFilters } from "./activity.js";
 export { approvalService } from "./approvals.js";

@@ -228,6 +228,13 @@ Invariants:
 - `author_user_id` uuid fk `users.id` null
 - `body` text not null
 
+Agent question routing:
+
+- delegated sub-agent questions default to internal `manager_question` comments, not user-facing `question` comments
+- internal questions set the child issue to `blocked` with `blocked_source='agent'` and wake the parent assignee, manager chain, or company coordinator
+- `manager_answer` comments resolve internal questions and wake the child assignee with the same task-scoped session context
+- EM/manager/coordinator agents may still create user-facing questions for hard blockers; no-manager fallback keeps the existing `awaiting_user` flow to avoid deadlock
+
 ## 7.8 `heartbeat_runs`
 
 - `id` uuid pk

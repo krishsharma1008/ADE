@@ -37,6 +37,7 @@ type ChildHandoffDigest = {
     excerpt: string;
   }>;
   openQuestions: string[];
+  internalQuestions: string[];
   qaFeedback: Array<{
     feedbackId: string;
     status: string;
@@ -66,11 +67,14 @@ function statusPhrase(status: string) {
 
 function buildRecommendedNextAction(
   child: IssueLike,
-  input: Pick<ChildHandoffDigest, "openQuestions" | "qaFeedback" | "latestComments">,
+  input: Pick<ChildHandoffDigest, "openQuestions" | "internalQuestions" | "qaFeedback" | "latestComments">,
   wakeReason: string,
 ) {
+  if (input.internalQuestions.length > 0) {
+    return "Answer the internal child question from available context or make a reasonable documented assumption, then wake the child assignee. Escalate to the human only for credentials/access, approval gates, destructive actions, budget/legal risk, or a true product decision with no reasonable default.";
+  }
   if (input.openQuestions.length > 0 || child.status === "awaiting_user") {
-    return "Resolve or route the open question from the child issue. If the answer is available from parent/child context, answer it yourself and wake the child assignee; ask a human only for a genuinely missing product decision.";
+    return "Resolve or route the open question from the child issue. If the answer is available from parent/child context, comments, QA/review feedback, repo state, or company memory, answer it yourself and wake the child assignee; ask a human only for a hard blocker.";
   }
   if (child.status === "blocked") {
     return "Review the blocker from the child issue, unblock or reassign the next fix, and keep the parent moving without waiting for a manual reminder.";
@@ -118,6 +122,20 @@ async function buildChildHandoffDigest(
         eq(issueComments.companyId, input.child.companyId),
         eq(issueComments.issueId, input.child.id),
         eq(issueComments.kind, "question"),
+        isNull(issueComments.answeredAt),
+      ),
+    )
+    .orderBy(desc(issueComments.createdAt))
+    .limit(5);
+
+  const internalQuestionRows = await db
+    .select({ body: issueComments.body })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.companyId, input.child.companyId),
+        eq(issueComments.issueId, input.child.id),
+        eq(issueComments.kind, "manager_question"),
         isNull(issueComments.answeredAt),
       ),
     )
@@ -190,6 +208,7 @@ async function buildChildHandoffDigest(
       : null,
     latestComments: latestComments.slice(0, 5),
     openQuestions: openQuestionRows.map((row) => compactText(row.body)).filter(Boolean),
+    internalQuestions: internalQuestionRows.map((row) => compactText(row.body)).filter(Boolean),
     qaFeedback: qaFeedbackRows.map((row) => ({
       feedbackId: row.id,
       status: row.status,
@@ -214,6 +233,7 @@ function renderParentHandoffComment(digest: ChildHandoffDigest) {
   lines.push(`- Status: \`${digest.childStatus}\``);
   lines.push(`- Assignee: ${digest.assignee?.name ?? "Unassigned"}`);
   lines.push(`- Open questions: ${digest.openQuestions.length}`);
+  lines.push(`- Internal EM/manager questions: ${digest.internalQuestions.length}`);
   lines.push(`- QA/review feedback items: ${digest.qaFeedback.length}`);
 
   if (digest.qaFeedback.length > 0) {
@@ -226,6 +246,11 @@ function renderParentHandoffComment(digest: ChildHandoffDigest) {
   if (digest.openQuestions.length > 0) {
     lines.push("", "### Open questions");
     for (const question of digest.openQuestions) lines.push(`- ${question}`);
+  }
+
+  if (digest.internalQuestions.length > 0) {
+    lines.push("", "### Internal EM/manager questions");
+    for (const question of digest.internalQuestions) lines.push(`- ${question}`);
   }
 
   if (digest.latestComments.length > 0) {

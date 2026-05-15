@@ -50,7 +50,7 @@ export interface LoadAssignedQueueOptions {
   includeReviewIssues?: boolean;
 }
 
-const FOCUS_BODY_TRUNCATE = 512;
+const FOCUS_BODY_TRUNCATE = 2400;
 const FOCUSED_TIMER_STATUSES = ["todo", "in_progress", "in_review"] as const;
 
 function renderDigestLine(item: AssignedIssueSummary): string {
