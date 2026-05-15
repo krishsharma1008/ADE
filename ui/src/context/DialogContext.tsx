@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useState, type ReactNode } from
 
 interface NewIssueDefaults {
   status?: string;
+  complexity?: string;
   priority?: string;
   projectId?: string;
   assigneeAgentId?: string;

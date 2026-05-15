@@ -91,6 +91,7 @@ export const issuesApi = {
       toAgentId: string;
       title: string;
       description?: string;
+      complexity?: "small" | "medium" | "large";
       priority?: string;
       labelIds?: string[];
     },

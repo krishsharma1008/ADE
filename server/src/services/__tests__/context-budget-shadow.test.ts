@@ -125,6 +125,24 @@ describe("resolveContextBudgetTokens", () => {
     ).toBe(50_000);
   });
 
+  it("uses focused Claude budgets from issue complexity context policy", () => {
+    expect(
+      resolveContextBudgetTokens("claude-local", {}, {
+        combyneContextPolicy: { contextProfile: "focused_small", issueComplexity: "small" },
+      }),
+    ).toBe(12_000);
+    expect(
+      resolveContextBudgetTokens("claude-local", {}, {
+        combyneContextPolicy: { contextProfile: "coordinator", issueComplexity: "medium" },
+      }),
+    ).toBe(32_000);
+    expect(
+      resolveContextBudgetTokens("claude-local", {}, {
+        combyneContextPolicy: { contextProfile: "coordinator", issueComplexity: "large" },
+      }),
+    ).toBe(48_000);
+  });
+
   it("reads COMBYNE_<ADAPTER>_CONTEXT_BUDGET_TOKENS from env as fallback", () => {
     const original = process.env.COMBYNE_GEMINI_LOCAL_CONTEXT_BUDGET_TOKENS;
     try {
@@ -292,6 +310,25 @@ describe("composeAndApplyBudget", () => {
     expect(nextWorking.length).toBeLessThan(working.length);
     expect(nextRecentTurns.length).toBeLessThan(recentTurns.length);
     expect(nextToolResults.length).toBeLessThan(toolResults.length);
+  });
+
+  it("applies the focused_small 12k budget to actual context composition", () => {
+    const context: Record<string, unknown> = {
+      combyneContextPolicy: { contextProfile: "focused_small", issueComplexity: "small" },
+      combyneFocusDirective: { body: "FOCUS " + "small task detail ".repeat(1000), directive: "stay" },
+      combyneWorkingSummary: { body: "working summary ".repeat(1000) },
+      combyneStandingSummary: { body: "standing memory ".repeat(20_000) },
+    };
+
+    const out = composeAndApplyBudget(context, {
+      adapterType: "claude-local",
+      adapterConfig: {},
+      model: "claude-sonnet-4-6",
+    });
+
+    expect(out).not.toBeNull();
+    expect(out!.composed.totalTokens).toBeLessThanOrEqual(12_000);
+    expect(out!.composed.dropped.includes("standing") || out!.composed.truncated.includes("standing")).toBe(true);
   });
 
   it("deletes combyneFocusDirective when the focus section was dropped wholesale", () => {

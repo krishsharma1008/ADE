@@ -202,6 +202,7 @@ Invariant: at least one root `company` level goal per company.
 - `title` text not null
 - `description` text null
 - `status` enum: `backlog | todo | in_progress | in_review | done | blocked | cancelled`
+- `complexity` enum nullable for legacy rows: `small | medium | large`; API/UI-created issues default to `small`, and legacy/null rows resolve from S/M/L labels/title prefixes before falling back to `medium`
 - `priority` enum: `critical | high | medium | low`
 - `assignee_agent_id` uuid fk `agents.id` null
 - `created_by_agent_id` uuid fk `agents.id` null
@@ -218,6 +219,9 @@ Invariants:
 - task must trace to company goal chain via `goal_id`, `parent_id`, or project-goal linkage
 - `in_progress` requires assignee
 - terminal states: `done | cancelled`
+- issue-scoped wakes atomically move assigned `backlog`/`todo` work to `in_progress` and bind `execution_run_id`
+- clean successful `small` issue runs auto-close when no user/internal questions, child issues, QA feedback, or review feedback remain
+- coordinator-owned `medium`/`large` issues require delegated child work and verification evidence before completion; successful runs without child issues stay `in_progress` and wake the coordinator with a delegation-required system comment
 
 ## 7.7 `issue_comments`
 

@@ -234,4 +234,46 @@ describe("issue internal question routes", () => {
         run.sessionIdBefore === "route-session-child";
     })).toBe(true);
   });
+
+  it("wakes the existing assignee when an assigned issue is reopened by status update", async () => {
+    const [issue] = await handle.db
+      .insert(issues)
+      .values({
+        companyId,
+        title: "Reopened child work",
+        status: "done",
+        assigneeAgentId: devId,
+      })
+      .returning();
+
+    const res = await request(app)
+      .patch(`/api/issues/${issue.id}`)
+      .send({
+        status: "todo",
+        comment: "Reviewer found a missing nullable default. Please finish the same issue.",
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("todo");
+
+    const comment = await handle.db
+      .select()
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issue.id), eq(issueComments.kind, "comment")))
+      .then((rows) => rows.find((row) => row.body.includes("missing nullable default")));
+    expect(comment?.id).toBeTruthy();
+
+    const childRuns = await handle.db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, devId));
+    expect(childRuns.some((run) => {
+      const context = run.contextSnapshot as Record<string, unknown> | null;
+      return context?.issueId === issue.id &&
+        context?.wakeReason === "issue_reopened" &&
+        context?.wakeCommentId === comment?.id &&
+        context?.previousStatus === "done" &&
+        context?.nextStatus === "todo";
+    })).toBe(true);
+  });
 });

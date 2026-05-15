@@ -327,6 +327,32 @@ async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
   return null;
 }
 
+async function ensureCombyneWorktreeParentExcluded(repoRoot: string, worktreeParentDir: string) {
+  const relativeParent = path.relative(repoRoot, worktreeParentDir).replace(/\\/g, "/");
+  if (
+    relativeParent.length === 0 ||
+    relativeParent.startsWith("..") ||
+    path.isAbsolute(relativeParent) ||
+    !relativeParent.split("/").includes(".combyne-ai")
+  ) {
+    return;
+  }
+
+  const gitCommonDir = await runGit(["rev-parse", "--git-common-dir"], repoRoot).catch(() => null);
+  if (!gitCommonDir) return;
+  const resolvedGitCommonDir = path.isAbsolute(gitCommonDir)
+    ? gitCommonDir
+    : path.resolve(repoRoot, gitCommonDir);
+  const infoDir = path.join(resolvedGitCommonDir, "info");
+  const excludePath = path.join(infoDir, "exclude");
+  const excludeEntry = ".combyne-ai/";
+  await fs.mkdir(infoDir, { recursive: true });
+  const existing = await fs.readFile(excludePath, "utf8").catch(() => "");
+  if (existing.split(/\r?\n/).some((line) => line.trim() === excludeEntry)) return;
+  const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+  await fs.writeFile(excludePath, `${existing}${prefix}${excludeEntry}\n`, "utf8");
+}
+
 async function directoryExists(value: string) {
   return fs.stat(value).then((stats) => stats.isDirectory()).catch(() => false);
 }
@@ -639,6 +665,7 @@ export async function realizeExecutionWorkspace(input: {
     ?? "HEAD";
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
+  await ensureCombyneWorktreeParentExcluded(repoRoot, worktreeParentDir);
 
   const existingWorktree = await directoryExists(worktreePath);
   if (existingWorktree) {

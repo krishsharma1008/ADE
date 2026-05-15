@@ -11,6 +11,7 @@ import {
   issueLabels,
   issueComments,
   issueReadStates,
+  issueWorkProducts,
   issues,
   labels,
   projectWorkspaces,
@@ -19,6 +20,7 @@ import {
 import { extractProjectMentionIds } from "@combyne/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { createHandoff } from "./agent-handoff.js";
+import { resolveIssueComplexity } from "./issue-complexity.js";
 import { notifyParentOnChildStatus } from "./issue-parent-notifications.js";
 
 const ALL_ISSUE_STATUSES = [
@@ -31,6 +33,10 @@ const ALL_ISSUE_STATUSES = [
   "done",
   "cancelled",
 ];
+
+const COORDINATOR_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
+const CHILD_TERMINAL_STATUSES = new Set(["done", "cancelled"]);
+const VERIFICATION_COMMENT_RE = /\b(verified|verification|reviewed|qa passed|checks? passed|tests? passed|validated)\b/i;
 
 function assertTransition(from: string, to: string) {
   if (from === to) return;
@@ -343,6 +349,75 @@ function withActiveRuns(
 }
 
 export function issueService(db: Db) {
+  async function assigneeHasCoordinatorAuthority(agentId: string | null | undefined): Promise<boolean> {
+    if (!agentId) return false;
+    const assignee = await db
+      .select({ role: agents.role, permissions: agents.permissions })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    if (!assignee) return false;
+    const role = assignee.role.trim().toLowerCase();
+    const permissions =
+      assignee.permissions && typeof assignee.permissions === "object"
+        ? (assignee.permissions as Record<string, unknown>)
+        : {};
+    return (
+      COORDINATOR_ROLES.has(role) ||
+      permissions.canCreateAgents === true ||
+      (permissions.canAssignTasks === true && permissions.taskAssignmentScope === "company")
+    );
+  }
+
+  async function hasDelegationVerificationEvidence(issueId: string): Promise<boolean> {
+    const workProduct = await db
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(and(eq(issueWorkProducts.issueId, issueId), ne(issueWorkProducts.status, "cancelled")))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (workProduct) return true;
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))
+      .orderBy(desc(issueComments.createdAt))
+      .limit(25);
+    return comments.some((comment) => VERIFICATION_COMMENT_RE.test(comment.body));
+  }
+
+  async function assertDelegationPolicyAllowsCompletion(
+    issue: IssueRow,
+    nextComplexity?: unknown,
+  ): Promise<void> {
+    if (issue.originKind === "routine_execution" || issue.originKind === "terminal_session") return;
+    const labelsForIssue = await labelMapForIssues(db, [issue.id]);
+    const complexity = resolveIssueComplexity({
+      complexity: nextComplexity ?? issue.complexity,
+      title: issue.title,
+      labels: labelsForIssue.get(issue.id) ?? [],
+    });
+    if (complexity === "small") return;
+    const coordinatorOwned = await assigneeHasCoordinatorAuthority(issue.assigneeAgentId);
+    if (!coordinatorOwned) return;
+
+    const childRows = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(eq(issues.parentId, issue.id));
+    if (childRows.length === 0) {
+      throw conflict("Medium/large coordinator issues require delegated child issues before completion.");
+    }
+    const openChild = childRows.find((child) => !CHILD_TERMINAL_STATUSES.has(child.status));
+    if (openChild) {
+      throw conflict("Medium/large coordinator issues cannot complete while delegated child issues are still open.");
+    }
+    if (!(await hasDelegationVerificationEvidence(issue.id))) {
+      throw conflict("Medium/large coordinator issues require a verification comment or work product before completion.");
+    }
+  }
+
   async function assertAssignableAgent(companyId: string, agentId: string) {
     const assignee = await db
       .select({
@@ -767,6 +842,9 @@ export function issueService(db: Db) {
       }
       if (issueData.assigneeUserId) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);
+      }
+      if (issueData.status === "done" && existing.status !== "done") {
+        await assertDelegationPolicyAllowsCompletion(existing, issueData.complexity);
       }
 
       applyStatusSideEffects(issueData.status, patch);

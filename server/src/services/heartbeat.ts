@@ -12,10 +12,16 @@ import {
   companies,
   heartbeatRunEvents,
   heartbeatRuns,
+  executionWorkspaces,
   issueComments,
+  issueLabels,
+  issuePullRequests,
   costEvents,
   issues,
+  labels,
+  projects,
   projectWorkspaces,
+  qaFeedbackEvents,
 } from "@combyne/db";
 import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -53,6 +59,7 @@ import { inspectGitStateForIssue } from "./git-state.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
 import { extractAndPostQuestions, extractQuestionsFromText, type ExtractedQuestionsResult } from "./agent-question-extract.js";
 import { issueService } from "./issues.js";
+import { resolveIssueComplexity } from "./issue-complexity.js";
 import { logActivity } from "./activity-log.js";
 import { loadCompanyProjectOverview } from "./agent-company-context.js";
 import {
@@ -81,6 +88,15 @@ import { parseObject, asBoolean, asNumber, asString, appendWithCap, MAX_EXCERPT_
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { loadIssueContextRefs, renderIssueContextRefs } from "./issue-context-refs.js";
+import {
+  buildExecutionWorkspaceAdapterConfig,
+  gateProjectExecutionWorkspacePolicy,
+  parseIssueExecutionWorkspaceSettings,
+  parseProjectExecutionWorkspacePolicy,
+  resolveExecutionWorkspaceMode,
+} from "./execution-workspace-policy.js";
+import { instanceSettingsService } from "./instance-settings.js";
+import { realizeExecutionWorkspace } from "./workspace-runtime.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
@@ -97,6 +113,7 @@ const SERVER_HOST_ID = process.env.COMBYNE_HOST_ID ?? `${os.hostname()}:${proces
 const SERVER_RESTART_GENERATION = Number(process.env.COMBYNE_RESTART_GENERATION ?? 0);
 
 const AUTO_CLOSE_SUCCESS_STATUSES = new Set(["todo", "in_progress"]);
+const RUN_FAILURE_BLOCK_SKIP_STATUSES = new Set(["done", "cancelled"]);
 const TOKEN_PAUSE_COMMENT_PREFIXES = [
   "Run paused after crossing the small-task token threshold",
   "Run paused after crossing the small-task active-token threshold",
@@ -104,6 +121,80 @@ const TOKEN_PAUSE_COMMENT_PREFIXES = [
 
 function autoCloseManualIssueRunsEnabled(): boolean {
   return asBoolean(process.env.COMBYNE_AUTO_CLOSE_MANUAL_ISSUES, false);
+}
+
+function runIssueIdFromContext(run: typeof heartbeatRuns.$inferSelect): string | null {
+  const snapshot = parseObject(run.contextSnapshot);
+  const direct = readNonEmptyString(snapshot.issueId) ?? readNonEmptyString(snapshot.taskId);
+  if (direct) return direct;
+  const wake = parseObject(snapshot[DEFERRED_WAKE_CONTEXT_KEY]);
+  return readNonEmptyString(wake.issueId) ?? readNonEmptyString(wake.taskId) ?? null;
+}
+
+function compactFailureText(value: string | null | undefined, maxChars = 900) {
+  const compacted = (value ?? "Adapter run failed").trim().replace(/\s+/g, " ");
+  if (compacted.length <= maxChars) return compacted;
+  return `${compacted.slice(0, maxChars - 3).trimEnd()}...`;
+}
+
+export async function markIssueBlockedAfterFailedRun(
+  db: Db,
+  input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: Pick<typeof agents.$inferSelect, "id" | "name">;
+    message: string | null | undefined;
+    errorCode?: string | null;
+  },
+): Promise<{ blocked: boolean; issueId: string | null; reason: string }> {
+  const issueId = runIssueIdFromContext(input.run);
+  if (!issueId) return { blocked: false, issueId: null, reason: "missing_issue_scope" };
+
+  const issue = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      parentId: issues.parentId,
+      status: issues.status,
+      identifier: issues.identifier,
+      title: issues.title,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId)))
+    .then((rows) => rows[0] ?? null);
+
+  if (!issue) return { blocked: false, issueId, reason: "issue_not_found" };
+  if (RUN_FAILURE_BLOCK_SKIP_STATUSES.has(issue.status)) {
+    return { blocked: false, issueId, reason: `status_${issue.status}` };
+  }
+
+  const errorSummary = compactFailureText(input.message);
+  const body = [
+    "Agent run failed before this issue could continue.",
+    "",
+    `- Run: ${input.run.id}`,
+    `- Agent: ${input.agent.name}`,
+    ...(input.errorCode ? [`- Error code: ${input.errorCode}`] : []),
+    `- Error: ${errorSummary}`,
+    "",
+    issue.parentId
+      ? "The child issue is blocked and the parent assignee was notified to split, reassign, retry, or make the next coordination decision."
+      : "The issue is blocked for run review. This is not a user question; review the failed run before waking the assignee again.",
+  ];
+
+  await issueService(db).addComment(issue.id, body.join("\n"), { kind: "system" });
+  await issueService(db).update(
+    issue.id,
+    {
+      status: "blocked",
+      blockedSource: "agent",
+      blockedReason: `Run ${input.run.id} failed: ${errorSummary}`,
+    },
+    {
+      parentNotificationActor: { actorType: "system", actorId: null },
+    },
+  );
+
+  return { blocked: true, issueId, reason: "blocked_after_failed_run" };
 }
 
 export async function autoCloseIssueAfterSuccessfulRun(
@@ -115,13 +206,18 @@ export async function autoCloseIssueAfterSuccessfulRun(
     issueId: string;
     questionResult?: ExtractedQuestionsResult | null;
     allowAutoClose?: boolean;
+    summary?: string | null;
+    changedFiles?: string[];
+    checks?: string[];
   },
 ): Promise<{ closed: boolean; reason: string }> {
   const issue = await db
     .select({
       id: issues.id,
       companyId: issues.companyId,
+      title: issues.title,
       status: issues.status,
+      complexity: issues.complexity,
       originKind: issues.originKind,
     })
     .from(issues)
@@ -135,9 +231,24 @@ export async function autoCloseIssueAfterSuccessfulRun(
   if (!AUTO_CLOSE_SUCCESS_STATUSES.has(issue.status)) {
     return { closed: false, reason: `status_${issue.status}` };
   }
+  const issueLabelsForComplexity = await db
+    .select({ name: labels.name })
+    .from(issueLabels)
+    .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+    .where(eq(issueLabels.issueId, issue.id));
+  const complexity = resolveIssueComplexity({
+    complexity: issue.complexity,
+    title: issue.title,
+    labels: issueLabelsForComplexity,
+  });
+  if (complexity !== "small" && issue.originKind !== "routine_execution" && !input.allowAutoClose) {
+    return { closed: false, reason: `complexity_${complexity}_requires_policy_close` };
+  }
   if (
     input.questionResult &&
-    (input.questionResult.posted > 0 || input.questionResult.skippedExisting > 0)
+    (input.questionResult.posted > 0 ||
+      input.questionResult.skippedExisting > 0 ||
+      input.questionResult.routedToManager)
   ) {
     return { closed: false, reason: "questions_extracted" };
   }
@@ -148,7 +259,7 @@ export async function autoCloseIssueAfterSuccessfulRun(
     .where(
       and(
         eq(issueComments.issueId, issue.id),
-        eq(issueComments.kind, "question"),
+        inArray(issueComments.kind, ["question", "manager_question"]),
         isNull(issueComments.answeredAt),
       ),
     )
@@ -156,13 +267,85 @@ export async function autoCloseIssueAfterSuccessfulRun(
     .then((rows) => rows[0] ?? null);
   if (openQuestion) return { closed: false, reason: "open_questions" };
 
+  const openChildIssue = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(and(eq(issues.parentId, issue.id), notInArray(issues.status, ["done", "cancelled"])))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (openChildIssue) return { closed: false, reason: "open_child_issues" };
+
+  const unresolvedPullRequestBlocker = await db
+    .select({ id: issuePullRequests.id })
+    .from(issuePullRequests)
+    .where(
+      and(
+        eq(issuePullRequests.companyId, issue.companyId),
+        eq(issuePullRequests.issueId, issue.id),
+        eq(issuePullRequests.state, "open"),
+        sql<boolean>`(
+          ${issuePullRequests.mergeStatus} = 'blocked'
+          OR ${issuePullRequests.reviewStatus} = 'changes_requested'
+          OR ${issuePullRequests.ciStatus} IN ('failed', 'failing')
+          OR ${issuePullRequests.qualityStatus} IN ('failed', 'blocked')
+          OR ${issuePullRequests.feedbackStatus} IN ('needs_agent', 'sent')
+        )`,
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (unresolvedPullRequestBlocker) return { closed: false, reason: "unresolved_pr_feedback" };
+
+  const unresolvedQaFeedback = await db
+    .select({ id: qaFeedbackEvents.id })
+    .from(qaFeedbackEvents)
+    .where(
+      and(
+        eq(qaFeedbackEvents.companyId, issue.companyId),
+        eq(qaFeedbackEvents.issueId, issue.id),
+        notInArray(qaFeedbackEvents.status, [
+          "known_issue",
+          "deferred",
+          "needs_product_decision",
+          "acknowledged",
+          "resolved",
+        ]),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (unresolvedQaFeedback) return { closed: false, reason: "unresolved_qa_feedback" };
+
   if (
     !input.allowAutoClose &&
+    complexity !== "small" &&
     issue.originKind !== "routine_execution" &&
     !autoCloseManualIssueRunsEnabled()
   ) {
     return { closed: false, reason: "manual_auto_close_disabled" };
   }
+
+  const details: string[] = [
+    "Run completed successfully and no open questions, blockers, child issues, QA feedback, or review feedback remain.",
+    "",
+    `- Run: ${input.runId}`,
+  ];
+  if (input.summary?.trim()) details.push(`- Summary: ${input.summary.trim().slice(0, 500)}`);
+  if (input.changedFiles && input.changedFiles.length > 0) {
+    details.push(`- Changed files: ${input.changedFiles.slice(0, 8).join(", ")}`);
+  }
+  if (input.checks && input.checks.length > 0) {
+    details.push(`- Checks: ${input.checks.slice(0, 8).join(", ")}`);
+  }
+
+  await db.insert(issueComments).values({
+    companyId: issue.companyId,
+    issueId: issue.id,
+    authorAgentId: null,
+    authorUserId: null,
+    body: details.join("\n"),
+    kind: "system",
+  });
 
   const updated = await issueService(db).update(issue.id, { status: "done" });
   if (!updated) return { closed: false, reason: "update_failed" };
@@ -179,10 +362,194 @@ export async function autoCloseIssueAfterSuccessfulRun(
     details: {
       reason: "successful_run_without_questions",
       previousStatus: issue.status,
+      issueComplexity: complexity,
     },
   });
 
   return { closed: true, reason: "successful_run_without_questions" };
+}
+
+async function mergeRunPromptBudgetMetadata(
+  db: Db,
+  runId: string,
+  patch: Record<string, unknown>,
+) {
+  const row = await db
+    .select({ promptBudgetJson: heartbeatRuns.promptBudgetJson })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then((rows) => rows[0] ?? null);
+  if (!row) return;
+  const existing = parseObject(row.promptBudgetJson);
+  await db
+    .update(heartbeatRuns)
+    .set({
+      promptBudgetJson: {
+        ...existing,
+        ...patch,
+      },
+      updatedAt: new Date(),
+    })
+    .where(eq(heartbeatRuns.id, runId));
+}
+
+export async function enforceDelegationPolicyAfterSuccessfulRun(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    issueId: string;
+    currentWakeReason?: string | null;
+    wakeAssignee?: boolean;
+  },
+): Promise<{ enforced: boolean; reason: string; wakeCommentId?: string | null }> {
+  const issue = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      title: issues.title,
+      status: issues.status,
+      complexity: issues.complexity,
+      assigneeAgentId: issues.assigneeAgentId,
+      originKind: issues.originKind,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!issue) return { enforced: false, reason: "issue_not_found" };
+  if (issue.originKind === "terminal_session") return { enforced: false, reason: "terminal_session_issue" };
+  if (issue.status === "done" || issue.status === "cancelled") return { enforced: false, reason: "terminal_issue" };
+  if (issue.status === "blocked" || issue.status === "awaiting_user") {
+    return { enforced: false, reason: `status_${issue.status}` };
+  }
+
+  const issueLabelsForComplexity = await db
+    .select({ name: labels.name })
+    .from(issueLabels)
+    .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+    .where(eq(issueLabels.issueId, issue.id));
+  const complexity = resolveIssueComplexity({
+    complexity: issue.complexity,
+    title: issue.title,
+    labels: issueLabelsForComplexity,
+  });
+  if (complexity === "small") return { enforced: false, reason: "small_issue" };
+
+  const assignee = issue.assigneeAgentId
+    ? await db
+        .select({ role: agents.role, permissions: agents.permissions })
+        .from(agents)
+        .where(eq(agents.id, issue.assigneeAgentId))
+        .then((rows) => rows[0] ?? null)
+    : null;
+  const permissions = parseObject(assignee?.permissions);
+  const role = assignee?.role?.trim().toLowerCase() ?? "";
+  const coordinatorOwned =
+    COORDINATOR_HEARTBEAT_ROLES.has(role) ||
+    permissions.canCreateAgents === true ||
+    hasCompanyAssignmentPermission(permissions);
+  if (!coordinatorOwned) return { enforced: false, reason: "not_coordinator_owned" };
+
+  const childRows = await db
+    .select({ id: issues.id, status: issues.status })
+    .from(issues)
+    .where(eq(issues.parentId, issue.id));
+  if (childRows.length > 0) {
+    const openChildCount = childRows.filter((child) => child.status !== "done" && child.status !== "cancelled").length;
+    return { enforced: false, reason: openChildCount > 0 ? "children_still_open" : "delegation_evidence_present" };
+  }
+
+  const existingComment = await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.issueId, issue.id),
+        eq(issueComments.kind, "system"),
+        sql`${issueComments.body} like 'Delegation required before this medium/large coordinator issue can complete.%'`,
+      ),
+    )
+    .orderBy(desc(issueComments.createdAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  const repeatedDelegationWake =
+    existingComment && input.currentWakeReason === "delegation_required";
+  const comment =
+    existingComment ??
+    (await db
+      .insert(issueComments)
+      .values({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        authorAgentId: null,
+        authorUserId: null,
+        kind: "system",
+        body:
+          "Delegation required before this medium/large coordinator issue can complete.\n\n" +
+          `- Issue complexity: ${complexity}\n` +
+          "- Current evidence: no child issues were created.\n" +
+          "- Required next step: create/delegate at least one child issue, wait for child completion, then add verification evidence before closing the parent.",
+      })
+      .returning({ id: issueComments.id })
+      .then((rows) => rows[0] ?? null));
+
+  if (issue.status === "backlog" || issue.status === "todo" || issue.status === "in_review") {
+    await issueService(db).update(issue.id, { status: "in_progress" }, { suppressParentNotification: true });
+  }
+
+  const policyMetadata = {
+    issueComplexity: complexity,
+    orchestrationPolicy: {
+      name: "medium_large_delegation_required",
+      action: repeatedDelegationWake ? "hold_in_progress" : "wake_coordinator",
+      violation: "missing_child_issues",
+      wakeReason: "delegation_required",
+      wakeCommentId: comment?.id ?? null,
+      runAgentId: input.agentId,
+      repeatedDelegationWake: Boolean(repeatedDelegationWake),
+    },
+  };
+  await mergeRunPromptBudgetMetadata(db, input.runId, policyMetadata);
+
+  await logActivity(db, {
+    companyId: issue.companyId,
+    actorType: "system",
+    actorId: "heartbeat",
+    agentId: input.agentId,
+    runId: input.runId,
+    action: "issue.delegation_required",
+    entityType: "issue",
+    entityId: issue.id,
+    details: policyMetadata,
+  });
+
+  if (issue.assigneeAgentId && input.wakeAssignee !== false && !repeatedDelegationWake) {
+    await heartbeatService(db).wakeup(issue.assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "delegation_required",
+      payload: { issueId: issue.id, runId: input.runId, commentId: comment?.id ?? null },
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat",
+      contextSnapshot: {
+        issueId: issue.id,
+        taskId: issue.id,
+        taskKey: issue.id,
+        wakeReason: "delegation_required",
+        wakeCommentId: comment?.id ?? null,
+        source: "orchestration_policy",
+        recommendedNextAction:
+          "Create and delegate child issues for this medium/large issue, then verify child completion before closing.",
+      },
+    });
+  }
+
+  return {
+    enforced: true,
+    reason: repeatedDelegationWake ? "delegation_required_already_pending" : "delegation_required",
+    wakeCommentId: comment?.id ?? null,
+  };
 }
 
 export async function reopenIssuesAutoClosedAfterTokenPause(
@@ -273,18 +640,28 @@ function hasCompanyAssignmentPermission(permissions: Record<string, unknown> | n
   return permissions?.canAssignTasks === true && permissions.taskAssignmentScope === "company";
 }
 
-export function defaultMaxConcurrentRunsForAgent(agent: {
+function parseAgentPermissions(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function isCoordinatorAgent(agent: {
   role?: string | null;
   permissions?: Record<string, unknown> | null;
 }) {
   const role = typeof agent.role === "string" ? agent.role.trim().toLowerCase() : "";
-  const permissions =
-    !!agent.permissions && typeof agent.permissions === "object"
-      ? (agent.permissions as Record<string, unknown>)
-      : null;
-  const canCreateAgents = permissions?.canCreateAgents === true;
-  const canAssignCompanyTasks = hasCompanyAssignmentPermission(permissions);
-  if (COORDINATOR_HEARTBEAT_ROLES.has(role) || canCreateAgents || canAssignCompanyTasks) {
+  const permissions = parseAgentPermissions(agent.permissions);
+  return (
+    COORDINATOR_HEARTBEAT_ROLES.has(role) ||
+    permissions?.canCreateAgents === true ||
+    hasCompanyAssignmentPermission(permissions)
+  );
+}
+
+export function defaultMaxConcurrentRunsForAgent(agent: {
+  role?: string | null;
+  permissions?: Record<string, unknown> | null;
+}) {
+  if (isCoordinatorAgent(agent)) {
     return HEARTBEAT_COORDINATOR_MAX_CONCURRENT_RUNS_DEFAULT;
   }
   return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
@@ -294,16 +671,7 @@ function buildCoordinatorGuidance(agent: {
   role?: string | null;
   permissions?: Record<string, unknown> | null;
 }) {
-  const role = typeof agent.role === "string" ? agent.role.trim().toLowerCase() : "";
-  const permissions =
-    !!agent.permissions && typeof agent.permissions === "object"
-      ? (agent.permissions as Record<string, unknown>)
-      : null;
-  const isCoordinator =
-    COORDINATOR_HEARTBEAT_ROLES.has(role) ||
-    permissions?.canCreateAgents === true ||
-    hasCompanyAssignmentPermission(permissions);
-  if (!isCoordinator) return null;
+  if (!isCoordinatorAgent(agent)) return null;
   return [
     "## Coordinator execution guidance",
     "",
@@ -312,6 +680,61 @@ function buildCoordinatorGuidance(agent: {
     "- Answer internal child questions before escalating. Escalate to the human only for credentials/access, approval gates, destructive actions, budget/legal risk, or a true product/business decision with no reasonable default.",
     "- Parallelize independent work across available agents, but keep same-issue code changes serialized by the issue execution lock.",
     "- Before push/merge, verify child issues, review feedback, QA feedback, and open questions are closed or explicitly assigned.",
+  ].join("\n");
+}
+
+function buildMediumLargeDelegationGuidance(input: {
+  issueId: string;
+  complexity: string | null;
+  agent: {
+    id: string;
+    role?: string | null;
+    permissions?: Record<string, unknown> | null;
+  };
+  candidates: Array<{
+    id: string;
+    name: string;
+    role: string | null;
+    reportsTo: string | null;
+    capabilities: string | null;
+  }>;
+}) {
+  if (input.complexity !== "medium" && input.complexity !== "large") return null;
+  if (!isCoordinatorAgent(input.agent)) return null;
+  const candidateLines =
+    input.candidates.length > 0
+      ? input.candidates
+          .map((candidate) => {
+            const role = candidate.role ? ` · ${candidate.role}` : "";
+            const reportsTo = candidate.reportsTo === input.agent.id ? " · direct report" : "";
+            const capabilities = candidate.capabilities
+              ? ` · ${candidate.capabilities.replace(/\s+/g, " ").slice(0, 160)}`
+              : "";
+            return `- ${candidate.name}${role}${reportsTo}: ${candidate.id}${capabilities}`;
+          })
+          .join("\n")
+      : "- No eligible child assignees were found. Create/hire an agent first or escalate this as a staffing blocker.";
+
+  return [
+    "## Medium/large delegation requirement",
+    "",
+    `This focused issue is ${input.complexity}. Server policy will keep coordinator-owned medium/large issues in progress until delegated child work exists, all child issues are terminal, and the parent has verification evidence.`,
+    "",
+    "If this wake reason is `delegation_required`, do not repeat the parent implementation work. Create child issue(s) now, then wait for those child issues to complete.",
+    "",
+    "Use the delegation endpoint from the run terminal:",
+    "",
+    "```sh",
+    `curl -sS -X POST "$COMBYNE_API_URL/api/issues/${input.issueId}/delegate" \\`,
+    '  -H "Authorization: Bearer $COMBYNE_API_KEY" \\',
+    '  -H "Content-Type: application/json" \\',
+    `  --data '{"toAgentId":"<agent-id>","title":"<child title>","description":"<focused child brief>","priority":"medium","complexity":"small"}'`,
+    "```",
+    "",
+    "Available child assignees:",
+    candidateLines,
+    "",
+    "After child completion, post a concise verification comment on the parent covering child outcomes and checks before marking the parent done.",
   ].join("\n");
 }
 
@@ -502,9 +925,14 @@ interface ParsedIssueAssigneeAdapterOverrides {
 
 export type ResolvedWorkspaceForRun = {
   cwd: string;
-  source: "project_primary" | "task_session" | "agent_home";
+  source: "project_primary" | "execution_workspace" | "task_session" | "agent_home";
   projectId: string | null;
   workspaceId: string | null;
+  projectWorkspaceId?: string | null;
+  executionWorkspaceId?: string | null;
+  executionWorkspaceMode?: string | null;
+  branchName?: string | null;
+  worktreePath?: string | null;
   repoUrl: string | null;
   repoRef: string | null;
   workspaceHints: Array<{
@@ -520,6 +948,433 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+export async function resolveWorkspaceForHeartbeatRun(
+  db: Db,
+  input: {
+    agent: typeof agents.$inferSelect;
+    context: Record<string, unknown>;
+    previousSessionParams: Record<string, unknown> | null;
+    useProjectWorkspace?: boolean | null;
+  },
+): Promise<ResolvedWorkspaceForRun> {
+  const { agent, context, previousSessionParams } = input;
+  const issueId = readNonEmptyString(context.issueId);
+  const contextProjectId = readNonEmptyString(context.projectId);
+  const issueRow = issueId
+    ? await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+        .then((rows) => rows[0] ?? null)
+    : null;
+  const resolvedProjectId = issueRow?.projectId ?? contextProjectId;
+  const useProjectWorkspace = input.useProjectWorkspace !== false;
+  const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
+
+  const projectRow = workspaceProjectId
+    ? await db
+        .select({
+          id: projects.id,
+          executionWorkspacePolicy: projects.executionWorkspacePolicy,
+        })
+        .from(projects)
+        .where(and(eq(projects.id, workspaceProjectId), eq(projects.companyId, agent.companyId)))
+        .then((rows) => rows[0] ?? null)
+    : null;
+  const experimentalSettings = await instanceSettingsService(db)
+    .getExperimental()
+    .catch(() => ({ enableIsolatedWorkspaces: false }));
+  const isolatedWorkspacesEnabled = experimentalSettings.enableIsolatedWorkspaces === true;
+  const projectPolicy = gateProjectExecutionWorkspacePolicy(
+    parseProjectExecutionWorkspacePolicy(projectRow?.executionWorkspacePolicy),
+    isolatedWorkspacesEnabled,
+  );
+  const rawIssueSettings = {
+    ...parseObject(issueRow?.executionWorkspaceSettings),
+  };
+  if (!readNonEmptyString(rawIssueSettings.mode) && issueRow?.executionWorkspacePreference) {
+    rawIssueSettings.mode = issueRow.executionWorkspacePreference;
+  }
+  const issueSettings = parseIssueExecutionWorkspaceSettings(rawIssueSettings);
+  const executionWorkspaceMode = resolveExecutionWorkspaceMode({
+    projectPolicy,
+    issueSettings,
+    legacyUseProjectWorkspace: input.useProjectWorkspace ?? null,
+  });
+
+  const projectWorkspaceRows = workspaceProjectId
+    ? await db
+        .select()
+        .from(projectWorkspaces)
+        .where(
+          and(
+            eq(projectWorkspaces.companyId, agent.companyId),
+            eq(projectWorkspaces.projectId, workspaceProjectId),
+          ),
+        )
+        .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+    : [];
+  const preferredWorkspaceId = projectPolicy?.defaultProjectWorkspaceId ?? null;
+  if (preferredWorkspaceId) {
+    projectWorkspaceRows.sort((left, right) => {
+      if (left.id === preferredWorkspaceId && right.id !== preferredWorkspaceId) return -1;
+      if (right.id === preferredWorkspaceId && left.id !== preferredWorkspaceId) return 1;
+      return 0;
+    });
+  }
+
+  const hideProjectWorkspaceCwds =
+    isolatedWorkspacesEnabled &&
+    Boolean(issueRow) &&
+    executionWorkspaceMode === "isolated_workspace";
+  const workspaceHints = projectWorkspaceRows.map((workspace) => ({
+    workspaceId: workspace.id,
+    cwd: hideProjectWorkspaceCwds ? null : readNonEmptyString(workspace.cwd),
+    repoUrl: readNonEmptyString(workspace.repoUrl),
+    repoRef: readNonEmptyString(workspace.repoRef),
+  }));
+
+  if (projectWorkspaceRows.length > 0) {
+    const missingProjectCwds: string[] = [];
+    let hasConfiguredProjectCwd = false;
+    for (const workspace of projectWorkspaceRows) {
+      const projectCwd = readNonEmptyString(workspace.cwd);
+      if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
+        continue;
+      }
+      hasConfiguredProjectCwd = true;
+      const projectCwdExists = await fs
+        .stat(projectCwd)
+        .then((stats) => stats.isDirectory())
+        .catch(() => false);
+      if (!projectCwdExists) {
+        missingProjectCwds.push(projectCwd);
+        continue;
+      }
+
+      if (
+        isolatedWorkspacesEnabled &&
+        issueRow &&
+        executionWorkspaceMode === "isolated_workspace"
+      ) {
+        const now = new Date();
+        const reusableWorkspace = await loadReusableExecutionWorkspaceForIssue(db, {
+          companyId: agent.companyId,
+          issueId: issueRow.id,
+          executionWorkspaceId: issueRow.executionWorkspaceId,
+        });
+        if (reusableWorkspace?.cwd) {
+          await db
+            .update(executionWorkspaces)
+            .set({ status: "active", lastUsedAt: now, updatedAt: now })
+            .where(eq(executionWorkspaces.id, reusableWorkspace.id));
+          if (issueRow.executionWorkspaceId !== reusableWorkspace.id) {
+            await db
+              .update(issues)
+              .set({ executionWorkspaceId: reusableWorkspace.id, updatedAt: now })
+              .where(and(eq(issues.id, issueRow.id), eq(issues.companyId, agent.companyId)));
+          }
+          return {
+            cwd: reusableWorkspace.cwd,
+            source: "execution_workspace" as const,
+            projectId: resolvedProjectId,
+            workspaceId: reusableWorkspace.id,
+            projectWorkspaceId: reusableWorkspace.projectWorkspaceId ?? workspace.id,
+            executionWorkspaceId: reusableWorkspace.id,
+            executionWorkspaceMode,
+            branchName: reusableWorkspace.branchName ?? null,
+            worktreePath: reusableWorkspace.cwd,
+            repoUrl: reusableWorkspace.repoUrl ?? workspace.repoUrl,
+            repoRef: reusableWorkspace.baseRef ?? workspace.repoRef,
+            workspaceHints,
+            warnings: [],
+          };
+        }
+
+        try {
+          const adapterConfig = buildExecutionWorkspaceAdapterConfig({
+            agentConfig: parseObject(agent.adapterConfig),
+            projectPolicy,
+            issueSettings,
+            mode: executionWorkspaceMode,
+            legacyUseProjectWorkspace: input.useProjectWorkspace ?? null,
+          });
+          const realized = await realizeExecutionWorkspace({
+            base: {
+              baseCwd: projectCwd,
+              source: "project_primary",
+              projectId: resolvedProjectId,
+              workspaceId: workspace.id,
+              repoUrl: workspace.repoUrl,
+              repoRef: workspace.repoRef,
+            },
+            config: adapterConfig,
+            issue: {
+              id: issueRow.id,
+              identifier: issueRow.identifier,
+              title: issueRow.title,
+            },
+            agent: {
+              id: agent.id,
+              name: agent.name,
+              companyId: agent.companyId,
+            },
+            recorder: null,
+          });
+
+          if (realized.strategy === "git_worktree") {
+            const strategy = parseObject(adapterConfig.workspaceStrategy);
+            const baseRef = readNonEmptyString(strategy.baseRef) ?? workspace.repoRef ?? null;
+            const executionProjectId = workspaceProjectId ?? resolvedProjectId;
+            if (!executionProjectId) {
+              return {
+                cwd: projectCwd,
+                source: "project_primary" as const,
+                projectId: resolvedProjectId,
+                workspaceId: workspace.id,
+                projectWorkspaceId: workspace.id,
+                executionWorkspaceId: null,
+                executionWorkspaceMode,
+                repoUrl: workspace.repoUrl,
+                repoRef: workspace.repoRef,
+                workspaceHints,
+                warnings: [
+                  `Isolated execution workspace could not be persisted because no project id is available. Using project workspace "${projectCwd}" for this run.`,
+                ],
+              };
+            }
+            const executionWorkspaceData = {
+              companyId: agent.companyId,
+              projectId: executionProjectId,
+              projectWorkspaceId: workspace.id,
+              sourceIssueId: issueRow.id,
+              mode: "isolated_workspace" as const,
+              strategyType: "git_worktree" as const,
+              name: `${issueRow.identifier ?? "Issue"} execution workspace`,
+              status: "active" as const,
+              cwd: realized.cwd,
+              repoUrl: workspace.repoUrl,
+              baseRef,
+              branchName: realized.branchName,
+              providerType: "git_worktree" as const,
+              providerRef: realized.worktreePath,
+              lastUsedAt: now,
+              metadata: {
+                createdByRuntime: true,
+                baseCwd: projectCwd,
+                baseRef,
+                branchName: realized.branchName,
+                worktreePath: realized.worktreePath,
+                sourceIssueId: issueRow.id,
+                issueIdentifier: issueRow.identifier,
+                agentId: agent.id,
+                projectWorkspaceId: workspace.id,
+                workspaceStrategy: strategy,
+              },
+              updatedAt: now,
+            };
+            const existingAfterRealize = await loadReusableExecutionWorkspaceForIssue(db, {
+              companyId: agent.companyId,
+              issueId: issueRow.id,
+              executionWorkspaceId: issueRow.executionWorkspaceId,
+            });
+            const [persistedWorkspace] = existingAfterRealize
+              ? await db
+                  .update(executionWorkspaces)
+                  .set(executionWorkspaceData)
+                  .where(eq(executionWorkspaces.id, existingAfterRealize.id))
+                  .returning()
+              : await db
+                  .insert(executionWorkspaces)
+                  .values({
+                    ...executionWorkspaceData,
+                    openedAt: now,
+                    createdAt: now,
+                  })
+                  .returning();
+            await db
+              .update(issues)
+              .set({
+                executionWorkspaceId: persistedWorkspace.id,
+                executionWorkspacePreference: issueRow.executionWorkspacePreference ?? "isolated_workspace",
+                updatedAt: now,
+              })
+              .where(and(eq(issues.id, issueRow.id), eq(issues.companyId, agent.companyId)));
+
+            return {
+              cwd: realized.cwd,
+              source: "execution_workspace" as const,
+              projectId: resolvedProjectId,
+              workspaceId: persistedWorkspace.id,
+              projectWorkspaceId: workspace.id,
+              executionWorkspaceId: persistedWorkspace.id,
+              executionWorkspaceMode,
+              branchName: realized.branchName,
+              worktreePath: realized.worktreePath,
+              repoUrl: workspace.repoUrl,
+              repoRef: baseRef,
+              workspaceHints,
+              warnings: realized.warnings,
+            };
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            { err, agentId: agent.id, issueId: issueRow.id, projectId: resolvedProjectId },
+            "failed to realize isolated execution workspace; falling back to project workspace",
+          );
+          return {
+            cwd: projectCwd,
+            source: "project_primary" as const,
+            projectId: resolvedProjectId,
+            workspaceId: workspace.id,
+            projectWorkspaceId: workspace.id,
+            executionWorkspaceId: null,
+            executionWorkspaceMode,
+            repoUrl: workspace.repoUrl,
+            repoRef: workspace.repoRef,
+            workspaceHints,
+            warnings: [
+              `Isolated execution workspace could not be prepared (${compactFailureText(message, 240)}). Using project workspace "${projectCwd}" for this run.`,
+            ],
+          };
+        }
+      }
+
+      return {
+        cwd: projectCwd,
+        source: "project_primary" as const,
+        projectId: resolvedProjectId,
+        workspaceId: workspace.id,
+        projectWorkspaceId: workspace.id,
+        executionWorkspaceId: null,
+        executionWorkspaceMode,
+        repoUrl: workspace.repoUrl,
+        repoRef: workspace.repoRef,
+        workspaceHints,
+        warnings: [],
+      };
+    }
+
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
+    await fs.mkdir(fallbackCwd, { recursive: true });
+    const warnings: string[] = [];
+    if (missingProjectCwds.length > 0) {
+      const firstMissing = missingProjectCwds[0];
+      const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
+      warnings.push(
+        extraMissingCount > 0
+          ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
+          : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
+      );
+    } else if (!hasConfiguredProjectCwd) {
+      warnings.push(
+        `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
+      );
+    }
+    return {
+      cwd: fallbackCwd,
+      source: "project_primary" as const,
+      projectId: resolvedProjectId,
+      workspaceId: projectWorkspaceRows[0]?.id ?? null,
+      projectWorkspaceId: projectWorkspaceRows[0]?.id ?? null,
+      executionWorkspaceId: null,
+      executionWorkspaceMode,
+      repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
+      repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
+      workspaceHints,
+      warnings,
+    };
+  }
+
+  const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
+  if (sessionCwd) {
+    const sessionCwdExists = await fs
+      .stat(sessionCwd)
+      .then((stats) => stats.isDirectory())
+      .catch(() => false);
+    if (sessionCwdExists) {
+      return {
+        cwd: sessionCwd,
+        source: "task_session" as const,
+        projectId: resolvedProjectId,
+        workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
+        projectWorkspaceId: null,
+        executionWorkspaceId: null,
+        executionWorkspaceMode,
+        repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
+        repoRef: readNonEmptyString(previousSessionParams?.repoRef),
+        workspaceHints,
+        warnings: [],
+      };
+    }
+  }
+
+  const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
+  await fs.mkdir(cwd, { recursive: true });
+  const warnings: string[] = [];
+  if (sessionCwd) {
+    warnings.push(
+      `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
+    );
+  } else if (resolvedProjectId) {
+    warnings.push(
+      `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
+    );
+  } else {
+    warnings.push(
+      `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
+    );
+  }
+  return {
+    cwd,
+    source: "agent_home" as const,
+    projectId: resolvedProjectId,
+    workspaceId: null,
+    projectWorkspaceId: null,
+    executionWorkspaceId: null,
+    executionWorkspaceMode,
+    repoUrl: null,
+    repoRef: null,
+    workspaceHints,
+    warnings,
+  };
+}
+
+async function loadReusableExecutionWorkspaceForIssue(
+  db: Db,
+  input: { companyId: string; issueId: string; executionWorkspaceId: string | null },
+): Promise<typeof executionWorkspaces.$inferSelect | null> {
+  const reusableStatuses = ["active", "idle", "in_review"];
+  if (input.executionWorkspaceId) {
+    const existing = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, input.companyId),
+          inArray(executionWorkspaces.status, reusableStatuses),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (existing) return existing;
+  }
+
+  return db
+    .select()
+    .from(executionWorkspaces)
+    .where(
+      and(
+        eq(executionWorkspaces.companyId, input.companyId),
+        eq(executionWorkspaces.sourceIssueId, input.issueId),
+        inArray(executionWorkspaces.status, reusableStatuses),
+      ),
+    )
+    .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.updatedAt), desc(executionWorkspaces.createdAt))
+    .then((rows) => rows[0] ?? null);
+}
+
 export function deriveLatestUserFacingAgentMessage(sourceText: string, resultJson: unknown): string | null {
   const extracted = extractQuestionsFromText(sourceText, 1)[0];
   if (extracted) return extracted;
@@ -533,6 +1388,34 @@ export function deriveLatestUserFacingAgentMessage(sourceText: string, resultJso
   if (structured) return structured.slice(0, 4000);
 
   return null;
+}
+
+function summarizeSuccessfulAdapterResult(
+  resultJson: unknown,
+  stdoutExcerpt: string,
+): { summary: string | null; changedFiles: string[]; checks: string[] } {
+  const result = parseObject(resultJson);
+  const summary =
+    readNonEmptyString(result?.summary) ??
+    readNonEmptyString(result?.message) ??
+    readNonEmptyString(result?.result) ??
+    readNonEmptyString(result?.final) ??
+    stdoutExcerpt
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0 && line.length <= 240) ??
+    null;
+  const toStringArray = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value
+          .map((item) => (typeof item === "string" ? item.trim() : ""))
+          .filter((item) => item.length > 0)
+      : [];
+  return {
+    summary: summary ? summary.slice(0, 600) : null,
+    changedFiles: toStringArray(result?.changedFiles ?? result?.filesChanged ?? result?.files),
+    checks: toStringArray(result?.checks ?? result?.commandsRun ?? result?.tests),
+  };
 }
 
 function contextSectionNames(context: Record<string, unknown>): string[] {
@@ -568,14 +1451,16 @@ function contextSectionNames(context: Record<string, unknown>): string[] {
 function setContextPolicy(
   context: Record<string, unknown>,
   input: {
-    profile: AgentContextProfile;
+    profile: AgentContextProfile | "focused_small";
     focusIssueId: string | null;
     focusIssueSource: string | null;
     queueDigest: "included" | "omitted" | "none";
+    issueComplexity?: string | null;
   },
 ) {
   context.combyneContextPolicy = {
     contextProfile: input.profile,
+    issueComplexity: input.issueComplexity ?? null,
     contextFocusIssueId: input.focusIssueId,
     focusIssueSource: input.focusIssueSource,
     queueDigest: input.queueDigest,
@@ -594,6 +1479,7 @@ function buildContextAuditSnapshot(
     taskId: readNonEmptyString(context.taskId) ?? readNonEmptyString(base?.taskId),
     taskKey: readNonEmptyString(context.taskKey) ?? readNonEmptyString(base?.taskKey),
     contextProfile: readNonEmptyString(policy?.contextProfile),
+    issueComplexity: readNonEmptyString(policy?.issueComplexity),
     contextFocusIssueId: readNonEmptyString(policy?.contextFocusIssueId),
     contextFocusIssueSource: readNonEmptyString(policy?.focusIssueSource),
     contextQueueDigest: readNonEmptyString(policy?.queueDigest),
@@ -610,6 +1496,19 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
   const previousSessionId = readNonEmptyString(previousSessionParams?.sessionId);
   const previousCwd = readNonEmptyString(previousSessionParams?.cwd);
   if (!previousSessionId || !previousCwd) {
+    return {
+      sessionParams: previousSessionParams,
+      warning: null as string | null,
+    };
+  }
+  if (resolvedWorkspace.source === "execution_workspace") {
+    const executionCwd = readNonEmptyString(resolvedWorkspace.cwd);
+    if (executionCwd && path.resolve(previousCwd) !== path.resolve(executionCwd)) {
+      return {
+        sessionParams: null,
+        warning: `Skipping saved session resume because the issue now runs in isolated workspace "${executionCwd}" instead of "${previousCwd}".`,
+      };
+    }
     return {
       sessionParams: previousSessionParams,
       warning: null as string | null,
@@ -1025,141 +1924,12 @@ export function heartbeatService(db: Db) {
     previousSessionParams: Record<string, unknown> | null,
     opts?: { useProjectWorkspace?: boolean | null },
   ): Promise<ResolvedWorkspaceForRun> {
-    const issueId = readNonEmptyString(context.issueId);
-    const contextProjectId = readNonEmptyString(context.projectId);
-    const issueProjectId = issueId
-      ? await db
-          .select({ projectId: issues.projectId })
-          .from(issues)
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
-          .then((rows) => rows[0]?.projectId ?? null)
-      : null;
-    const resolvedProjectId = issueProjectId ?? contextProjectId;
-    const useProjectWorkspace = opts?.useProjectWorkspace !== false;
-    const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
-
-    const projectWorkspaceRows = workspaceProjectId
-      ? await db
-          .select()
-          .from(projectWorkspaces)
-          .where(
-            and(
-              eq(projectWorkspaces.companyId, agent.companyId),
-              eq(projectWorkspaces.projectId, workspaceProjectId),
-            ),
-          )
-          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
-      : [];
-
-    const workspaceHints = projectWorkspaceRows.map((workspace) => ({
-      workspaceId: workspace.id,
-      cwd: readNonEmptyString(workspace.cwd),
-      repoUrl: readNonEmptyString(workspace.repoUrl),
-      repoRef: readNonEmptyString(workspace.repoRef),
-    }));
-
-    if (projectWorkspaceRows.length > 0) {
-      const missingProjectCwds: string[] = [];
-      let hasConfiguredProjectCwd = false;
-      for (const workspace of projectWorkspaceRows) {
-        const projectCwd = readNonEmptyString(workspace.cwd);
-        if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
-          continue;
-        }
-        hasConfiguredProjectCwd = true;
-        const projectCwdExists = await fs
-          .stat(projectCwd)
-          .then((stats) => stats.isDirectory())
-          .catch(() => false);
-        if (projectCwdExists) {
-          return {
-            cwd: projectCwd,
-            source: "project_primary" as const,
-            projectId: resolvedProjectId,
-            workspaceId: workspace.id,
-            repoUrl: workspace.repoUrl,
-            repoRef: workspace.repoRef,
-            workspaceHints,
-            warnings: [],
-          };
-        }
-        missingProjectCwds.push(projectCwd);
-      }
-
-      const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
-      await fs.mkdir(fallbackCwd, { recursive: true });
-      const warnings: string[] = [];
-      if (missingProjectCwds.length > 0) {
-        const firstMissing = missingProjectCwds[0];
-        const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
-        warnings.push(
-          extraMissingCount > 0
-            ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
-            : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      } else if (!hasConfiguredProjectCwd) {
-        warnings.push(
-          `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      }
-      return {
-        cwd: fallbackCwd,
-        source: "project_primary" as const,
-        projectId: resolvedProjectId,
-        workspaceId: projectWorkspaceRows[0]?.id ?? null,
-        repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
-        repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
-        workspaceHints,
-        warnings,
-      };
-    }
-
-    const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
-    if (sessionCwd) {
-      const sessionCwdExists = await fs
-        .stat(sessionCwd)
-        .then((stats) => stats.isDirectory())
-        .catch(() => false);
-      if (sessionCwdExists) {
-        return {
-          cwd: sessionCwd,
-          source: "task_session" as const,
-          projectId: resolvedProjectId,
-          workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
-          repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
-          repoRef: readNonEmptyString(previousSessionParams?.repoRef),
-          workspaceHints,
-          warnings: [],
-        };
-      }
-    }
-
-    const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
-    await fs.mkdir(cwd, { recursive: true });
-    const warnings: string[] = [];
-    if (sessionCwd) {
-      warnings.push(
-        `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
-      );
-    } else if (resolvedProjectId) {
-      warnings.push(
-        `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
-      );
-    } else {
-      warnings.push(
-        `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
-      );
-    }
-    return {
-      cwd,
-      source: "agent_home" as const,
-      projectId: resolvedProjectId,
-      workspaceId: null,
-      repoUrl: null,
-      repoRef: null,
-      workspaceHints,
-      warnings,
-    };
+    return resolveWorkspaceForHeartbeatRun(db, {
+      agent,
+      context,
+      previousSessionParams,
+      useProjectWorkspace: opts?.useProjectWorkspace ?? null,
+    });
   }
 
   async function upsertTaskSession(input: {
@@ -1878,6 +2648,8 @@ export function heartbeatService(db: Db) {
     });
     let memoryIssueId = readNonEmptyString(context.issueId);
     let focusIssueSource: string | null = memoryIssueId ? "context" : null;
+    let issueComplexity: string | null = null;
+    let effectiveContextProfile: AgentContextProfile | "focused_small" = contextProfile;
     let queueDigestPolicy: "included" | "omitted" | "none" =
       contextProfile === "focused" ? "none" : "included";
     if (contextProfile === "focused" && !memoryIssueId && run.invocationSource === "timer") {
@@ -1893,11 +2665,43 @@ export function heartbeatService(db: Db) {
         context.taskKey = nextIssue.identifier ?? nextIssue.id;
       }
     }
+    if (memoryIssueId) {
+      try {
+        const focusIssue = await db
+          .select({
+            id: issues.id,
+            title: issues.title,
+            complexity: issues.complexity,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (focusIssue) {
+          const complexityLabels = await db
+            .select({ name: labels.name })
+            .from(issueLabels)
+            .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+            .where(eq(issueLabels.issueId, focusIssue.id));
+          issueComplexity = resolveIssueComplexity({
+            complexity: focusIssue.complexity,
+            title: focusIssue.title,
+            labels: complexityLabels,
+          });
+          if (issueComplexity === "small") {
+            effectiveContextProfile = "focused_small";
+            queueDigestPolicy = "none";
+          }
+        }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId, issueId: memoryIssueId }, "failed to resolve issue complexity");
+      }
+    }
     setContextPolicy(context, {
-      profile: contextProfile,
+      profile: effectiveContextProfile,
       focusIssueId: memoryIssueId ?? null,
       focusIssueSource,
       queueDigest: queueDigestPolicy,
+      issueComplexity,
     });
     const acceptedWorkSvc = acceptedWorkService(db);
     void acceptedWorkSvc
@@ -1968,7 +2772,7 @@ export function heartbeatService(db: Db) {
     } catch (err) {
       logger.debug({ err, agentId: agent.id }, "failed to load pending handoff");
     }
-    if (contextProfile !== "focused" || memoryIssueId) {
+    if (effectiveContextProfile !== "focused_small" && (contextProfile !== "focused" || memoryIssueId)) {
       try {
         const memoryRows = await loadRecentMemory(db, {
           companyId: agent.companyId,
@@ -1994,7 +2798,7 @@ export function heartbeatService(db: Db) {
         logger.debug({ err, agentId: agent.id, runId }, "failed to load agent memory preamble");
       }
     }
-    if (contextProfile !== "focused") {
+    if (effectiveContextProfile !== "focused" && effectiveContextProfile !== "focused_small") {
       try {
         const acceptedWorkEventId = readNonEmptyString(context.acceptedWorkEventId);
         const events = await acceptedWorkSvc.pendingForManager(
@@ -2183,6 +2987,11 @@ export function heartbeatService(db: Db) {
       source: resolvedWorkspace.source,
       projectId: resolvedWorkspace.projectId,
       workspaceId: resolvedWorkspace.workspaceId,
+      projectWorkspaceId: resolvedWorkspace.projectWorkspaceId ?? null,
+      executionWorkspaceId: resolvedWorkspace.executionWorkspaceId ?? null,
+      executionWorkspaceMode: resolvedWorkspace.executionWorkspaceMode ?? null,
+      branchName: resolvedWorkspace.branchName ?? null,
+      worktreePath: resolvedWorkspace.worktreePath ?? null,
       repoUrl: resolvedWorkspace.repoUrl,
       repoRef: resolvedWorkspace.repoRef,
     };
@@ -2202,6 +3011,48 @@ export function heartbeatService(db: Db) {
       context.combyneCoordinatorGuidance = {
         body: coordinatorGuidance,
       };
+    }
+    if (memoryIssueId && (issueComplexity === "medium" || issueComplexity === "large")) {
+      try {
+        const candidateAgents = await db
+          .select({
+            id: agents.id,
+            name: agents.name,
+            role: agents.role,
+            reportsTo: agents.reportsTo,
+            capabilities: agents.capabilities,
+          })
+          .from(agents)
+          .where(
+            and(
+              eq(agents.companyId, agent.companyId),
+              notInArray(agents.id, [agent.id]),
+              notInArray(agents.status, ["terminated", "pending_approval"]),
+            ),
+          )
+          .orderBy(asc(agents.reportsTo), asc(agents.name))
+          .limit(12);
+        const delegationGuidance = buildMediumLargeDelegationGuidance({
+          issueId: memoryIssueId,
+          complexity: issueComplexity,
+          agent: {
+            id: agent.id,
+            role: agent.role,
+            permissions: parseAgentPermissions(agent.permissions),
+          },
+          candidates: candidateAgents,
+        });
+        if (delegationGuidance) {
+          context.combyneDelegationGuidance = {
+            body: delegationGuidance,
+            issueId: memoryIssueId,
+            complexity: issueComplexity,
+            candidateAgentIds: candidateAgents.map((candidate) => candidate.id),
+          };
+        }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId, issueId: memoryIssueId }, "failed to build delegation guidance");
+      }
     }
     const bukuPrePushGovernance = buildBukuPrePushGovernance({
       cwd: resolvedWorkspace.cwd,
@@ -2253,6 +3104,31 @@ export function heartbeatService(db: Db) {
         if (managerAction) {
           internalContextLines.push("## Recommended next action", managerAction);
         }
+        if (effectiveContextProfile === "focused_small") {
+          const recentComments = await db
+            .select({
+              kind: issueComments.kind,
+              body: issueComments.body,
+              createdAt: issueComments.createdAt,
+            })
+            .from(issueComments)
+            .where(eq(issueComments.issueId, memoryIssueId))
+            .orderBy(desc(issueComments.createdAt))
+            .limit(4);
+          if (recentComments.length > 0) {
+            internalContextLines.push(
+              "## Latest relevant issue comments",
+              recentComments
+                .reverse()
+                .map((comment) => {
+                  const kind = comment.kind ?? "comment";
+                  const body = comment.body.length > 1200 ? `${comment.body.slice(0, 1200)}\n...(truncated)` : comment.body;
+                  return `### ${kind} · ${comment.createdAt.toISOString()}\n${body}`;
+                })
+                .join("\n\n"),
+            );
+          }
+        }
         if (internalContextLines.length > 0) {
           focusIssueBody = [focusIssueBody, internalContextLines.join("\n\n")]
             .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
@@ -2261,7 +3137,7 @@ export function heartbeatService(db: Db) {
       }
 
       const queue =
-        contextProfile === "focused" && !memoryIssueId
+        effectiveContextProfile === "focused" && !memoryIssueId
           ? {
               items: [],
               totalOpen: 0,
@@ -2280,13 +3156,14 @@ export function heartbeatService(db: Db) {
               currentIssueBody: focusIssueBody,
               focusMode,
               includeReviewIssues:
-                contextProfile === "focused" ||
+                effectiveContextProfile === "focused" ||
+                effectiveContextProfile === "focused_small" ||
                 run.invocationSource !== "timer" ||
                 Boolean(memoryIssueId),
-              limit: contextProfile === "focused" ? 100 : undefined,
+              limit: effectiveContextProfile === "focused" || effectiveContextProfile === "focused_small" ? 100 : undefined,
             });
 
-      if (contextProfile === "focused") {
+      if (effectiveContextProfile === "focused" || effectiveContextProfile === "focused_small") {
         const focusOnlyItems = queue.focusItem ? [queue.focusItem] : [];
         context.combyneAssignedIssues = {
           ...queue,
@@ -2323,7 +3200,7 @@ export function heartbeatService(db: Db) {
             runId,
             issueId: queue.focusItem.id,
             bodyChars: queue.focusBody.length,
-            contextProfile,
+            contextProfile: effectiveContextProfile,
           },
           "agent_queue.focus_section_rendered",
         );
@@ -2349,21 +3226,24 @@ export function heartbeatService(db: Db) {
         }
       }
       setContextPolicy(context, {
-        profile: contextProfile,
+        profile: effectiveContextProfile,
         focusIssueId: memoryIssueId ?? null,
         focusIssueSource,
         queueDigest: queueDigestPolicy,
+        issueComplexity,
       });
     } catch (err) {
       logger.debug({ err, agentId: agent.id, runId }, "failed to load assigned issue queue");
     }
 
-    // Surface Combyne-managed project workspaces to the adapter so it can
-    // ls/read/write across them — same fix as the terminal preamble,
-    // mirrored here so heartbeat runs don't ask "project not found" either.
-    if (contextProfile !== "focused") {
+    // Surface Combyne-managed projects to the adapter so agents know what
+    // exists. When this run has a focused execution workspace, hide primary
+    // checkout paths so parallel issue runs do not write outside isolation.
+    if (effectiveContextProfile !== "focused" && effectiveContextProfile !== "focused_small") {
       try {
-        const overview = await loadCompanyProjectOverview(db, agent.companyId);
+        const overview = await loadCompanyProjectOverview(db, agent.companyId, {
+          redactLocalWorkspacePaths: resolvedWorkspace.source === "execution_workspace",
+        });
         if (overview.items.length > 0) {
           context.combyneCompanyProjects = overview;
           const dirs: string[] = [];
@@ -2374,10 +3254,11 @@ export function heartbeatService(db: Db) {
           }
           if (dirs.length > 0) context.combyneProjectWorkspaceDirs = dirs.slice(0, 10);
           setContextPolicy(context, {
-            profile: contextProfile,
+            profile: effectiveContextProfile,
             focusIssueId: memoryIssueId ?? null,
             focusIssueSource,
             queueDigest: queueDigestPolicy,
+            issueComplexity,
           });
         }
       } catch (err) {
@@ -2447,10 +3328,11 @@ export function heartbeatService(db: Db) {
       }
     }
     setContextPolicy(context, {
-      profile: contextProfile,
+      profile: effectiveContextProfile,
       focusIssueId: memoryIssueId ?? null,
       focusIssueSource,
       queueDigest: queueDigestPolicy,
+      issueComplexity,
     });
     const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
     const previousSessionDisplayId = truncateDisplayId(
@@ -2635,7 +3517,7 @@ export function heartbeatService(db: Db) {
           : undefined;
         const summarizerEnabled = summarizerCfg?.enabled !== false;
         if (summarizerEnabled) {
-          if (contextProfile !== "focused") {
+          if (effectiveContextProfile !== "focused" && effectiveContextProfile !== "focused_small") {
             const standingLatest = await loadLatestSummary(db, {
               agentId: agent.id,
               scopeKind: "standing",
@@ -2671,7 +3553,7 @@ export function heartbeatService(db: Db) {
           // Recent raw turns since the most relevant cutoff. Prefer the
           // working cutoff when an issue is in focus (keeps the block
           // ticket-scoped); fall back to the standing cutoff.
-          if (contextProfile !== "focused" || memoryIssueId) {
+          if (effectiveContextProfile !== "focused_small" && (effectiveContextProfile !== "focused" || memoryIssueId)) {
             const scopeForRecent: SummaryScope = memoryIssueId ? "working" : "standing";
             const recent = await unsummarizedTokensFor(db, {
               companyId: agent.companyId,
@@ -2706,10 +3588,11 @@ export function heartbeatService(db: Db) {
         );
       }
       setContextPolicy(context, {
-        profile: contextProfile,
+        profile: effectiveContextProfile,
         focusIssueId: memoryIssueId ?? null,
         focusIssueSource,
         queueDigest: queueDigestPolicy,
+        issueComplexity,
       });
       await db
         .update(heartbeatRuns)
@@ -2805,7 +3688,8 @@ export function heartbeatService(db: Db) {
           }
           snapshot.pruningMode = pruningMode;
           snapshot.contextPolicy = {
-            profile: contextProfile,
+            profile: effectiveContextProfile,
+            issueComplexity,
             focusIssueId: memoryIssueId ?? null,
             focusIssueSource,
             queueDigest: queueDigestPolicy,
@@ -2843,6 +3727,7 @@ export function heartbeatService(db: Db) {
                 budget: resolveContextBudgetTokens(
                   agent.adapterType,
                   (agent.adapterConfig ?? {}) as Record<string, unknown>,
+                  context,
                 ),
                 composedTokens: shadow.composed.totalTokens,
                 stableTokens: shadow.composed.stableTokens,
@@ -3001,6 +3886,22 @@ export function heartbeatService(db: Db) {
         context,
         usage: (adapterResult.usage ?? {}) as Record<string, unknown>,
       });
+      try {
+        const contextPolicy = parseObject(context.combyneContextPolicy);
+        await mergeRunPromptBudgetMetadata(db, run.id, {
+          issueComplexity: readNonEmptyString(contextPolicy.issueComplexity) ?? null,
+          contextProfile: readNonEmptyString(contextPolicy.contextProfile) ?? null,
+          contextBudgetTokens: resolveContextBudgetTokens(
+            agent.adapterType,
+            (agent.adapterConfig ?? {}) as Record<string, unknown>,
+            context,
+          ),
+          activeTokens: smallTaskBudget.usage.activeTokens,
+          cachedInputTokens: smallTaskBudget.usage.cachedInputTokens,
+        });
+      } catch (err) {
+        logger.debug({ err, runId: run.id }, "prompt budget usage metadata update failed");
+      }
 
       // Round 3 Phase 3 — close the calibration loop. Compares our
       // pre-run estimate with the adapter-reported actual usage.inputTokens
@@ -3097,6 +3998,16 @@ export function heartbeatService(db: Db) {
             exitCode: adapterResult.exitCode,
           },
         });
+        if (outcome === "failed") {
+          await markIssueBlockedAfterFailedRun(db, {
+            run: finalizedRun,
+            agent,
+            message: adapterResult.errorMessage ?? "Adapter failed",
+            errorCode: adapterResult.errorCode ?? "adapter_failed",
+          }).catch((err) => {
+            logger.debug({ err, runId: finalizedRun.id }, "failed-run issue handoff failed");
+          });
+        }
         await releaseIssueExecutionAndPromote(finalizedRun);
         void summarizeRunAndPersist(db, {
           runId: finalizedRun.id,
@@ -3324,6 +4235,7 @@ export function heartbeatService(db: Db) {
         }
 
         if (runIssueId && outcome === "succeeded" && !smallTaskBudget.hardPause) {
+          const completion = summarizeSuccessfulAdapterResult(adapterResult.resultJson, stdoutExcerpt);
           await autoCloseIssueAfterSuccessfulRun(db, {
             companyId: finalizedRun.companyId,
             agentId: finalizedRun.agentId,
@@ -3331,10 +4243,25 @@ export function heartbeatService(db: Db) {
             issueId: runIssueId,
             questionResult,
             allowAutoClose: false,
+            summary: completion.summary,
+            changedFiles: completion.changedFiles,
+            checks: completion.checks,
           }).catch((err) => {
             logger.debug(
               { err, runId: finalizedRun.id, issueId: runIssueId },
               "successful-run auto-close failed",
+            );
+          });
+          await enforceDelegationPolicyAfterSuccessfulRun(db, {
+            companyId: finalizedRun.companyId,
+            agentId: finalizedRun.agentId,
+            runId: finalizedRun.id,
+            issueId: runIssueId,
+            currentWakeReason: readNonEmptyString(context.wakeReason),
+          }).catch((err) => {
+            logger.debug(
+              { err, runId: finalizedRun.id, issueId: runIssueId },
+              "successful-run delegation policy check failed",
             );
           });
         }
@@ -3404,6 +4331,14 @@ export function heartbeatService(db: Db) {
           level: "error",
           message,
         });
+        await markIssueBlockedAfterFailedRun(db, {
+          run: failedRun,
+          agent,
+          message,
+          errorCode,
+        }).catch((handoffErr) => {
+          logger.debug({ err: handoffErr, runId: failedRun.id }, "failed-run issue handoff failed");
+        });
         await releaseIssueExecutionAndPromote(failedRun);
 
         await updateRuntimeState(agent, failedRun, {
@@ -3445,6 +4380,9 @@ export function heartbeatService(db: Db) {
         .select({
           id: issues.id,
           companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          startedAt: issues.startedAt,
         })
         .from(issues)
         .where(and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
@@ -3573,15 +4511,20 @@ export function heartbeatService(db: Db) {
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: newRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
-            executionLockedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(issues.id, issue.id));
+        const issuePatch: Partial<typeof issues.$inferInsert> = {
+          executionRunId: newRun.id,
+          executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
+          executionLockedAt: now,
+          updatedAt: now,
+        };
+        if (
+          issue.assigneeAgentId === deferredAgent.id &&
+          (issue.status === "backlog" || issue.status === "todo")
+        ) {
+          issuePatch.status = "in_progress";
+          issuePatch.startedAt = issue.startedAt ?? now;
+        }
+        await tx.update(issues).set(issuePatch).where(eq(issues.id, issue.id));
 
         return newRun;
       }
@@ -3681,8 +4624,11 @@ export function heartbeatService(db: Db) {
           .select({
             id: issues.id,
             companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
+            startedAt: issues.startedAt,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
@@ -3919,15 +4865,21 @@ export function heartbeatService(db: Db) {
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: newRun.id,
-            executionAgentNameKey: agentNameKey,
-            executionLockedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(issues.id, issue.id));
+        const now = new Date();
+        const issuePatch: Partial<typeof issues.$inferInsert> = {
+          executionRunId: newRun.id,
+          executionAgentNameKey: agentNameKey,
+          executionLockedAt: now,
+          updatedAt: now,
+        };
+        if (
+          issue.assigneeAgentId === agent.id &&
+          (issue.status === "backlog" || issue.status === "todo")
+        ) {
+          issuePatch.status = "in_progress";
+          issuePatch.startedAt = issue.startedAt ?? now;
+        }
+        await tx.update(issues).set(issuePatch).where(eq(issues.id, issue.id));
 
         return { kind: "queued" as const, run: newRun };
       });

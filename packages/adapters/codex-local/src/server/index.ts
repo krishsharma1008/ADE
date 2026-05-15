@@ -1,4 +1,4 @@
-export { execute } from "./execute.js";
+export { execute, stripCodexRolloutNoise } from "./execute.js";
 export { testEnvironment } from "./test.js";
 export { parseCodexJsonl, isCodexUnknownSessionError } from "./parse.js";
 import type { AdapterSessionCodec } from "@combyne/adapter-utils";

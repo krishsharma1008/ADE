@@ -8,6 +8,7 @@ import type {
   QaParserType,
   QaRunnerType,
 } from "@combyne/shared";
+import { applyJavaResolutionEnv, resolveJavaRuntime } from "./java-runtime.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
 
@@ -164,11 +165,27 @@ export function buildQaRunnerCommand(input: {
     }
   }
 
+  let env = asStringRecord(profile.env);
+  if (command.includes("gradlew") && profile.cwd) {
+    const resolution = resolveJavaRuntime({
+      cwd: profile.cwd,
+      javaHome: env.JAVA_HOME ?? process.env.COMBYNE_AUDIT_JAVA_HOME ?? null,
+    });
+    if (resolution.status === "ok") {
+      env = applyJavaResolutionEnv({ PATH: process.env.PATH ?? "", ...env }, resolution);
+      notes.push(
+        `Selected Java ${resolution.javaMajor} for Gradle ${resolution.gradleVersion ?? "unknown"} at ${resolution.javaHome ?? "current JAVA_HOME"}.`,
+      );
+    } else {
+      notes.push(`setup_missing: ${resolution.guidance}`);
+    }
+  }
+
   return {
     command,
     cwd: profile.cwd ?? null,
     timeoutSec,
-    env: asStringRecord(profile.env),
+    env,
     artifactsPath: profile.artifactsPath ?? null,
     notes,
   };

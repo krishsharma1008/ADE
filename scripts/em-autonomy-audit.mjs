@@ -3,6 +3,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { envForJavaResolution, resolveJavaRuntime } from "./java-resolver.mjs";
 
 const DEFAULT_API_URL = process.env.COMBYNE_API_URL ?? "http://127.0.0.1:3100/api";
 const DEFAULT_ROOT = path.join("/tmp", `combyne-em-autonomy-audit-${new Date().toISOString().replace(/[:.]/g, "-")}`);
@@ -30,6 +31,7 @@ function run(command, args, opts = {}) {
     encoding: "utf8",
     stdio: opts.capture ? "pipe" : "inherit",
     cwd: opts.cwd,
+    env: opts.env,
   });
   if (result.status !== 0) {
     const detail = result.stderr || result.stdout || `${command} exited ${result.status}`;
@@ -62,6 +64,7 @@ const wakeRealAgents = hasFlag("wake-real-agents");
 const runQualityChecks = hasFlag("quality-checks");
 const watchMs = Math.max(0, Number(readArg("watch-ms", wakeRealAgents ? "120000" : "10000")) || 0);
 const boardToken = process.env.COMBYNE_BOARD_TOKEN ?? null;
+const javaHome = readArg("java-home", process.env.COMBYNE_AUDIT_JAVA_HOME ?? null);
 
 const processStubAdapterConfig = {
   command: process.execPath,
@@ -276,6 +279,7 @@ async function scenarioAnswerableAmbiguity(ctx) {
     title: "S audit: BNPL validation defaulting",
     description: `Implement defensive defaulting in ${ctx.bnplCopy.target}.`,
     status: "backlog",
+    complexity: "small",
     priority: "medium",
     assigneeAgentId: ctx.em.id,
   });
@@ -285,6 +289,7 @@ async function scenarioAnswerableAmbiguity(ctx) {
     title: "S audit child: default missing spouse income",
     description: "If spouse income is missing during BNPL validation, decide a safe default and add a regression test.",
     status: "backlog",
+    complexity: "small",
     priority: "medium",
     assigneeAgentId: ctx.bnplDev.id,
   });
@@ -323,6 +328,7 @@ async function scenarioQaFeedback(ctx) {
     title: "S audit: Brick token filter regression",
     description: `Fix a small token filter regression in ${ctx.brickCopy.target}.`,
     status: "backlog",
+    complexity: "small",
     priority: "medium",
     assigneeAgentId: ctx.brickDev.id,
   });
@@ -337,7 +343,11 @@ async function scenarioQaFeedback(ctx) {
       platform: "api",
       runnerType: "rest_assured",
       service: "fs-brick-service",
-      commandProfile: { command: "./gradlew test --tests '*PanaceaTokenFilterTest'", cwd: ctx.brickCopy.target },
+      commandProfile: {
+        command: "./gradlew test --tests '*PanaceaTokenFilterTest'",
+        cwd: ctx.brickCopy.target,
+        ...(javaHome ? { env: { JAVA_HOME: javaHome } } : {}),
+      },
     },
   });
   await api(`/qa/runs/${run.id}/results`, {
@@ -382,6 +392,7 @@ async function scenarioParallelTwoRepo(ctx) {
     title: "M audit: parallel BNPL and Brick validation updates",
     description: "Coordinate independent BNPL and Brick changes, then verify both before closure.",
     status: "backlog",
+    complexity: "medium",
     priority: "high",
     assigneeAgentId: ctx.em.id,
   });
@@ -391,6 +402,7 @@ async function scenarioParallelTwoRepo(ctx) {
     title: "M audit child: BNPL validation update",
     description: `Make the BNPL-side change in ${ctx.bnplCopy.target}.`,
     status: "backlog",
+    complexity: "small",
     priority: "high",
     assigneeAgentId: ctx.bnplDev.id,
   });
@@ -400,6 +412,7 @@ async function scenarioParallelTwoRepo(ctx) {
     title: "M audit child: Brick validation update",
     description: `Make the Brick-side change in ${ctx.brickCopy.target}.`,
     status: "backlog",
+    complexity: "small",
     priority: "high",
     assigneeAgentId: ctx.brickDev.id,
   });
@@ -435,6 +448,7 @@ async function scenarioReviewFeedback(ctx) {
     title: "M/L audit: review feedback rework",
     description: "Review a broader BNPL change and make sure review feedback wakes the EM without user nudges.",
     status: "backlog",
+    complexity: "large",
     priority: "high",
     assigneeAgentId: ctx.em.id,
   });
@@ -444,6 +458,7 @@ async function scenarioReviewFeedback(ctx) {
     title: "M/L audit child: reviewer feedback",
     description: "Review the BNPL validation diff and report actionable changes.",
     status: "backlog",
+    complexity: "small",
     priority: "high",
     assigneeAgentId: ctx.reviewer.id,
   });
@@ -475,6 +490,7 @@ async function scenarioHardBlocker(ctx) {
     title: "Negative control: unavailable production credential",
     description: "Requires a missing production Veefin credential that is not present in repo, memory, or company secrets.",
     status: "backlog",
+    complexity: "medium",
     priority: "critical",
     assigneeAgentId: ctx.em.id,
   });
@@ -503,30 +519,36 @@ async function qualityCheck(copy) {
   if (!runQualityChecks) {
     return { repo: copy.target, status: "not_run", detail: "Pass --quality-checks to run Gradle task discovery." };
   }
+  const java = resolveJavaRuntime({ cwd: copy.target, javaHome });
+  if (java.status === "setup_missing") {
+    return {
+      repo: copy.target,
+      status: "setup_missing",
+      detail: java.guidance,
+      java,
+    };
+  }
   try {
-    const output = run("./gradlew", ["tasks", "--all", "--no-daemon"], { cwd: copy.target, capture: true });
-    return { repo: copy.target, status: "pass", detail: output.slice(0, 1000) };
+    const output = run("./gradlew", ["tasks", "--all", "--no-daemon"], {
+      cwd: copy.target,
+      capture: true,
+      env: envForJavaResolution(java),
+    });
+    return { repo: copy.target, status: "pass", detail: output.slice(0, 1000), java };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    const javaVersion = (() => {
-      try {
-        return run("java", ["-version"], { capture: true }).trim();
-      } catch (javaErr) {
-        return javaErr instanceof Error ? javaErr.message : String(javaErr);
-      }
-    })();
     if (/Unsupported class file major version/i.test(detail)) {
       return {
         repo: copy.target,
-        status: "env_blocked",
+        status: "setup_missing",
         detail: [
-          "Gradle/JDK toolchain mismatch: Gradle could not compile settings.gradle because the installed Java runtime emits an unsupported class file major version.",
-          javaVersion,
+          `Gradle/JDK toolchain mismatch. ${java.guidance ?? "Set --java-home or COMBYNE_AUDIT_JAVA_HOME to a compatible JDK."}`,
           detail,
         ].filter(Boolean).join("\n"),
+        java,
       };
     }
-    return { repo: copy.target, status: "fail", detail };
+    return { repo: copy.target, status: "fail", detail, java };
   }
 }
 

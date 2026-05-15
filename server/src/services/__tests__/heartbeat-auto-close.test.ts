@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { activityLog, agents, companies, heartbeatRuns, issueComments, issues } from "@combyne/db";
 import {
   autoCloseIssueAfterSuccessfulRun,
+  enforceDelegationPolicyAfterSuccessfulRun,
   reopenIssuesAutoClosedAfterTokenPause,
 } from "../heartbeat.js";
 import { startTestDb, stopTestDb, type TestDbHandle } from "./_test-db.js";
@@ -11,6 +12,7 @@ describe("heartbeat successful-run auto-close", () => {
   let handle: TestDbHandle;
   let companyId: string;
   let agentId: string;
+  let emAgentId: string;
 
   beforeAll(async () => {
     handle = await startTestDb();
@@ -25,6 +27,11 @@ describe("heartbeat successful-run auto-close", () => {
       .values({ companyId, name: "Engineer", adapterType: "process" })
       .returning();
     agentId = agent.id;
+    const [em] = await handle.db
+      .insert(agents)
+      .values({ companyId, name: "EM", role: "em", adapterType: "process" })
+      .returning();
+    emAgentId = em.id;
   }, 60_000);
 
   afterAll(async () => {
@@ -33,7 +40,7 @@ describe("heartbeat successful-run auto-close", () => {
 
   async function seedIssue(
     status: "todo" | "in_progress" | "awaiting_user" | "done" = "in_progress",
-    opts: { originKind?: string | null } = {},
+    opts: { originKind?: string | null; complexity?: string | null; assigneeAgentId?: string | null } = {},
   ) {
     const [run] = await handle.db
       .insert(heartbeatRuns)
@@ -50,7 +57,8 @@ describe("heartbeat successful-run auto-close", () => {
         companyId,
         title: `Auto-close ${status}`,
         status,
-        assigneeAgentId: agentId,
+        complexity: opts.complexity ?? null,
+        assigneeAgentId: opts.assigneeAgentId ?? agentId,
         executionRunId: run.id,
         originKind: opts.originKind ?? null,
       })
@@ -58,7 +66,7 @@ describe("heartbeat successful-run auto-close", () => {
     return { issue, run };
   }
 
-  it("does not close a manual implementation issue just because the run succeeded", async () => {
+  it("does not close old/manual medium fallback issues just because the run succeeded", async () => {
     const { issue, run } = await seedIssue("in_progress");
 
     const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
@@ -69,10 +77,32 @@ describe("heartbeat successful-run auto-close", () => {
       questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
     });
 
-    expect(result).toEqual({ closed: false, reason: "manual_auto_close_disabled" });
+    expect(result).toEqual({ closed: false, reason: "complexity_medium_requires_policy_close" });
     const [refreshed] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
     expect(refreshed.status).toBe("in_progress");
     expect(refreshed.completedAt).toBeNull();
+  });
+
+  it("auto-closes clean small implementation issues and posts a system completion note", async () => {
+    const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
+
+    const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      issueId: issue.id,
+      questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
+      summary: "Updated the null-safe default.",
+      changedFiles: ["src/example.ts"],
+      checks: ["pnpm test"],
+    });
+
+    expect(result).toEqual({ closed: true, reason: "successful_run_without_questions" });
+    const [refreshed] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(refreshed.status).toBe("done");
+    const comments = await handle.db.select().from(issueComments).where(eq(issueComments.issueId, issue.id));
+    expect(comments.some((comment) => /Run completed successfully/.test(comment.body))).toBe(true);
+    expect(comments.some((comment) => /src\/example\.ts/.test(comment.body))).toBe(true);
   });
 
   it("still auto-closes operational routine issues when no user input is pending", async () => {
@@ -93,7 +123,7 @@ describe("heartbeat successful-run auto-close", () => {
   });
 
   it("does not close when an open question exists", async () => {
-    const { issue, run } = await seedIssue("in_progress");
+    const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
     await handle.db.insert(issueComments).values({
       companyId,
       issueId: issue.id,
@@ -114,6 +144,85 @@ describe("heartbeat successful-run auto-close", () => {
     expect(result.reason).toBe("questions_extracted");
     const [refreshed] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
     expect(refreshed.status).toBe("in_progress");
+  });
+
+  it("does not close small issues with open internal manager questions", async () => {
+    const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
+    await handle.db.insert(issueComments).values({
+      companyId,
+      issueId: issue.id,
+      authorAgentId: agentId,
+      body: "Need EM input on the default.",
+      kind: "manager_question",
+    });
+
+    const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      issueId: issue.id,
+      questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
+    });
+
+    expect(result).toEqual({ closed: false, reason: "open_questions" });
+  });
+
+  it("does not close small issues while child issues are still open", async () => {
+    const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
+    await handle.db.insert(issues).values({
+      companyId,
+      parentId: issue.id,
+      title: "Open child",
+      status: "in_progress",
+      complexity: "small",
+      assigneeAgentId: agentId,
+    });
+
+    const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      issueId: issue.id,
+      questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
+    });
+
+    expect(result).toEqual({ closed: false, reason: "open_child_issues" });
+  });
+
+  it("flags medium coordinator issues that finish without delegated children", async () => {
+    const { issue, run } = await seedIssue("in_progress", {
+      complexity: "medium",
+      assigneeAgentId: emAgentId,
+    });
+
+    const result = await enforceDelegationPolicyAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId: emAgentId,
+      runId: run.id,
+      issueId: issue.id,
+      wakeAssignee: false,
+    });
+
+    expect(result.enforced).toBe(true);
+    expect(result.reason).toBe("delegation_required");
+    const comments = await handle.db.select().from(issueComments).where(eq(issueComments.issueId, issue.id));
+    expect(comments.some((comment) => /Delegation required/.test(comment.body))).toBe(true);
+    const secondResult = await enforceDelegationPolicyAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId: emAgentId,
+      runId: run.id,
+      issueId: issue.id,
+      currentWakeReason: "delegation_required",
+      wakeAssignee: false,
+    });
+    expect(secondResult.reason).toBe("delegation_required_already_pending");
+    const commentsAfterSecondCheck = await handle.db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issue.id));
+    expect(commentsAfterSecondCheck.filter((comment) => /Delegation required/.test(comment.body)).length).toBe(1);
+    const [refreshedRun] = await handle.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect((refreshedRun.promptBudgetJson as Record<string, unknown> | null)?.orchestrationPolicy).toBeTruthy();
   });
 
   it("leaves explicit awaiting_user issues alone", async () => {

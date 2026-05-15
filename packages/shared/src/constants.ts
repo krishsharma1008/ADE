@@ -156,6 +156,15 @@ export type OpenIssueStatus = (typeof OPEN_ISSUE_STATUSES)[number];
 export const ISSUE_PRIORITIES = ["critical", "high", "medium", "low"] as const;
 export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
 
+export const ISSUE_COMPLEXITIES = ["small", "medium", "large"] as const;
+export type IssueComplexity = (typeof ISSUE_COMPLEXITIES)[number];
+
+export const ISSUE_COMPLEXITY_LABELS: Record<IssueComplexity, string> = {
+  small: "S",
+  medium: "M",
+  large: "L",
+};
+
 export const ISSUE_ORIGIN_KINDS = ["manual", "routine_execution", "terminal_session"] as const;
 export type IssueOriginKind = (typeof ISSUE_ORIGIN_KINDS)[number];
 
