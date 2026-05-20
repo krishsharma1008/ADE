@@ -188,6 +188,74 @@ Human-readable note: OTP crash reproduces every run.
     })).toBe(true);
   });
 
+  it("wakes the parent EM when QA feedback is sent on a child issue", async () => {
+    const svc = qaService(handle.db);
+    const [emAgent] = await handle.db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "QA Parent EM",
+        role: "em",
+        adapterType: "process",
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      })
+      .returning();
+    await handle.db
+      .insert(heartbeatRuns)
+      .values({ companyId, agentId: emAgent.id, status: "running", invocationSource: "on_demand" });
+    const [parent] = await handle.db
+      .insert(issues)
+      .values({ companyId, title: "Parent QA handoff", status: "in_progress", assigneeAgentId: emAgent.id })
+      .returning();
+    const [child] = await handle.db
+      .insert(issues)
+      .values({
+        companyId,
+        title: "Child QA fix",
+        status: "in_review",
+        parentId: parent.id,
+        assigneeAgentId: devAgentId,
+      })
+      .returning();
+    const run = await svc.createRun(companyId, {
+      issueId: child.id,
+      qaAgentId,
+      title: "Child Android QA",
+      platform: "android",
+      runnerType: "android_emulator",
+      parserType: "maestro",
+    }, { agentId: qaAgentId, runId: null });
+    await svc.addResult(run.id, {
+      title: "Filter save flow",
+      status: "failed",
+      expectedResult: "The saved filter remains selected after refresh",
+      actualResult: "The filter resets to All after refresh",
+      failureReason: "Selection is not persisted",
+    });
+
+    await svc.createFeedbackForRun(run.id, {
+      toAgentId: devAgentId,
+      createBugIssue: false,
+      wakeDeveloper: false,
+    }, { agentId: qaAgentId });
+
+    const parentComments = await handle.db.select().from(issueComments).where(eq(issueComments.issueId, parent.id));
+    expect(parentComments.some((comment) => comment.body.includes("### QA/review feedback"))).toBe(true);
+    expect(parentComments.some((comment) => comment.body.includes("Child Android QA"))).toBe(true);
+    expect(parentComments.some((comment) => comment.body.includes("Review the QA/review feedback below"))).toBe(true);
+
+    const parentRuns = await handle.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, emAgent.id));
+    expect(parentRuns.some((heartbeatRun) => {
+      const context = heartbeatRun.contextSnapshot as Record<string, unknown> | null;
+      const digest = context?.childDigest as Record<string, unknown> | undefined;
+      const qaFeedback = digest?.qaFeedback as Array<Record<string, unknown>> | undefined;
+      return context?.childIssueId === child.id &&
+        context?.wakeReason === "child_issue_commented" &&
+        context?.wakeCommentId &&
+        qaFeedback?.some((item) => String(item.title ?? "").includes("Child Android QA"));
+    })).toBe(true);
+  });
+
   it("keeps the QA approval gate when explicitly requested", async () => {
     const svc = qaService(handle.db);
     const [approvalIssue] = await handle.db

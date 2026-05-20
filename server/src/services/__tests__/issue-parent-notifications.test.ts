@@ -92,6 +92,55 @@ describe("issue parent notifications", () => {
     })).toBe(true);
   });
 
+  it("wakes the parent when a child becomes awaiting_user with an open question", async () => {
+    const [parent] = await handle.db
+      .insert(issues)
+      .values({ companyId, title: "Parent routing user blocker", status: "in_progress", assigneeAgentId: parentAgentId })
+      .returning();
+    const [child] = await handle.db
+      .insert(issues)
+      .values({
+        companyId,
+        title: "Clarify review blocker",
+        status: "in_progress",
+        complexity: "small",
+        parentId: parent.id,
+        assigneeAgentId: reviewerAgentId,
+      })
+      .returning();
+    await handle.db.insert(issueComments).values({
+      companyId,
+      issueId: child.id,
+      authorAgentId: reviewerAgentId,
+      body: "Which field should be used as the fallback customer identifier?",
+      kind: "question",
+    });
+
+    await issueService(handle.db).update(child.id, { status: "awaiting_user" });
+
+    const parentComments = await handle.db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, parent.id));
+    expect(parentComments.some((comment) => comment.body.includes("Resolve or route the open question"))).toBe(true);
+    expect(parentComments.some((comment) => comment.body.includes("fallback customer identifier"))).toBe(true);
+
+    const parentRuns = await handle.db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, parentAgentId));
+    expect(parentRuns.some((parentRun) => {
+      const context = parentRun.contextSnapshot as Record<string, unknown> | null;
+      const digest = context?.childDigest as Record<string, unknown> | undefined;
+      const openQuestions = digest?.openQuestions as string[] | undefined;
+      return context?.childIssueId === child.id &&
+        context?.childIssueStatus === "awaiting_user" &&
+        context?.wakeReason === "child_issue_awaiting_user" &&
+        context?.wakeCommentId &&
+        openQuestions?.some((question) => question.includes("fallback customer identifier"));
+    })).toBe(true);
+  });
+
   it("blocks failed child runs and wakes the parent with the failure digest", async () => {
     const [parent] = await handle.db
       .insert(issues)

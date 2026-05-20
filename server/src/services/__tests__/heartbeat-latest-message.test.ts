@@ -14,6 +14,22 @@ stdout: wrote file
     expect(deriveLatestUserFacingAgentMessage(raw, null)).toBeNull();
   });
 
+  it("does not surface raw demographic setter QA output as a latest message", () => {
+    const raw = `
+stdout: demographic setter output
+class BankValidationRequestDto {
+  private String accountNumber;
+  @JsonProperty(value = "is_payment_in")
+  private Boolean isPaymentIn;
+  @JsonSetter(nulls = Nulls.SKIP)
+  private Boolean isPaymentIn = false;
+}
+ERROR Unsupported class file major version 69 while compiling settings.gradle
+    `;
+
+    expect(deriveLatestUserFacingAgentMessage(raw, null)).toBeNull();
+  });
+
   it("uses structured adapter summaries", () => {
     expect(
       deriveLatestUserFacingAgentMessage("raw logs", { summary: "QA needs a field mapping decision." }),
