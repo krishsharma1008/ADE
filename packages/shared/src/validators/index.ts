@@ -360,8 +360,10 @@ export {
 export {
   issuePullRequestUpsertSchema,
   issuePullRequestMergeSchema,
+  issuePullRequestFeedbackOptInSchema,
   type IssuePullRequestUpsert,
   type IssuePullRequestMerge,
+  type IssuePullRequestFeedbackOptIn,
 } from "./issue-pull-request.js";
 export {
   qaPlatforms,

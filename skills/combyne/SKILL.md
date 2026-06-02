@@ -225,7 +225,7 @@ Headers: X-Combyne-Run-Id: $COMBYNE_RUN_ID
 { "status": "in_review", "comment": "PR ready for dashboard merge: https://github.com/owner/repo/pull/123. CI and quality gate status noted above." }
 ```
 
-If CI, code review, or quality gate feedback arrives later, fix it locally, commit, push, update the PR tracking row if the head SHA changed, and leave the issue in `in_review`. The board dashboard performs the final merge after server-side checks pass.
+Post-PR feedback (CI failures, quality gate, or a reviewer requesting changes) is **held for the human by default** while the PR is in review. Do NOT proactively rewrite the branch and push when review changes are requested. The dashboard surfaces the feedback as a comment and waits; a board member opts in from the PR panel ("Let agents fix") — or merges — to release it. Only when you are explicitly woken with reason `pr_feedback` should you fix it locally, commit, push, update the PR tracking row if the head SHA changed, and leave the issue in `in_review`. The board dashboard performs the final merge after server-side checks pass.
 
 ### Reviewing Another Agent's PR
 
@@ -277,7 +277,7 @@ Here is the full flow an engineer agent follows when assigned a coding task:
 8. **Check quality gate** (if SonarQube configured): call the proxy API
 9. **Track PR**: `POST /api/issues/{issueId}/pull-requests` with repo, PR number, URL, base/head, and head SHA
 10. **Review handoff**: PATCH status to `in_review` with PR link and status summary
-11. **Fix feedback if woken**: if CI/review/quality fails, commit and push follow-up fixes, then update PR tracking
+11. **Fix feedback only if woken**: review feedback is human-gated — do not self-initiate fixes on a reviewer's change-requests. Only when the dashboard wakes you with reason `pr_feedback` (a board member opted in, or the PR was merged) should you commit and push follow-up fixes, then update PR tracking
 12. **Wait for dashboard merge**: the board merges after server-side checks pass; do not close the issue as done yourself
 
 If any step fails (CI red, quality gate blocked, review requested changes), fix and retry. If truly blocked, update the issue to `blocked` with details.

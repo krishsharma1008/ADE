@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   activityLog,
@@ -288,7 +288,7 @@ export async function autoCloseIssueAfterSuccessfulRun(
           OR ${issuePullRequests.reviewStatus} = 'changes_requested'
           OR ${issuePullRequests.ciStatus} IN ('failed', 'failing')
           OR ${issuePullRequests.qualityStatus} IN ('failed', 'blocked')
-          OR ${issuePullRequests.feedbackStatus} IN ('needs_agent', 'sent')
+          OR ${issuePullRequests.feedbackStatus} IN ('needs_agent', 'sent', 'awaiting_human')
         )`,
       ),
     )
@@ -675,7 +675,8 @@ function buildCoordinatorGuidance(agent: {
   return [
     "## Coordinator execution guidance",
     "",
-    "- Default to hands-off execution for small tasks. Do not wait for a human nudge after child/reviewer/QA feedback.",
+    "- Default to hands-off execution for small tasks: keep internal work moving on child/QA feedback without waiting for a human nudge.",
+    "- EXCEPTION — pull request review feedback is human-gated. When a reviewer requests changes (or post-PR CI/quality feedback lands) on a PR awaiting review, the dashboard holds it for the human by default. Do NOT proactively rewrite and push in response to review feedback. Only act on it when you are explicitly woken with reason `pr_feedback`, which happens after a board member opts in from the PR panel (or merges). Until then, leave the PR in `in_review` and let the human review.",
     "- If a child agent asks a question and the answer is available from parent issue context, comments, QA/review feedback, repo state, or company memory, answer it yourself with `POST /api/issues/{issueId}/internal-questions/{commentId}/answer` and body `{ \"answer\": \"...\", \"assumption\": true }` when you are choosing a reasonable default.",
     "- Answer internal child questions before escalating. Escalate to the human only for credentials/access, approval gates, destructive actions, budget/legal risk, or a true product/business decision with no reasonable default.",
     "- Parallelize independent work across available agents, but keep same-issue code changes serialized by the issue execution lock.",
@@ -4605,6 +4606,68 @@ export function heartbeatService(db: Db) {
     if (source !== "timer" && !policy.wakeOnDemand) {
       await writeSkippedRequest("heartbeat.wakeOnDemand.disabled");
       return null;
+    }
+
+    // Per-issue PR review hold: while a tracked PR for the target issue (or the child
+    // issue a notification/question references) is awaiting human review, suppress
+    // AUTOMATIC wakeups so review-feedback churn (delegation, parent notifications,
+    // question routing) can't re-ignite work the human is still reviewing. Human/board
+    // actions (requestedByActorType "user") pass through — including the one-shot
+    // "Let agents fix" release, which marks its wake user-originated.
+    if (opts.requestedByActorType !== "user") {
+      const reviewHoldIssueIds = Array.from(
+        new Set(
+          [
+            issueId,
+            readNonEmptyString((payload as Record<string, unknown> | null)?.childIssueId),
+            readNonEmptyString(enrichedContextSnapshot.childIssueId),
+          ].filter((value): value is string => Boolean(value)),
+        ),
+      );
+      // A wake aimed at a specific PR is only frozen by THAT PR's own hold — a sibling PR
+      // held on the same issue must not block it (an issue can have multiple PRs).
+      const targetPullRequestId =
+        readNonEmptyString((payload as Record<string, unknown> | null)?.issuePullRequestId) ??
+        readNonEmptyString(enrichedContextSnapshot.issuePullRequestId);
+
+      let heldPr: { id: string } | null = null;
+      if (reviewHoldIssueIds.length > 0) {
+        const conditions = [
+          eq(issuePullRequests.companyId, agent.companyId),
+          inArray(issuePullRequests.issueId, reviewHoldIssueIds),
+          eq(issuePullRequests.feedbackStatus, "awaiting_human"),
+          ne(issuePullRequests.mergeStatus, "merged"),
+        ];
+        if (targetPullRequestId) conditions.push(eq(issuePullRequests.id, targetPullRequestId));
+        heldPr = await db
+          .select({ id: issuePullRequests.id })
+          .from(issuePullRequests)
+          .where(and(...conditions))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      } else if (source === "timer") {
+        // Timer heartbeats carry no issue scope; freeze the assignee's own proactive
+        // polling while one of their PRs awaits human review so they don't re-touch held
+        // work. Event-driven wakes (assignments, etc.) are unaffected.
+        heldPr = await db
+          .select({ id: issuePullRequests.id })
+          .from(issuePullRequests)
+          .innerJoin(issues, eq(issues.id, issuePullRequests.issueId))
+          .where(
+            and(
+              eq(issuePullRequests.companyId, agent.companyId),
+              eq(issues.assigneeAgentId, agentId),
+              eq(issuePullRequests.feedbackStatus, "awaiting_human"),
+              ne(issuePullRequests.mergeStatus, "merged"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      }
+      if (heldPr) {
+        await writeSkippedRequest("issue.pr_review_hold");
+        return null;
+      }
     }
 
     const bypassIssueExecutionLock =

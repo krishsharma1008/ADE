@@ -28,6 +28,8 @@ export const companiesApi = {
     >,
   ) => api.patch<Company>(`/companies/${companyId}`, data),
   archive: (companyId: string) => api.post<Company>(`/companies/${companyId}/archive`, {}),
+  pause: (companyId: string) => api.post<Company>(`/companies/${companyId}/pause`, {}),
+  resume: (companyId: string) => api.post<Company>(`/companies/${companyId}/resume`, {}),
   remove: (companyId: string) => api.delete<{ ok: true }>(`/companies/${companyId}`),
   exportBundle: (companyId: string, data: { include?: { company?: boolean; agents?: boolean } }) =>
     api.post<CompanyPortabilityExportResult>(`/companies/${companyId}/export`, data),

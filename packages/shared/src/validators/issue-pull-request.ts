@@ -21,3 +21,8 @@ export const issuePullRequestMergeSchema = z.object({
   decisionNote: z.string().optional().nullable(),
 });
 export type IssuePullRequestMerge = z.infer<typeof issuePullRequestMergeSchema>;
+
+export const issuePullRequestFeedbackOptInSchema = z.object({
+  enabled: z.boolean(),
+});
+export type IssuePullRequestFeedbackOptIn = z.infer<typeof issuePullRequestFeedbackOptInSchema>;

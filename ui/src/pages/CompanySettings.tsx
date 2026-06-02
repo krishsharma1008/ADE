@@ -136,6 +136,14 @@ export function CompanySettings() {
     setSnippetCopied(false);
     setSnippetCopyDelightId(0);
   }, [selectedCompanyId]);
+  const pauseMutation = useMutation({
+    mutationFn: ({ companyId, paused }: { companyId: string; paused: boolean }) =>
+      paused ? companiesApi.pause(companyId) : companiesApi.resume(companyId),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.companies.stats });
+    }
+  });
   const archiveMutation = useMutation({
     mutationFn: ({
       companyId,
@@ -382,6 +390,61 @@ export function CompanySettings() {
                 </div>
               </div>
             </div>
+          )}
+        </div>
+      </div>
+
+      {/* Autonomy controls */}
+      <div className="space-y-4">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+          Autonomy
+        </div>
+        <div className="space-y-3 rounded-md border border-border px-4 py-4">
+          {selectedCompany.status === "archived" ? (
+            <p className="text-sm text-muted-foreground">
+              This company is archived — all agent activity is already stopped. Unarchive it
+              to resume work.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                {selectedCompany.status === "paused"
+                  ? "This company is paused. Agents won't pick up or continue any work until you resume — give yourself time to review without shutting down ADE."
+                  : "Pause this company to immediately stop all agent activity (delegation, PR feedback, wakeups) and cancel queued or running work. Nothing is lost — resume any time to pick back up. Use this instead of closing ADE when you need to review."}
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant={selectedCompany.status === "paused" ? "default" : "outline"}
+                  disabled={pauseMutation.isPending}
+                  onClick={() => {
+                    if (!selectedCompanyId) return;
+                    pauseMutation.mutate({
+                      companyId: selectedCompanyId,
+                      paused: selectedCompany.status !== "paused"
+                    });
+                  }}
+                >
+                  {pauseMutation.isPending
+                    ? selectedCompany.status === "paused"
+                      ? "Resuming..."
+                      : "Pausing..."
+                    : selectedCompany.status === "paused"
+                    ? "Resume company"
+                    : "Pause company"}
+                </Button>
+                {selectedCompany.status === "paused" && (
+                  <span className="text-xs font-medium text-amber-400">Paused</span>
+                )}
+                {pauseMutation.isError && (
+                  <span className="text-xs text-destructive">
+                    {pauseMutation.error instanceof Error
+                      ? pauseMutation.error.message
+                      : "Failed to update company"}
+                  </span>
+                )}
+              </div>
+            </>
           )}
         </div>
       </div>

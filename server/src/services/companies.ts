@@ -132,6 +132,36 @@ export function companyService(db: Db) {
         return company;
       }),
 
+    // Soft, reversible pause: blocks every new wakeup/run via isCompanyActive (status
+    // must be "active") without archiving the company or terminating its agents. Pair
+    // with heartbeat.cancelActiveForCompany() at the route to also stop in-flight runs.
+    pause: (id: string, reason: string = "manual") =>
+      db
+        .update(companies)
+        .set({
+          status: "paused",
+          pauseReason: reason,
+          pausedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(companies.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null),
+
+    resume: (id: string, data: Partial<typeof companies.$inferInsert> = {}) =>
+      db
+        .update(companies)
+        .set({
+          ...data,
+          status: "active",
+          pauseReason: null,
+          pausedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(companies.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null),
+
     remove: (id: string) =>
       db.transaction(async (tx) => {
         // Delete from child tables in dependency order
