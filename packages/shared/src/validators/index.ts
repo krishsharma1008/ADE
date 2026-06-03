@@ -7,6 +7,8 @@ export {
   patchInstanceExperimentalSettingsSchema,
   type InstanceExperimentalSettings,
   type PatchInstanceExperimentalSettings,
+  DEFAULT_ISOLATION_MODES,
+  type DefaultIsolationMode,
 } from "./instance.js";
 
 export {

@@ -171,6 +171,7 @@ export type {
   InstanceExperimentalSettings,
   InstanceGeneralSettings,
   InstanceSettings,
+  DefaultIsolationMode,
   Agent,
   AgentPermissions,
   AgentKeyCreated,
@@ -403,6 +404,7 @@ export {
   instanceExperimentalSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   type PatchInstanceExperimentalSettings,
+  DEFAULT_ISOLATION_MODES,
 } from "./validators/index.js";
 
 export {

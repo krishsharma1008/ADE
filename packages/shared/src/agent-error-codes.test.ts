@@ -69,6 +69,8 @@ describe("resolveAgentErrorCode", () => {
       "adapter_failed",
       "agent_not_found",
       "cancelled",
+      "claude_usage_limit_reached",
+      "usage_pause_max_retries",
       "openclaw_gateway_agent_error",
       "openclaw_gateway_url_invalid",
       "openclaw_gateway_url_missing",

@@ -51,6 +51,103 @@ async function runGit(args: string[], cwd: string): Promise<{ stdout: string; st
   });
 }
 
+export interface DirtyFile {
+  /** Path relative to the repo root, as reported by `git status --porcelain`. */
+  path: string;
+  /** Two-character porcelain status code (e.g. " M", "??", "A "). */
+  code: string;
+  /** Whether the change is untracked (`??`). */
+  untracked: boolean;
+}
+
+export interface DirtyFilesRelatedToIssue {
+  /** All dirty + untracked files in the checkout (relative paths). */
+  all: DirtyFile[];
+  /**
+   * Files whose path appears to relate to the issue identifier
+   * (path contains the identifier, slugified or raw). Best-effort.
+   */
+  related: DirtyFile[];
+  /** Dirty files that do NOT obviously relate to the issue identifier. */
+  unrelated: DirtyFile[];
+  /** True when there is at least one dirty/untracked file. */
+  hasDirty: boolean;
+}
+
+function parsePorcelainStatus(stdout: string): DirtyFile[] {
+  const out: DirtyFile[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line) continue;
+    const code = line.slice(0, 2);
+    let rest = line.slice(3);
+    // Rename/copy lines look like "R  old -> new"; keep the destination path.
+    const arrowIdx = rest.indexOf(" -> ");
+    if (arrowIdx !== -1) {
+      rest = rest.slice(arrowIdx + 4);
+    }
+    const filePath = rest.trim();
+    if (!filePath) continue;
+    out.push({ path: filePath, code, untracked: code === "??" });
+  }
+  return out;
+}
+
+/**
+ * Read-only classification of a checkout's dirty/untracked files into
+ * "related to this issue identifier" vs "unrelated". Used by the workspace
+ * scope guard to decide whether a dirty base checkout is leftover from a
+ * prior session of the SAME issue (tolerable) or contamination from another
+ * issue (unclean).
+ *
+ * Best-effort and never throws — a non-repo or git failure yields an empty,
+ * non-dirty result so callers can degrade gracefully.
+ */
+export async function filterDirtyFilesRelatedToIssue(
+  issueIdentifier: string | null,
+  cwd: string,
+): Promise<DirtyFilesRelatedToIssue> {
+  const empty: DirtyFilesRelatedToIssue = {
+    all: [],
+    related: [],
+    unrelated: [],
+    hasDirty: false,
+  };
+  if (!cwd || cwd.length === 0) return empty;
+  if (!(await pathExists(cwd))) return empty;
+
+  let files: DirtyFile[] = [];
+  try {
+    const status = await runGit(["status", "--porcelain=v1", "--untracked-files=all"], cwd);
+    files = parsePorcelainStatus(status.stdout);
+  } catch {
+    return empty;
+  }
+
+  if (files.length === 0) {
+    return { all: [], related: [], unrelated: [], hasDirty: false };
+  }
+
+  const needles: string[] = [];
+  if (issueIdentifier && issueIdentifier.trim().length > 0) {
+    const raw = issueIdentifier.trim().toLowerCase();
+    needles.push(raw);
+    // Branch/path slug variants: PAP-12 -> pap-12, pap_12, pap12
+    needles.push(raw.replace(/-/g, "_"));
+    needles.push(raw.replace(/-/g, ""));
+  }
+
+  const related: DirtyFile[] = [];
+  const unrelated: DirtyFile[] = [];
+  for (const file of files) {
+    const lowerPath = file.path.toLowerCase();
+    const isRelated = needles.length > 0 && needles.some((needle) => lowerPath.includes(needle));
+    if (isRelated) related.push(file);
+    else unrelated.push(file);
+  }
+
+  return { all: files, related, unrelated, hasDirty: files.length > 0 };
+}
+
 function parseLogLines(stdout: string): GitCommitMatch[] {
   const out: GitCommitMatch[] = [];
   for (const line of stdout.split("\n")) {

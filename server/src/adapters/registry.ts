@@ -3,6 +3,7 @@ import {
   execute as claudeExecute,
   testEnvironment as claudeTestEnvironment,
   sessionCodec as claudeSessionCodec,
+  getQuotaWindows as claudeGetQuotaWindows,
 } from "@combyne/adapter-claude-local/server";
 import { agentConfigurationDoc as claudeAgentConfigurationDoc, models as claudeModels } from "@combyne/adapter-claude-local";
 import {
@@ -73,6 +74,7 @@ const claudeLocalAdapter: ServerAdapterModule = {
   models: claudeModels,
   supportsLocalAgentJwt: true,
   agentConfigurationDoc: claudeAgentConfigurationDoc,
+  getQuotaWindows: claudeGetQuotaWindows,
 };
 
 const codexLocalAdapter: ServerAdapterModule = {

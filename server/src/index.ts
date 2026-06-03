@@ -706,10 +706,26 @@ export async function startServer(): Promise<StartedServer> {
     const AWAITING_USER_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
     let lastAwaitingUserSweepAt = 0;
 
-    // Reap orphaned runs at startup (no threshold -- runningProcesses is empty)
-    void heartbeat.reapOrphanedRuns().catch((err) => {
-      logger.error({ err }, "startup reap of orphaned heartbeat runs failed");
-    });
+    // Issue 4 — usage-pause boot recovery MUST run before reapOrphanedRuns so
+    // the reaper sees a clean window set: it deletes windows whose run is gone
+    // or no longer paused_usage and leaves valid ones for the resume poller.
+    // A window whose reset elapsed while ADE was down is picked up on the first
+    // post-boot poll (nextRetryAt/resetsAt <= now). No-ops when the flag is off.
+    const usagePauseEnabledFlag = process.env.COMBYNE_USAGE_PAUSE_ENABLED === "true";
+    const bootUsagePauseRecovery = usagePauseEnabledFlag
+      ? heartbeat.bootRecoverUsagePausedRuns().catch((err) => {
+          logger.error({ err }, "startup usage-pause boot recovery failed");
+          return null;
+        })
+      : Promise.resolve(null);
+
+    // Reap orphaned runs at startup (no threshold -- runningProcesses is empty).
+    // Chained AFTER usage-pause boot recovery so the ordering invariant holds.
+    void bootUsagePauseRecovery
+      .then(() => heartbeat.reapOrphanedRuns())
+      .catch((err) => {
+        logger.error({ err }, "startup reap of orphaned heartbeat runs failed");
+      });
     // Also sweep issue-side lock leaks at startup — runs that finalized
     // but whose issue rows never released the executionRunId pointer.
     void heartbeat.reapOrphanedIssueLocks().catch((err) => {
@@ -797,8 +813,34 @@ export async function startServer(): Promise<StartedServer> {
           });
       }
     }, config.heartbeatSchedulerIntervalMs);
+
+    // Issue 4 — usage-pause resume poller. Independent 60s cadence (the resume
+    // decision is reset-time driven, not heartbeat driven). Gated by
+    // COMBYNE_USAGE_PAUSE_ENABLED; resumeUsagePausedRuns() itself also no-ops
+    // when the flag is off, so this is belt-and-suspenders.
+    if (usagePauseEnabledFlag) {
+      const USAGE_PAUSE_POLL_INTERVAL_MS = 60 * 1000;
+      let usagePausePollInFlight = false;
+      setInterval(() => {
+        if (usagePausePollInFlight) return;
+        usagePausePollInFlight = true;
+        void heartbeat
+          .resumeUsagePausedRuns(new Date())
+          .then((result) => {
+            if (result.resumed > 0) {
+              logger.info({ ...result }, "usage-pause poll resumed runs");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "usage-pause resume poll failed");
+          })
+          .finally(() => {
+            usagePausePollInFlight = false;
+          });
+      }, USAGE_PAUSE_POLL_INTERVAL_MS);
+    }
   }
-  
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
     let backupInFlight = false;

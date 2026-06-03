@@ -6,9 +6,13 @@ export const instanceGeneralSettingsSchema = z.object({
 
 export const patchInstanceGeneralSettingsSchema = instanceGeneralSettingsSchema.partial();
 
+export const DEFAULT_ISOLATION_MODES = ["per_issue_worktree", "shared_workspace"] as const;
+export type DefaultIsolationMode = (typeof DEFAULT_ISOLATION_MODES)[number];
+
 export const instanceExperimentalSettingsSchema = z.object({
   enableIsolatedWorkspaces: z.boolean().default(false),
   autoRestartDevServerWhenIdle: z.boolean().default(false),
+  defaultIsolationMode: z.enum(DEFAULT_ISOLATION_MODES).default("shared_workspace"),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();

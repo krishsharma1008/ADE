@@ -330,6 +330,13 @@
       "when": 1778803200000,
       "tag": "0046_issue_complexity",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1780405304500,
+      "tag": "0047_careless_sir_ram",
+      "breakpoints": true
     }
   ]
 }

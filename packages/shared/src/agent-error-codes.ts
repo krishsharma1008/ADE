@@ -60,6 +60,36 @@ const ENTRIES: AgentErrorCodeEntry[] = [
       "Open the run log and search for the first `stderr` line. If it mentions authentication, run `combyne doctor` to probe the adapter. If it mentions rate limits or quota, wait and retry. Otherwise file the run id.",
     severity: "investigate",
   },
+  {
+    // Emitted as `integration_auth_required:<provider>` — the provider slug
+    // (atlassian/linear/slack/google-drive/gmail/google-calendar/supabase/…)
+    // is appended after the colon and resolved out by `resolveAgentErrorCode`.
+    code: "integration_auth_required",
+    title: "Integration needs re-authentication",
+    body: "An MCP / integration tool the agent called returned a 401/403 (unauthenticated). The run did NOT do the work it appeared to — the agent was paused and is waiting for you to reconnect the integration. This never auto-closes.",
+    remediation:
+      "Open the provider auth link posted on the issue and reconnect the integration (re-run the OAuth / login flow). Once the token is valid, wake the agent again. Repeated failures circuit-break automatic retries.",
+    severity: "user_action",
+  },
+
+  // ── Provider usage / subscription limits ─────────────────────────
+  {
+    code: "claude_usage_limit_reached",
+    title: "Claude usage limit reached",
+    body: "Claude reported a usage / subscription-window limit (e.g. the 5-hour window, a rate limit, or a 429). The run was paused — NOT failed — and the session was preserved so the exact same conversation can resume once the window resets. No work was lost.",
+    remediation:
+      "Nothing to do — Combyne parks the run and resumes it automatically when the provider window resets (the reset time, when reported, is in the run's errorMeta.resetsAt). If you need it sooner, upgrade the Claude plan or attach an API-key-billed agent. Repeated limits across many runs mean the subscription is undersized for the workload.",
+    severity: "retry",
+    docsUrl: "https://docs.claude.com/claude-code",
+  },
+  {
+    code: "usage_pause_max_retries",
+    title: "Usage-paused run gave up after repeated limits",
+    body: "A run that was paused on a Claude usage / subscription-window limit was retried automatically once the window was believed to have reset, but it kept hitting the limit (or could not resume) past the retry budget. The run was finally failed and the issue handed back so a human can decide what to do.",
+    remediation:
+      "The Claude subscription is almost certainly undersized for the current workload, or the session can no longer be resumed. Upgrade the plan, attach an API-key-billed agent for this work, or re-run the issue on a fresh session. Check the run's last error message for whether it was a persistent limit or a resume failure.",
+    severity: "investigate",
+  },
 
   // ── Agent lifecycle ───────────────────────────────────────────────
   {
@@ -191,7 +221,18 @@ export function resolveAgentErrorCode(
   if (!code) return null;
   const trimmed = code.trim();
   if (!trimmed) return null;
-  return ENTRY_BY_CODE.get(trimmed) ?? unknownEntry(trimmed);
+  const exact = ENTRY_BY_CODE.get(trimmed);
+  if (exact) return exact;
+  // Parametric codes carry a `:<detail>` suffix (e.g.
+  // `integration_auth_required:atlassian`). Fall back to the base code so the
+  // provider-specific variant still resolves to a real taxonomy entry instead
+  // of the unknown-code fallback.
+  const colon = trimmed.indexOf(":");
+  if (colon > 0) {
+    const base = ENTRY_BY_CODE.get(trimmed.slice(0, colon));
+    if (base) return { ...base, code: trimmed };
+  }
+  return unknownEntry(trimmed);
 }
 
 /** Enumeration of every code the taxonomy ships. Used for tests + docs. */

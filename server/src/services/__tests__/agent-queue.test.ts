@@ -183,7 +183,11 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
     // Focus block present and loud.
     expect(result.focusBody).toMatch(/🎯 Current focus/);
     expect(result.focusBody).toMatch(/open high-priority/);
-    expect(result.directive).toMatch(/only to the current focus issue/i);
+    // Scope-aware directive names the issue and tells the agent to file
+    // separate tickets for cross-service work rather than implement inline.
+    expect(result.directive).toMatch(/Respond only to the scope of/i);
+    expect(result.directive).toMatch(/open high-priority/);
+    expect(result.directive).toMatch(/STOP and create separate issues/i);
 
     // Digest block labels itself and lists OTHERS — never the focus issue.
     expect(result.digestBody).toMatch(/Other open issues/);
@@ -209,8 +213,11 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
       focusMode: true,
     });
     expect(result.currentIssueMissing).toBe(true);
+    // Focus body only renders when the issue row resolves...
     expect(result.focusBody).toBe("");
-    expect(result.directive).toBeNull();
+    // ...but the scope directive is always-on whenever there is a current
+    // issue id, even when the row did not resolve into the queue.
+    expect(result.directive).toMatch(/Respond only to the scope of/i);
     // Digest still renders all open items.
     expect(result.digestBody).toMatch(/open high-priority/);
   });
@@ -229,8 +236,11 @@ describe("agent-queue: loadAssignedIssueQueue", () => {
       currentIssueId: currentId,
       focusMode: false,
     });
+    // The loud rendered focus block is suppressed when focus is off...
     expect(result.focusBody).toBe("");
-    expect(result.directive).toBeNull();
+    // ...but the scope-fence directive is a SAFETY guardrail and is still
+    // produced whenever there is a current issue, even with focusMode off.
+    expect(result.directive).toMatch(/Respond only to the scope of/i);
     // No "Other open issues" heading when focus is off.
     expect(result.digestBody).not.toMatch(/Other open issues/);
   });

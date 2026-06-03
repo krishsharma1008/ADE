@@ -164,6 +164,7 @@ export type {
   InstanceGeneralSettings,
   InstanceExperimentalSettings,
   InstanceSettings,
+  DefaultIsolationMode,
 } from "./instance.js";
 export type {
   JsonSchema,

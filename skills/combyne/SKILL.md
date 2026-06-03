@@ -194,6 +194,28 @@ If the quality gate **fails**: fix the issues in your branch, commit, and push a
 
 If the quality gate **passes**: move the issue to review and wait for dashboard merge. Do not merge it yourself.
 
+### Design Quality Self-Review (Before Review Handoff)
+
+SonarQube enforces *metrics* (coverage, duplications, complexity numbers) post-PR, but it does
+not catch the Clean-Code / OOP *design* smells that draw repeated reviewer comments (god
+classes, deep nesting, copy-paste, inheritance-for-reuse, opaque tests). Before you move the
+issue to `in_review`, run a **design self-review pass** over your own diff.
+
+For BukuWarung Java services, this is the **Pre-Push Step 7b** checklist in the
+`buku-code-development` skill (`skills/buku-code-development/SKILL.md` → Pre-Push Step 7b),
+backed by `skills/buku-code-development/references/clean-code.md` sections A–G. It is a
+mandatory *pass* you perform and fix, with **objective thresholds** where quantifiable
+(method body `> 25 lines` or `> 3` nesting levels → extract; a block duplicated `≥ 3` times →
+extract).
+
+- Re-read your diff against clean-code sections A–G; fix any smell **before** pushing the
+  branch and opening the PR. Do not push-and-ask the reviewer to flag it.
+- If a clean-code rule conflicts with the service's framework idiom or local convention, keep
+  the local convention, document the trade-off in the PR description, and ask the
+  reviewer/architect — do not silently rewrite the idiom.
+- This is *your* self-review of *your own* PR; it does not replace, and is separate from,
+  reviewing another agent's PR (below).
+
 ### Human-Gated Pull Request Merge
 
 Agents must never merge pull requests. Do not run `gh pr merge`, do not run a direct GitHub merge API call, and do not merge protected base branches locally. Branch pushes, PR creation, and follow-up fix pushes are allowed; merge is a board/dashboard action.
@@ -229,22 +251,40 @@ Post-PR feedback (CI failures, quality gate, or a reviewer requesting changes) i
 
 ### Reviewing Another Agent's PR
 
-If asked to review a PR (via task assignment or @-mention):
+Reviewing another agent's PR is **gated work, never unsolicited**. You may post a PR review
+**only** when all of the following hold:
+
+- You have been **assigned a task** whose `originKind` is `pr_review_requested`.
+- That task names the **exact `repo#number`** you are being asked to review.
+- `COMBYNE_TASK_ID` is set in your environment (the assignment wakeup injected it). If it is
+  not set, you do not have a review task — stop.
+
+When you hold a valid `pr_review_requested` task for the named `repo#number`:
 
 ```bash
-# View the PR
+# Read the PR named by the review task
 gh pr view <number>
 gh pr diff <number>
-
-# Leave a review
-gh pr review <number> --approve --body "LGTM - code quality looks good, tests pass."
-# Or request changes:
-gh pr review <number> --request-changes --body "Found an issue: ..."
 ```
 
-### GitHub Integration Proxy API (Alternative)
+Then record your review as a **comment on the review task in Combyne** (status update on
+`$COMBYNE_TASK_ID`) with your assessment and recommendation. Do **not** run a raw
+`gh pr review` against another agent's PR — `gh pr review --approve` / `--request-changes`
+posted unsolicited from your local CLI is not an authorized action. Approving or merging is a
+**board/dashboard** decision, and the server's `/reviews` proxy is board-only; agents are
+blocked there by design, so there is no agent-callable review-submit endpoint.
 
-Agents can also use the Combyne server proxy for GitHub operations. This is useful when you need structured API access or when `gh` CLI is not available:
+If you were not assigned a `pr_review_requested` task (for example, you merely saw a PR URL or
+were @-mentioned without a review task):
+
+- **Check your queue** for a `pr_review_requested` assignment naming that `repo#number`.
+- If there is none, **ask the requester** to open a review task; do not review on your own.
+
+### GitHub Integration Proxy API (read-only helpers)
+
+When you need structured GitHub data and the `gh` CLI is not available, the Combyne server
+proxy exposes **read-only** helpers. Review submission and merge are **not** agent actions —
+they are board/dashboard decisions (the `/reviews` proxy is board-only and blocks agents).
 
 | Action | Endpoint |
 |--------|----------|
@@ -254,8 +294,7 @@ Agents can also use the Combyne server proxy for GitHub operations. This is usef
 | List PRs | `GET /api/companies/:companyId/integrations/github/repos/:repo/pulls` |
 | Create PR | `POST /api/companies/:companyId/integrations/github/repos/:repo/pulls` |
 | Merge PR | Board/dashboard only; agents must not call merge endpoints |
-| Create review | `POST /api/companies/:companyId/integrations/github/repos/:repo/pulls/:number/reviews` |
-| Add comment | `POST /api/companies/:companyId/integrations/github/repos/:repo/pulls/:number/comments` |
+| Submit PR review | Board/dashboard only; agents are blocked from the `/reviews` proxy |
 | Check CI | `GET /api/companies/:companyId/integrations/github/repos/:repo/commits/:ref/checks` |
 | Quality gate | `GET /api/companies/:companyId/integrations/sonarqube/quality-gate` |
 | Code issues | `GET /api/companies/:companyId/integrations/sonarqube/issues` |

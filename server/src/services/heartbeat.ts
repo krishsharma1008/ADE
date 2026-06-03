@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   activityLog,
@@ -22,6 +22,7 @@ import {
   projects,
   projectWorkspaces,
   qaFeedbackEvents,
+  usagePauseWindows,
 } from "@combyne/db";
 import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -56,6 +57,8 @@ import {
 } from "./context-budget-telemetry.js";
 import { resolveModel } from "@combyne/context-budget";
 import { inspectGitStateForIssue } from "./git-state.js";
+import { verifyCleanBaseCheckoutForIssue } from "./workspace-scope-guard.js";
+import { validateScopeDiffBeforeAutoClose } from "./scope-diff-validator.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
 import { extractAndPostQuestions, extractQuestionsFromText, type ExtractedQuestionsResult } from "./agent-question-extract.js";
 import { issueService } from "./issues.js";
@@ -122,6 +125,30 @@ const TOKEN_PAUSE_COMMENT_PREFIXES = [
 function autoCloseManualIssueRunsEnabled(): boolean {
   return asBoolean(process.env.COMBYNE_AUTO_CLOSE_MANUAL_ISSUES, false);
 }
+
+/**
+ * Issue 4 — master flag for the usage-pause engine. Default OFF.
+ *
+ * When false:
+ *   - the run-completion path treats a `claude_usage_limit_reached` adapter
+ *     result as an ordinary failure (no pause, no window), and
+ *   - the resume scheduler (resumeUsagePausedRuns) no-ops.
+ *
+ * Read live (not cached) so it can be flipped in env without a code path
+ * change, matching the COMBYNE_SUMMARIZER_ENABLED pattern in index.ts.
+ */
+export function usagePauseEnabled(): boolean {
+  return process.env.COMBYNE_USAGE_PAUSE_ENABLED === "true";
+}
+
+// Resume backoff ceiling — never wait more than 5 minutes between resume
+// polls for a given window, even after repeated "not reset yet" re-polls.
+const USAGE_PAUSE_MAX_BACKOFF_MS = 5 * 60 * 1000;
+
+// What a single resume attempt actually did, so the poller's
+// {resumed,deferred,failed} counters are accurate (a defer/fail inside
+// attemptResumeExecution must not be miscounted as a resume).
+type ResumeOutcome = "resumed" | "deferred" | "failed";
 
 function runIssueIdFromContext(run: typeof heartbeatRuns.$inferSelect): string | null {
   const snapshot = parseObject(run.contextSnapshot);
@@ -195,6 +222,243 @@ export async function markIssueBlockedAfterFailedRun(
   );
 
   return { blocked: true, issueId, reason: "blocked_after_failed_run" };
+}
+
+// ── Issue 3 — MCP / integration auth-failure loop ─────────────────────────
+//
+// A 401 from an MCP tool must NEVER be reported as success or silently
+// auto-close. The adapter encodes the provider in the errorCode as
+// `integration_auth_required:<provider>` (heartbeat_runs has no error_meta
+// column, so the code IS the channel). The heartbeat then (a) transitions the
+// issue to awaiting_user with a provider auth link instead of blocking it, and
+// (b) circuit-breaks after 3 consecutive failed runs so we stop auto-retrying
+// against a broken integration.
+
+const INTEGRATION_AUTH_ERROR_PREFIX = "integration_auth_required";
+
+/** Provider slug -> friendly label for human-facing comments. */
+const INTEGRATION_PROVIDER_LABELS: Record<string, string> = {
+  atlassian: "Atlassian (Jira / Confluence)",
+  jira: "Jira",
+  linear: "Linear",
+  slack: "Slack",
+  "google-drive": "Google Drive",
+  gmail: "Gmail",
+  "google-calendar": "Google Calendar",
+  supabase: "Supabase",
+  integration: "the integration",
+};
+
+function isIntegrationAuthErrorCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && code.startsWith(INTEGRATION_AUTH_ERROR_PREFIX);
+}
+
+/**
+ * Parse the provider slug out of an `integration_auth_required:<provider>`
+ * code. Returns `"integration"` (generic) when no slug is present.
+ */
+function providerFromAuthErrorCode(code: string | null | undefined): string {
+  if (!isIntegrationAuthErrorCode(code)) return "integration";
+  const slug = String(code).split(":")[1]?.trim();
+  return slug && slug.length > 0 ? slug : "integration";
+}
+
+function integrationProviderLabel(provider: string): string {
+  return INTEGRATION_PROVIDER_LABELS[provider] ?? provider;
+}
+
+function dashboardBaseUrl(): string {
+  return (
+    process.env.COMBYNE_PUBLIC_URL?.trim().replace(/\/$/, "") ||
+    `http://127.0.0.1:${process.env.PORT?.trim() || "3100"}`
+  );
+}
+
+/**
+ * Best-effort deep link to re-authenticate a provider. Known providers map to
+ * their canonical OAuth / login entry point; everything else falls back to the
+ * Combyne integrations settings page (or a localhost equivalent when no public
+ * dashboard URL is configured).
+ */
+export function inferAuthUrlForProvider(provider: string): string {
+  const slug = (provider || "integration").trim().toLowerCase();
+  const known: Record<string, string> = {
+    atlassian: "https://id.atlassian.com/login",
+    jira: "https://id.atlassian.com/login",
+    linear: "https://linear.app/settings/account/security",
+    slack: "https://slack.com/signin",
+    "google-drive": "https://accounts.google.com/signin",
+    gmail: "https://accounts.google.com/signin",
+    "google-calendar": "https://accounts.google.com/signin",
+    supabase: "https://supabase.com/dashboard/sign-in",
+  };
+  if (known[slug]) return known[slug];
+  return `${dashboardBaseUrl()}/settings/integrations/${slug}`;
+}
+
+function buildIntegrationAuthComment(input: {
+  provider: string;
+  runId: string;
+  agentName: string;
+  errorMessage: string | null | undefined;
+  authUrl: string;
+  breaker?: boolean;
+}): string {
+  const label = integrationProviderLabel(input.provider);
+  const summary = compactFailureText(input.errorMessage ?? `${input.provider} auth required`);
+  if (input.breaker) {
+    return [
+      `Integration auth still failing for ${label} after 3 consecutive runs — pausing automatic retries.`,
+      "",
+      `- Latest run: ${input.runId}`,
+      `- Agent: ${input.agentName}`,
+      `- Error: ${summary}`,
+      "",
+      `Reconnect ${label} here: ${input.authUrl}`,
+      "",
+      "Once the integration is reconnected, wake the agent again to resume. The agent will not auto-retry until then.",
+    ].join("\n");
+  }
+  return [
+    `This issue is paused: the agent's ${label} integration returned an authentication error (401/403), so the run could not complete.`,
+    "",
+    `- Run: ${input.runId}`,
+    `- Agent: ${input.agentName}`,
+    `- Error: ${summary}`,
+    "",
+    `Reconnect ${label} here: ${input.authUrl}`,
+    "",
+    "After reconnecting the integration, wake the agent again to continue. This was NOT auto-closed — no real work happened on this run.",
+  ].join("\n");
+}
+
+/**
+ * Count how many of this issue's recent runs failed with the SAME provider's
+ * integration-auth error inside the last 24h. Filters to `status="failed"`
+ * (so in-progress / queued runs can't false-trip the count) and limits the
+ * scan to 3 rows. Returns the count plus whether the breaker should fire.
+ *
+ * heartbeat_runs has no issueId column, so we scope by company + agent +
+ * errorCode + window in SQL, then filter to this issue via the JSON context
+ * snapshot in JS (cheap — the window + limit keep the row set tiny).
+ */
+export async function trackConsecutiveAuthFailure(
+  db: Db,
+  input: {
+    issueId: string;
+    provider: string;
+    companyId: string;
+    agentId: string;
+  },
+): Promise<{ count: number; breakerTripped: boolean }> {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const errorCode = `${INTEGRATION_AUTH_ERROR_PREFIX}:${input.provider}`;
+
+  // Scope to THIS issue in SQL so the `LIMIT 3` is never consumed by other
+  // issues' runs for the same agent/provider. issueId lives in the JSON
+  // context_snapshot — match the direct `issueId`/`taskId` keys as well as the
+  // deferred-wake nested form (mirrors `runIssueIdFromContext`).
+  const issueScope = sql`(
+    ${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}
+    OR ${heartbeatRuns.contextSnapshot}->>'taskId' = ${input.issueId}
+    OR ${heartbeatRuns.contextSnapshot}->${DEFERRED_WAKE_CONTEXT_KEY}->>'issueId' = ${input.issueId}
+    OR ${heartbeatRuns.contextSnapshot}->${DEFERRED_WAKE_CONTEXT_KEY}->>'taskId' = ${input.issueId}
+  )`;
+
+  const rows = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        eq(heartbeatRuns.status, "failed"),
+        eq(heartbeatRuns.errorCode, errorCode),
+        gt(heartbeatRuns.finishedAt, since),
+        issueScope,
+      ),
+    )
+    .orderBy(desc(heartbeatRuns.finishedAt))
+    .limit(3);
+
+  const count = rows.length;
+  return { count, breakerTripped: count >= 3 };
+}
+
+/**
+ * Transition an issue to `awaiting_user` after an MCP/integration auth failure
+ * and post a provider auth link. Mirrors the small-task pause precedent
+ * (issueComments.insert + issueService.update). Fires the circuit-breaker
+ * comment once 3 consecutive same-provider failures have accumulated.
+ */
+export async function pauseIssueForIntegrationAuth(
+  db: Db,
+  input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: Pick<typeof agents.$inferSelect, "id" | "name">;
+    errorCode: string | null | undefined;
+    errorMessage: string | null | undefined;
+  },
+): Promise<{ paused: boolean; issueId: string | null; reason: string; breakerTripped: boolean }> {
+  const issueId = runIssueIdFromContext(input.run);
+  if (!issueId) return { paused: false, issueId: null, reason: "missing_issue_scope", breakerTripped: false };
+
+  const issue = await db
+    .select({ id: issues.id, companyId: issues.companyId, status: issues.status })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId)))
+    .then((rows) => rows[0] ?? null);
+
+  if (!issue) return { paused: false, issueId, reason: "issue_not_found", breakerTripped: false };
+  if (issue.status === "done" || issue.status === "cancelled") {
+    return { paused: false, issueId, reason: `status_${issue.status}`, breakerTripped: false };
+  }
+
+  const provider = providerFromAuthErrorCode(input.errorCode);
+  const authUrl = inferAuthUrlForProvider(provider);
+
+  const breaker = await trackConsecutiveAuthFailure(db, {
+    issueId,
+    provider,
+    companyId: issue.companyId,
+    agentId: input.run.agentId,
+  });
+
+  const commentBody = buildIntegrationAuthComment({
+    provider,
+    runId: input.run.id,
+    agentName: input.agent.name,
+    errorMessage: input.errorMessage,
+    authUrl,
+    breaker: breaker.breakerTripped,
+  });
+
+  await db.insert(issueComments).values({
+    companyId: issue.companyId,
+    issueId: issue.id,
+    authorAgentId: null,
+    authorUserId: null,
+    body: commentBody,
+    kind: "system",
+  });
+
+  await issueService(db).update(
+    issue.id,
+    {
+      status: "awaiting_user",
+      latestUserFacingAgentMessage: `${integrationProviderLabel(provider)} authentication required. Reconnect the integration: ${authUrl}`,
+    },
+    {
+      parentNotificationActor: { actorType: "system", actorId: null },
+    },
+  );
+
+  return {
+    paused: true,
+    issueId,
+    reason: breaker.breakerTripped ? "integration_auth_breaker_tripped" : "integration_auth_awaiting_user",
+    breakerTripped: breaker.breakerTripped,
+  };
 }
 
 export async function autoCloseIssueAfterSuccessfulRun(
@@ -943,6 +1207,19 @@ export type ResolvedWorkspaceForRun = {
     repoRef: string | null;
   }>;
   warnings: string[];
+  /**
+   * Set when the per-issue workspace scope guard refused to fork an isolated
+   * workspace from a base checkout contaminated by another issue's
+   * uncommitted work. The caller must abort the run (do not invoke the
+   * adapter), post the supplied comment to the issue, and leave the issue for
+   * a human to triage. Null on the normal path.
+   */
+  scopeRefusal?: {
+    issueId: string;
+    reason: string;
+    suggestion: string;
+    baseCwd: string;
+  } | null;
 };
 
 function readNonEmptyString(value: unknown): string | null {
@@ -984,8 +1261,13 @@ export async function resolveWorkspaceForHeartbeatRun(
     : null;
   const experimentalSettings = await instanceSettingsService(db)
     .getExperimental()
-    .catch(() => ({ enableIsolatedWorkspaces: false }));
+    .catch(() => ({
+      enableIsolatedWorkspaces: false,
+      autoRestartDevServerWhenIdle: false,
+      defaultIsolationMode: "shared_workspace" as const,
+    }));
   const isolatedWorkspacesEnabled = experimentalSettings.enableIsolatedWorkspaces === true;
+  const defaultIsolationMode = experimentalSettings.defaultIsolationMode ?? "shared_workspace";
   const projectPolicy = gateProjectExecutionWorkspacePolicy(
     parseProjectExecutionWorkspacePolicy(projectRow?.executionWorkspacePolicy),
     isolatedWorkspacesEnabled,
@@ -997,11 +1279,31 @@ export async function resolveWorkspaceForHeartbeatRun(
     rawIssueSettings.mode = issueRow.executionWorkspacePreference;
   }
   const issueSettings = parseIssueExecutionWorkspaceSettings(rawIssueSettings);
-  const executionWorkspaceMode = resolveExecutionWorkspaceMode({
+  let executionWorkspaceMode = resolveExecutionWorkspaceMode({
     projectPolicy,
     issueSettings,
     legacyUseProjectWorkspace: input.useProjectWorkspace ?? null,
   });
+
+  // Default-isolation upgrade (P1.A §5d): when the resolved mode is
+  // shared_workspace but this issue resolves a real project repo and the
+  // instance flag opts into per-issue worktrees, upgrade to isolation so a
+  // "code ticket" runs in its own fenced checkout. Gated on
+  // isolatedWorkspacesEnabled because the worktree realization path itself is
+  // gated on it; without it the upgrade would have no effect.
+  if (
+    executionWorkspaceMode === "shared_workspace" &&
+    defaultIsolationMode === "per_issue_worktree" &&
+    isolatedWorkspacesEnabled &&
+    Boolean(issueRow) &&
+    Boolean(workspaceProjectId)
+  ) {
+    executionWorkspaceMode = "isolated_workspace";
+    logger.debug(
+      { agentId: agent.id, issueId: issueRow?.id, projectId: resolvedProjectId },
+      "workspace_isolation.default_upgrade_to_isolated",
+    );
+  }
 
   const projectWorkspaceRows = workspaceProjectId
     ? await db
@@ -1090,6 +1392,107 @@ export async function resolveWorkspaceForHeartbeatRun(
             workspaceHints,
             warnings: [],
           };
+        }
+
+        // Per-issue workspace scope guard (P1.A §5b). Before forking an
+        // isolated worktree from the shared BASE checkout, verify that base is
+        // not contaminated by another issue's uncommitted work. We only reach
+        // here when there is no reusable workspace for this issue, i.e. this is
+        // a fresh isolation. If the issue has never had an execution workspace
+        // and is not already on the isolated preference, treat a dirty-base as
+        // first-time isolation of a previously-shared checkout → SOFT WARN
+        // (proceed + comment). Otherwise a dirty-unrelated base is a hard
+        // refusal.
+        const scopeWarnings: string[] = [];
+        try {
+          const scopeCheck = await verifyCleanBaseCheckoutForIssue(db, {
+            baseCwd: projectCwd,
+            issueId: issueRow.id,
+            issueIdentifier: issueRow.identifier ?? null,
+          });
+          if (!scopeCheck.clean) {
+            const firstTimeIsolation =
+              !issueRow.executionWorkspaceId &&
+              issueRow.executionWorkspacePreference !== "isolated_workspace";
+            if (firstTimeIsolation) {
+              // Soft warn — proceed, but surface a comment so a human can
+              // confirm the leftover work is intentional.
+              const softMessage =
+                `Heads up: this issue is moving to an isolated per-issue workspace for the first time, ` +
+                `but the shared base checkout \`${projectCwd}\` has uncommitted changes that are not obviously ` +
+                `attributable to this issue. Proceeding with isolation; the new worktree forks from the current ` +
+                `base state. ${scopeCheck.suggestion}`;
+              scopeWarnings.push(softMessage);
+              await logActivity(db, {
+                companyId: agent.companyId,
+                actorType: "system",
+                actorId: agent.id,
+                action: "workspace_scope_violation",
+                entityType: "issue",
+                entityId: issueRow.id,
+                agentId: agent.id,
+                details: {
+                  severity: "soft_warn",
+                  baseCwd: projectCwd,
+                  reason: scopeCheck.reason,
+                  issueIdentifier: issueRow.identifier ?? null,
+                },
+              }).catch(() => {});
+              await db
+                .insert(issueComments)
+                .values({
+                  companyId: agent.companyId,
+                  issueId: issueRow.id,
+                  authorAgentId: null,
+                  authorUserId: null,
+                  body: softMessage,
+                })
+                .catch(() => {});
+            } else {
+              // Hard refuse — the base is contaminated and we have no reason to
+              // believe the dirty work is ours. Do not fork; abort the run.
+              await logActivity(db, {
+                companyId: agent.companyId,
+                actorType: "system",
+                actorId: agent.id,
+                action: "workspace_scope_violation",
+                entityType: "issue",
+                entityId: issueRow.id,
+                agentId: agent.id,
+                details: {
+                  severity: "refused",
+                  baseCwd: projectCwd,
+                  reason: scopeCheck.reason,
+                  suggestion: scopeCheck.suggestion,
+                  issueIdentifier: issueRow.identifier ?? null,
+                },
+              }).catch(() => {});
+              return {
+                cwd: projectCwd,
+                source: "project_primary" as const,
+                projectId: resolvedProjectId,
+                workspaceId: workspace.id,
+                projectWorkspaceId: workspace.id,
+                executionWorkspaceId: null,
+                executionWorkspaceMode,
+                repoUrl: workspace.repoUrl,
+                repoRef: workspace.repoRef,
+                workspaceHints,
+                warnings: [scopeCheck.reason, scopeCheck.suggestion],
+                scopeRefusal: {
+                  issueId: issueRow.id,
+                  reason: scopeCheck.reason,
+                  suggestion: scopeCheck.suggestion,
+                  baseCwd: projectCwd,
+                },
+              };
+            }
+          }
+        } catch (err) {
+          logger.debug(
+            { err, agentId: agent.id, issueId: issueRow.id },
+            "workspace scope guard check failed; proceeding without scope enforcement",
+          );
         }
 
         try {
@@ -1215,7 +1618,7 @@ export async function resolveWorkspaceForHeartbeatRun(
               repoUrl: workspace.repoUrl,
               repoRef: baseRef,
               workspaceHints,
-              warnings: realized.warnings,
+              warnings: [...scopeWarnings, ...realized.warnings],
             };
           }
         } catch (err) {
@@ -2007,7 +2410,11 @@ export function heartbeatService(db: Db) {
     const existing = await getRuntimeState(agent.id);
     if (existing) return existing;
 
-    return db
+    // Idempotent insert. agentId is the PK, so two concurrent callers (e.g. the
+    // usage-pause resume poller racing another wake on the same agent) could
+    // both pass the existence check and both INSERT — the second would throw a
+    // duplicate-key error. onConflictDoNothing + a re-read makes this safe.
+    const inserted = await db
       .insert(agentRuntimeState)
       .values({
         agentId: agent.id,
@@ -2015,8 +2422,12 @@ export function heartbeatService(db: Db) {
         adapterType: agent.adapterType,
         stateJson: {},
       })
+      .onConflictDoNothing({ target: agentRuntimeState.agentId })
       .returning()
-      .then((rows) => rows[0]);
+      .then((rows) => rows[0] ?? null);
+    if (inserted) return inserted;
+    // Lost the insert race — the row now exists; read it back.
+    return getRuntimeState(agent.id);
   }
 
   async function setRunStatus(
@@ -2304,6 +2715,616 @@ export function heartbeatService(db: Db) {
     }
   }
 
+  // ────────────────────────────────────────────────────────────────────────
+  // Issue 4 — usage-pause / resume engine.
+  //
+  // When the Claude adapter reports a usage/subscription-window limit, the
+  // run-completion path calls handleUsageLimitResponse(), which parks the run
+  // as `paused_usage`, keeps the issue lock held, and writes a
+  // usage_pause_windows row. A 60s poller (resumeUsagePausedRuns) later checks
+  // whether the provider window has reset and, if so, re-dispatches the paused
+  // run through the EXISTING run pipeline (set 'queued' + startNextQueuedRun).
+  //
+  // Everything here is gated by usagePauseEnabled() (default OFF) at the
+  // call sites in the completion path and in index.ts; the functions
+  // themselves are defensive but assume the caller already checked the flag.
+  // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Park a run on a Claude usage limit instead of failing it.
+   *
+   * - upserts a usage_pause_windows row keyed by runId (idempotent on conflict),
+   * - sets the run status AND its wakeup status to `paused_usage`,
+   * - does NOT release the issue lock (releaseIssueExecutionAndPromote) — the
+   *   lock stays held so a sibling agent can't grab the issue,
+   * - does NOT finalize the agent status,
+   * - logs a `usage_pause` activity,
+   *
+   * Returns true when the run was parked (caller must RETURN early), false when
+   * it declined to park (caller falls through to normal failure handling).
+   */
+  async function handleUsageLimitResponse(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    adapterResult: AdapterExecutionResult;
+    sessionIdToResume: string | null;
+    sessionCwd: string | null;
+    seq: number;
+  }): Promise<boolean> {
+    const { run, agent, adapterResult, sessionIdToResume, sessionCwd, seq } = input;
+
+    // Without a session id to resume from we cannot continue the exact
+    // conversation the limit interrupted. Decline the pause and let the normal
+    // failure path handle it (so the work isn't silently lost in a pause we
+    // could never resume).
+    if (!sessionIdToResume) {
+      logger.warn(
+        { runId: run.id, agentId: agent.id },
+        "usage_pause.declined_no_session",
+      );
+      return false;
+    }
+
+    const errorMeta = parseObject(adapterResult.errorMeta ?? null);
+    const resetsAtRaw = readNonEmptyString(errorMeta.resetsAt);
+    const resetsAtMs = resetsAtRaw ? Date.parse(resetsAtRaw) : NaN;
+    const resetsAt = Number.isFinite(resetsAtMs) ? new Date(resetsAtMs) : null;
+    const pauseReason = resetsAt ? "subscription_limit" : "unknown_reset_time";
+    const now = new Date();
+    // First retry: at the reported reset (when known), else after one backoff
+    // step. The poller re-checks the real window before resuming regardless.
+    const firstRetryAt = resetsAt ?? new Date(now.getTime() + 30_000);
+    const lastErrorMessage = adapterResult.errorMessage ?? "Claude usage limit reached";
+
+    await db
+      .insert(usagePauseWindows)
+      .values({
+        companyId: run.companyId,
+        agentId: agent.id,
+        runId: run.id,
+        sessionIdToResume,
+        sessionCwd: sessionCwd ?? null,
+        pausedAt: now,
+        resetsAt,
+        pauseReason,
+        nextRetryAt: firstRetryAt,
+        lastErrorMessage,
+        lastResumeAttemptResult: {
+          ok: false,
+          code: "claude_usage_limit_reached",
+        },
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: usagePauseWindows.runId,
+        set: {
+          // Idempotent re-pause (e.g. a resume that hit the limit again). Keep
+          // the existing attemptCount/backoff (the resume path bumps those);
+          // refresh the session, reset time, and error.
+          sessionIdToResume,
+          sessionCwd: sessionCwd ?? null,
+          resetsAt,
+          pauseReason,
+          nextRetryAt: firstRetryAt,
+          lastErrorMessage,
+          lastResumeAttemptResult: {
+            ok: false,
+            code: "claude_usage_limit_reached",
+          },
+          updatedAt: now,
+        },
+      });
+
+    await setRunStatus(run.id, "paused_usage", {
+      finishedAt: null,
+      error: lastErrorMessage,
+      errorCode: "claude_usage_limit_reached",
+      exitCode: adapterResult.exitCode ?? null,
+      signal: adapterResult.signal ?? null,
+    });
+    await setWakeupStatus(run.wakeupRequestId, "paused_usage", {
+      error: lastErrorMessage,
+    });
+
+    const parkedRun = await getRun(run.id);
+    if (parkedRun) {
+      await appendRunEvent(parkedRun, seq, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "run paused on Claude usage limit",
+        payload: {
+          status: "paused_usage",
+          resetsAt: resetsAt ? resetsAt.toISOString() : null,
+          pauseReason,
+        },
+      });
+    }
+
+    const issueId = resolveRunIssueId(run);
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "usage-pause-engine",
+      action: "usage_pause",
+      entityType: issueId ? "issue" : "agent",
+      entityId: issueId ?? agent.id,
+      agentId: agent.id,
+      runId: run.id,
+      details: {
+        reason: pauseReason,
+        resetsAt: resetsAt ? resetsAt.toISOString() : null,
+        sessionIdToResume,
+        sessionCwd: sessionCwd ?? null,
+        message: lastErrorMessage,
+      },
+    }).catch((err) => {
+      logger.debug({ err, runId: run.id }, "usage_pause activity log failed");
+    });
+
+    logger.warn(
+      {
+        runId: run.id,
+        agentId: agent.id,
+        companyId: run.companyId,
+        resetsAt: resetsAt ? resetsAt.toISOString() : null,
+        pauseReason,
+      },
+      "run.paused_usage",
+    );
+
+    return true;
+  }
+
+  /**
+   * Has the provider window reset? Per the plan:
+   *   - stored resetsAt is null → re-poll the adapter's getQuotaWindows; if it
+   *     reports a future reset, treat as NOT reset; otherwise NOT reset (we
+   *     don't fabricate a reset out of "unknown"). → false unless we can prove
+   *     the window has reset.
+   *   - stored resetsAt > now → false (still throttled).
+   *   - stored resetsAt <= now → true (reset).
+   */
+  async function checkIfQuotaWindowReset(
+    adapterType: string,
+    resetsAt: Date | null,
+    now: Date,
+  ): Promise<boolean> {
+    if (resetsAt) {
+      return resetsAt.getTime() <= now.getTime();
+    }
+    // No stored reset time — re-poll the adapter best-effort. The claude
+    // adapter derives a 5h window from its last in-process limit observation.
+    try {
+      const adapter = getServerAdapter(adapterType);
+      if (!adapter.getQuotaWindows) {
+        // Adapter can't tell us anything; without evidence we stay paused and
+        // rely on the capped backoff to keep re-polling cheaply.
+        return false;
+      }
+      const result = await adapter.getQuotaWindows();
+      if (!result.ok) return false;
+      // If ANY window still reports a future reset / 100% usage we're still
+      // throttled. If no window reports a future reset, the observation has
+      // aged out → treat the window as reset. The adapter-utils type is
+      // `unknown[]`, so narrow each window defensively.
+      for (const raw of result.windows) {
+        const w = parseObject(raw);
+        const wResetAt = readNonEmptyString(w.resetsAt);
+        const wResetMs = wResetAt ? Date.parse(wResetAt) : NaN;
+        if (Number.isFinite(wResetMs) && wResetMs > now.getTime()) {
+          return false;
+        }
+        const usedPercent = typeof w.usedPercent === "number" ? w.usedPercent : 0;
+        if (usedPercent >= 100 && !wResetAt) {
+          // Throttled with an unknown reset — can't prove a reset yet.
+          return false;
+        }
+      }
+      return true;
+    } catch (err) {
+      logger.debug({ err, adapterType }, "checkIfQuotaWindowReset poll failed");
+      return false;
+    }
+  }
+
+  /**
+   * Fail a usage-paused run for good (retry budget exhausted, or a
+   * non-retryable resume error). NOW we release the issue lock and finalize the
+   * agent — the things handleUsageLimitResponse deliberately deferred.
+   */
+  async function failUsagePausedRun(
+    window: typeof usagePauseWindows.$inferSelect,
+    reason: string,
+    errorCode = "usage_pause_max_retries",
+  ): Promise<void> {
+    const run = await getRun(window.runId);
+    // Always remove the window first so no poller picks it up again.
+    await db.delete(usagePauseWindows).where(eq(usagePauseWindows.id, window.id));
+
+    if (!run) {
+      logger.warn(
+        { runId: window.runId, windowId: window.id },
+        "failUsagePausedRun.run_missing",
+      );
+      return;
+    }
+
+    const failedRun = await setRunStatus(run.id, "failed", {
+      finishedAt: new Date(),
+      error: reason,
+      errorCode,
+    });
+    await setWakeupStatus(run.wakeupRequestId, "failed", {
+      finishedAt: new Date(),
+      error: reason,
+    });
+
+    const target = failedRun ?? run;
+    await appendRunEvent(target, 1, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "error",
+      message: reason,
+      payload: { status: "failed", errorCode },
+    }).catch(() => {});
+
+    const agent = await getAgent(run.agentId);
+    if (agent) {
+      await markIssueBlockedAfterFailedRun(db, {
+        run: target,
+        agent,
+        message: reason,
+        errorCode,
+      }).catch((err) => {
+        logger.debug({ err, runId: run.id }, "usage_pause fail handoff failed");
+      });
+    }
+
+    await releaseIssueExecutionAndPromote(target);
+    await finalizeAgentStatus(run.agentId, "failed");
+    await startNextQueuedRunForAgent(run.agentId);
+
+    logger.warn(
+      { runId: run.id, agentId: run.agentId, errorCode, reason },
+      "usage_pause.run_failed",
+    );
+  }
+
+  /**
+   * Resume a single usage-paused run whose window is believed reset.
+   *
+   * Gates (every "defer" bumps attempt + backs off so we don't spin):
+   *   - company must be active (never bypass a company/budget pause),
+   *   - the saved sessionCwd must still match the currently-resolved workspace
+   *     cwd (mismatch → defer; the workspace moved out from under the session).
+   *
+   * On a green light we re-dispatch through the EXISTING run pipeline: write
+   * the resume session into runtime state, set the run back to `queued`, and
+   * call startNextQueuedRunForAgent. The normal completion path then handles
+   * the outcome — including a fresh usage limit, which re-pauses idempotently
+   * via handleUsageLimitResponse. The window is deleted by the completion path
+   * once the resumed run reaches a terminal (non-paused) status, OR here on a
+   * non-retryable failure.
+   */
+  async function attemptResumeExecution(
+    window: typeof usagePauseWindows.$inferSelect,
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now: Date,
+  ): Promise<ResumeOutcome> {
+    // Report what actually happened so the poller's {resumed,deferred,failed}
+    // counters are accurate. A "defer" (company inactive, cwd mismatch,
+    // workspace resolution error, lost CAS race) must NOT be counted as a
+    // resume — otherwise operational telemetry hides runs that are silently
+    // stuck. A defer whose attempt budget is now exhausted escalates to a fail.
+    const deferRetryable = async (reason: string): Promise<ResumeOutcome> => {
+      const attemptCount = window.attemptCount + 1;
+      if (attemptCount >= window.maxRetries) {
+        await failUsagePausedRun(
+          window,
+          `Usage-paused run exceeded ${window.maxRetries} resume attempts: ${reason}`,
+        );
+        return "failed";
+      }
+      const backoff = Math.min(
+        window.retryBackoffMs * 2,
+        USAGE_PAUSE_MAX_BACKOFF_MS,
+      );
+      await db
+        .update(usagePauseWindows)
+        .set({
+          attemptCount,
+          retryBackoffMs: backoff,
+          nextRetryAt: new Date(now.getTime() + backoff),
+          lastErrorMessage: reason,
+          lastResumeAttemptResult: { ok: false, deferred: true, reason },
+          updatedAt: now,
+        })
+        .where(eq(usagePauseWindows.id, window.id));
+      logger.info(
+        { runId: run.id, agentId: agent.id, attemptCount, reason },
+        "usage_pause.resume_deferred",
+      );
+      return "deferred";
+    };
+
+    // GATE: company must be active. A company/budget pause must NEVER be
+    // bypassed by the resume path — defer (retryable) until it's reactivated.
+    if (!(await isCompanyActive(agent.companyId))) {
+      return deferRetryable("company is not active");
+    }
+
+    // VALIDATE: the saved cwd must still match where this issue/agent would run
+    // now. If the workspace moved (e.g. an isolated execution workspace was
+    // realized), resuming the old session in the wrong cwd is unsafe.
+    if (window.sessionCwd) {
+      try {
+        const context = parseObject(run.contextSnapshot);
+        const resolvedWorkspace = await resolveWorkspaceForRun(
+          agent,
+          context,
+          { sessionId: window.sessionIdToResume, cwd: window.sessionCwd },
+          { useProjectWorkspace: null },
+        );
+        const currentCwd = readNonEmptyString(resolvedWorkspace.cwd);
+        if (
+          currentCwd &&
+          path.resolve(currentCwd) !== path.resolve(window.sessionCwd)
+        ) {
+          return deferRetryable(
+            `workspace cwd changed (${window.sessionCwd} -> ${currentCwd})`,
+          );
+        }
+      } catch (err) {
+        return deferRetryable(
+          `workspace resolution failed: ${err instanceof Error ? err.message : "unknown"}`,
+        );
+      }
+    }
+
+    // Green light. Persist the resume session onto the agent runtime so the
+    // existing executeRun() session-resolution path resumes the exact session
+    // (adapter invokes `--resume <sessionIdToResume>` in the matching cwd).
+    //
+    // For the non-task-keyed path executeRun reads runtime.sessionId (the
+    // agentRuntimeState.sessionId column) as the resume id; the cwd is resolved
+    // fresh by resolveWorkspaceForRun and we already validated it still matches
+    // window.sessionCwd above. Setting the column is therefore sufficient — we
+    // intentionally do NOT touch a task session here (the paused run resumes
+    // its own session, not a per-task one).
+    await ensureRuntimeState(agent);
+
+    // Re-queue the paused run FIRST. CAS from 'paused_usage' → 'queued' so two
+    // concurrent pollers can't both flip it. We win the run-CAS BEFORE touching
+    // the window or runtime state: a poller that LOSES the race then leaves the
+    // window completely untouched (no attempt bump to roll back), which closes
+    // the multi-process clobber race where a loser's "rollback" would stomp the
+    // winner's bump (or a fresh re-pause's ON CONFLICT attemptCount) and hand
+    // out unbounded extra retries — a budget/lock leak. With this ordering the
+    // attempt is only ever bumped by the poller that actually owns the resume.
+    const requeued = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "queued",
+        finishedAt: null,
+        error: null,
+        errorCode: null,
+        recoveryStatus: null,
+        updatedAt: now,
+      })
+      .where(
+        and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "paused_usage")),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+
+    if (!requeued) {
+      // Lost the race (another poller, or the run changed state). The window is
+      // untouched — nothing to roll back — so we just report a non-resume.
+      logger.info(
+        { runId: run.id, agentId: agent.id },
+        "usage_pause.resume_requeue_lost_race",
+      );
+      // Lost the CAS race — NOT a resume. Report as deferred so the counters
+      // reflect that this poll did not actually re-dispatch the run.
+      return "deferred";
+    }
+
+    // We own the resume. Now bump the attempt + backoff and push nextRetryAt out
+    // so the poller won't double-resume while this run executes, and write the
+    // resume session onto runtime state for executeRun's --resume path. We KEEP
+    // the window (we do NOT delete it here): the retry budget must persist
+    // across re-pauses. The window is removed by the completion path when the
+    // resumed run reaches a terminal, non-paused status
+    // (cleanupUsagePauseWindowForRun), or by failUsagePausedRun when the budget
+    // is exhausted. If the resume hits the limit again,
+    // handleUsageLimitResponse's ON CONFLICT preserves this attemptCount.
+    //
+    // The window attempt-bump is itself guarded on the attemptCount we observed
+    // (an optimistic CAS): if a concurrent re-pause already advanced it, we do
+    // NOT overwrite — we never lower a budget counter.
+    const attemptCount = window.attemptCount + 1;
+    await db
+      .update(usagePauseWindows)
+      .set({
+        attemptCount,
+        nextRetryAt: new Date(now.getTime() + USAGE_PAUSE_MAX_BACKOFF_MS),
+        lastResumeAttemptResult: { ok: true, resumedAt: now.toISOString() },
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(usagePauseWindows.id, window.id),
+          eq(usagePauseWindows.attemptCount, window.attemptCount),
+        ),
+      );
+
+    await db
+      .update(agentRuntimeState)
+      .set({
+        sessionId: window.sessionIdToResume,
+        updatedAt: now,
+      })
+      .where(eq(agentRuntimeState.agentId, agent.id));
+
+    await setWakeupStatus(requeued.wakeupRequestId, "queued", {});
+
+    await startNextQueuedRunForAgent(agent.id);
+
+    logger.info(
+      { runId: run.id, agentId: agent.id, attemptCount },
+      "usage_pause.resumed",
+    );
+    return "resumed";
+  }
+
+  /**
+   * 60s poller. Picks windows that are due (nextRetryAt <= now) and under the
+   * retry budget, earliest resetsAt first (fairness), and tries to resume them.
+   * No-ops entirely when the feature is disabled.
+   */
+  async function resumeUsagePausedRuns(now = new Date()) {
+    if (!usagePauseEnabled()) return { checked: 0, resumed: 0, deferred: 0, failed: 0 };
+
+    // Select all DUE windows (no nextRetryAt, or it's in the past). We do NOT
+    // filter on attemptCount in SQL: a window that has exhausted its budget
+    // must be FAILED here (failUsagePausedRun), not silently filtered out —
+    // otherwise it would leak forever (never resumed, never cleaned up). Typed
+    // operators bind the Date via the column codec (a raw `${now}` in an sql``
+    // template can't be serialized by postgres-js).
+    const windows = await db
+      .select()
+      .from(usagePauseWindows)
+      .where(
+        or(
+          isNull(usagePauseWindows.nextRetryAt),
+          lte(usagePauseWindows.nextRetryAt, now),
+        ),
+      )
+      // Earliest reset first so the agent that's been waiting longest wins.
+      // NULLS LAST so unknown-reset windows don't starve known-reset ones.
+      .orderBy(sql`${usagePauseWindows.resetsAt} ASC NULLS LAST`);
+
+    let resumed = 0;
+    let deferred = 0;
+    let failed = 0;
+
+    for (const window of windows) {
+      try {
+        const run = await getRun(window.runId);
+        const agent = await getAgent(window.agentId);
+        // Run gone or no longer paused (or agent gone) → stale window, delete.
+        if (!run || !agent || run.status !== "paused_usage") {
+          await db
+            .delete(usagePauseWindows)
+            .where(eq(usagePauseWindows.id, window.id));
+          continue;
+        }
+
+        // Budget exhausted → fail terminally (releases the lock + finalizes the
+        // agent + deletes the window). Guards the leak where a resume bumped
+        // attemptCount to maxRetries and the run then re-paused.
+        if (window.attemptCount >= window.maxRetries) {
+          await failUsagePausedRun(
+            window,
+            `Usage-paused run exceeded ${window.maxRetries} resume attempts`,
+          );
+          failed += 1;
+          continue;
+        }
+
+        const isReset = await checkIfQuotaWindowReset(
+          agent.adapterType,
+          window.resetsAt,
+          now,
+        );
+        if (!isReset) {
+          // Not reset yet — back off (capped) and re-poll later.
+          const backoff = Math.min(
+            window.retryBackoffMs * 2,
+            USAGE_PAUSE_MAX_BACKOFF_MS,
+          );
+          await db
+            .update(usagePauseWindows)
+            .set({
+              retryBackoffMs: backoff,
+              nextRetryAt: new Date(now.getTime() + backoff),
+              updatedAt: now,
+            })
+            .where(eq(usagePauseWindows.id, window.id));
+          deferred += 1;
+          continue;
+        }
+
+        const outcome = await attemptResumeExecution(window, run, agent, now);
+        // attemptResumeExecution can internally defer (company inactive, cwd
+        // mismatch, workspace resolution error, lost CAS race) or escalate to a
+        // fail (defer with the budget now exhausted). Count what actually
+        // happened so the telemetry doesn't hide stuck runs.
+        if (outcome === "resumed") resumed += 1;
+        else if (outcome === "failed") failed += 1;
+        else deferred += 1;
+      } catch (err) {
+        logger.error(
+          { err, windowId: window.id, runId: window.runId },
+          "resumeUsagePausedRuns window failed",
+        );
+      }
+    }
+
+    if (resumed > 0 || deferred > 0 || failed > 0) {
+      logger.info({ resumed, deferred, failed, checked: windows.length }, "usage_pause.poll");
+    }
+    return { checked: windows.length, resumed, deferred, failed };
+  }
+
+  /**
+   * Boot recovery for usage-paused runs. Runs IN A TRANSACTION during heartbeat
+   * init, ORDERED BEFORE reapOrphanedRuns, so the reaper sees a consistent set
+   * of windows. Per window:
+   *   - run missing → delete the window,
+   *   - run not `paused_usage` → delete the window (it already resolved),
+   *   - valid → leave it (the poller resumes it; a window whose reset elapsed
+   *     while ADE was down is picked up immediately on the first post-boot poll
+   *     because nextRetryAt/resetsAt <= now).
+   */
+  async function bootRecoverUsagePausedRuns(): Promise<{ kept: number; deleted: number }> {
+    if (!usagePauseEnabled()) return { kept: 0, deleted: 0 };
+    return db.transaction(async (tx) => {
+      const windows = await tx.select().from(usagePauseWindows);
+      let kept = 0;
+      let deleted = 0;
+      for (const window of windows) {
+        const [run] = await tx
+          .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, window.runId))
+          .limit(1);
+        if (!run || run.status !== "paused_usage") {
+          await tx.delete(usagePauseWindows).where(eq(usagePauseWindows.id, window.id));
+          deleted += 1;
+          continue;
+        }
+        kept += 1;
+      }
+      if (deleted > 0 || kept > 0) {
+        logger.info({ kept, deleted }, "usage_pause.boot_recover");
+      }
+      return { kept, deleted };
+    });
+  }
+
+  /**
+   * Delete any usage_pause_window for a run that has reached a terminal,
+   * non-paused status. Called from the completion path: a resumed run that
+   * finally succeeds/fails (and was NOT re-paused) no longer needs its window.
+   * Idempotent — a no-op when there is no window.
+   */
+  async function cleanupUsagePauseWindowForRun(runId: string): Promise<void> {
+    await db.delete(usagePauseWindows).where(eq(usagePauseWindows.runId, runId));
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; hardCapMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     // Round 3 Phase 8 — wall-clock hard cap. A run that started >hardCapMs ago
@@ -2313,16 +3334,42 @@ export function heartbeatService(db: Db) {
     const hardCapMs = opts?.hardCapMs ?? 60 * 60 * 1000;
     const now = new Date();
 
-    // Find all runs in "queued" or "running" state
+    // Find all runs in "queued" or "running" state.
+    //
+    // Issue 4 LOCK-LIVE: also scan `paused_usage` runs. These hold their issue
+    // lock on purpose (the resume poller owns them), so we must NOT blindly
+    // reap them. For each paused_usage run we look up its usage_pause_windows
+    // row: if the window exists the run is healthy and parked — SKIP it and
+    // leave it for resumeUsagePausedRuns. If the window is MISSING the pause is
+    // corrupt (we can never resume it), so we fall through and recover the run
+    // normally, which also releases the lock.
     const activeRuns = await db
       .select()
       .from(heartbeatRuns)
-      .where(inArray(heartbeatRuns.status, ["queued", "running"]));
+      .where(inArray(heartbeatRuns.status, ["queued", "running", "paused_usage"]));
 
     const reaped: string[] = [];
 
     for (const run of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
+
+      if (run.status === "paused_usage") {
+        const [pauseWindow] = await db
+          .select({ id: usagePauseWindows.id })
+          .from(usagePauseWindows)
+          .where(eq(usagePauseWindows.runId, run.id))
+          .limit(1);
+        if (pauseWindow) {
+          // Healthy parked run — the resume poller owns it. Leave the lock held.
+          continue;
+        }
+        logger.warn(
+          { runId: run.id, agentId: run.agentId },
+          "reapOrphanedRuns.paused_usage_window_missing",
+        );
+        // No window → corrupt pause. Fall through and recover the run normally
+        // below, which releases the issue lock.
+      }
 
       // Hard-cap short-circuit: if the run started long enough ago, reap it
       // regardless of updatedAt. Uses startedAt when present, falls back to
@@ -2420,8 +3467,16 @@ export function heartbeatService(db: Db) {
       // Only clear when the run is terminal or absent. Live runs
       // ('queued' or 'running') are left alone — the run-side reaper
       // owns them.
+      //
+      // Issue 4 LOCK-LIVE: a `paused_usage` run is ALSO live for lock
+      // purposes — it is parked on a provider usage limit with its session
+      // preserved and its issue lock intentionally held, and the resume
+      // poller (resumeUsagePausedRuns) owns it. If we cleared its lock here a
+      // sibling agent could grab the same issue and run concurrently against
+      // the paused run's work. So `paused_usage` MUST be treated as live.
       const runStatus = row.runStatus;
-      const isLive = runStatus === "queued" || runStatus === "running";
+      const isLive =
+        runStatus === "queued" || runStatus === "running" || runStatus === "paused_usage";
       if (isLive) continue;
 
       await db
@@ -2966,6 +4021,49 @@ export function heartbeatService(db: Db) {
       previousSessionParams,
       { useProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null },
     );
+
+    // Per-issue workspace scope refusal (P1.A §5b). The scope guard refused to
+    // fork an isolated workspace from a contaminated base. Do not invoke the
+    // adapter — post a stash hint to the issue, pause it for a human, and
+    // finalize this run as cancelled.
+    if (resolvedWorkspace.scopeRefusal) {
+      const refusal = resolvedWorkspace.scopeRefusal;
+      const refusalMessage =
+        `Run blocked: cannot fork an isolated workspace for this issue. ${refusal.reason} ${refusal.suggestion}`;
+      try {
+        await db.insert(issueComments).values({
+          companyId: run.companyId,
+          issueId: refusal.issueId,
+          authorAgentId: null,
+          authorUserId: null,
+          body: refusalMessage,
+        });
+      } catch (err) {
+        logger.debug({ err, runId, issueId: refusal.issueId }, "failed to post scope-refusal comment");
+      }
+      try {
+        await issueService(db).update(refusal.issueId, {
+          status: "awaiting_user",
+          latestUserFacingAgentMessage: refusalMessage,
+        });
+      } catch (err) {
+        logger.debug({ err, runId, issueId: refusal.issueId }, "failed to pause issue after scope refusal");
+      }
+      await setRunStatus(runId, "cancelled", {
+        error: "workspace_scope_violation",
+        errorCode: "workspace_scope_violation",
+        finishedAt: new Date(),
+      });
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: new Date(),
+        error: "workspace_scope_violation",
+      });
+      await finalizeAgentStatus(agent.id, "cancelled");
+      const refusedRun = await getRun(runId);
+      if (refusedRun) await releaseIssueExecutionAndPromote(refusedRun);
+      return;
+    }
+
     const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
       agentId: agent.id,
       previousSessionParams,
@@ -3085,13 +4183,21 @@ export function heartbeatService(db: Db) {
       // Pull a short description body for the focus-block preview. Bounded
       // inside renderFocusSection; we only fetch when a focus issue exists.
       let focusIssueBody: string | null = null;
+      let focusIssueIdentifier: string | null = null;
+      let focusIssueTitle: string | null = null;
       if (memoryIssueId && focusMode) {
         const focusRow = await db
-          .select({ description: issues.description })
+          .select({
+            description: issues.description,
+            identifier: issues.identifier,
+            title: issues.title,
+          })
           .from(issues)
           .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null);
         focusIssueBody = focusRow?.description ?? null;
+        focusIssueIdentifier = focusRow?.identifier ?? null;
+        focusIssueTitle = focusRow?.title ?? null;
         const managerQuestionBody = readNonEmptyString(context.managerQuestionBody);
         const managerAnswerBody = readNonEmptyString(context.managerAnswerBody);
         const managerAction = readNonEmptyString(context.recommendedNextAction);
@@ -3155,6 +4261,8 @@ export function heartbeatService(db: Db) {
               agentId: agent.id,
               currentIssueId: memoryIssueId ?? null,
               currentIssueBody: focusIssueBody,
+              issueIdentifier: focusIssueIdentifier,
+              issueTitle: focusIssueTitle,
               focusMode,
               includeReviewIssues:
                 effectiveContextProfile === "focused" ||
@@ -3180,9 +4288,21 @@ export function heartbeatService(db: Db) {
         queueDigestPolicy = queue.digestBody ? "included" : "none";
       }
 
-      if (queue.focusBody && queue.directive && memoryIssueId) {
+      // Inject the scope directive whenever there is a current issue and a
+      // directive was produced — independent of whether the focus body
+      // rendered. This keeps the always-on scope fence in front of the model
+      // even when the focus issue row did not resolve into the queue. The
+      // rendered focus block already embeds the directive; when there is no
+      // focus block (issue row missing) we surface the directive text on its
+      // own so the scope fence still reaches the adapter, which renders only
+      // the `body` field.
+      if (queue.directive && memoryIssueId) {
+        const directiveBody =
+          queue.focusBody && queue.focusBody.trim().length > 0
+            ? queue.focusBody
+            : `## 🎯 Current focus\n> ${queue.directive}`;
         context.combyneFocusDirective = {
-          body: queue.focusBody,
+          body: directiveBody,
           directive: queue.directive,
           issueId: memoryIssueId,
         };
@@ -3833,12 +4953,81 @@ export function heartbeatService(db: Db) {
         previousLegacySessionId: runtimeForAdapter.sessionId,
       });
 
+      // Issue 4 — usage-limit pause. If the adapter reported a Claude
+      // usage/subscription-window limit AND the feature is enabled AND the run
+      // wasn't cancelled out from under us, park the run as `paused_usage`
+      // instead of failing it. handleUsageLimitResponse keeps the issue lock
+      // held, does NOT finalize the agent, and RETURNS so we skip the normal
+      // completion + auto-close machinery below. The resume poller takes over.
+      if (
+        usagePauseEnabled() &&
+        adapterResult.errorCode === "claude_usage_limit_reached"
+      ) {
+        const cancelledNow = await getRun(run.id);
+        if (cancelledNow?.status !== "cancelled") {
+          // The session to resume is the POST session id the adapter just
+          // produced (it preserves the session on a usage limit), falling back
+          // to whatever session we resumed from this run.
+          const sessionIdToResume =
+            nextSessionState.legacySessionId ??
+            nextSessionState.displayId ??
+            runtimeForAdapter.sessionId ??
+            null;
+          const handled = await handleUsageLimitResponse({
+            run,
+            agent,
+            adapterResult,
+            sessionIdToResume,
+            sessionCwd: readNonEmptyString(resolvedWorkspace.cwd),
+            seq: seq++,
+          });
+          if (handled) {
+            // Task-keyed runs resume off the TASK SESSION (executeRun zeroes the
+            // runtime.sessionId fallback when taskKey is set), so the resume
+            // path that the engine drives via agentRuntimeState would NOT pick
+            // up the limit-interrupted session. handleUsageLimitResponse returns
+            // BEFORE the normal completion-path task-session upsert, so persist
+            // the POST (limit) session into the task session here — otherwise
+            // the resume would replay the PRE-run session and lose the
+            // conversation state the limit interrupted. Mirror the success-path
+            // upsert at the completion block below.
+            if (taskKey && (nextSessionState.params || nextSessionState.displayId)) {
+              await upsertTaskSession({
+                companyId: agent.companyId,
+                agentId: agent.id,
+                adapterType: agent.adapterType,
+                taskKey,
+                sessionParamsJson: nextSessionState.params,
+                sessionDisplayId: nextSessionState.displayId,
+                lastRunId: run.id,
+                lastError: adapterResult.errorMessage ?? "claude_usage_limit_reached",
+              }).catch((err) => {
+                logger.warn(
+                  { err, runId: run.id, taskKey },
+                  "usage_pause.task_session_persist_failed",
+                );
+              });
+            }
+            // finally{} still runs startNextQueuedRunForAgent(agent.id), which
+            // is correct: OTHER queued runs for this agent may proceed; only
+            // THIS paused run keeps its lock.
+            return;
+          }
+        }
+      }
+
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
       if (latestRun?.status === "cancelled") {
         outcome = "cancelled";
       } else if (adapterResult.timedOut) {
         outcome = "timed_out";
+        // Issue 3 — an MCP/integration 401 makes the adapter exit 0 with a
+        // well-formed result block. The error-code is the only reliable signal
+        // (the run "succeeded" by exit code), so force the outcome to failed
+        // BEFORE the exit-0 success check so it can never auto-close.
+      } else if (adapterResult.errorCode?.startsWith("integration_auth_required")) {
+        outcome = "failed";
       } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
         outcome = "succeeded";
       } else {
@@ -3967,6 +5156,16 @@ export function heartbeatService(db: Db) {
         error: outcome === "cancelled" ? cancelledError : adapterResult.errorMessage ?? null,
       });
 
+      // Issue 4 — reaching here means the run finalized to a terminal status
+      // and was NOT re-paused (handleUsageLimitResponse returns early before
+      // this point). If this run had ever been usage-paused, its window is now
+      // stale — drop it so no poller resurrects a completed run.
+      if (usagePauseEnabled()) {
+        await cleanupUsagePauseWindowForRun(run.id).catch((err) => {
+          logger.debug({ err, runId: run.id }, "usage_pause window cleanup failed");
+        });
+      }
+
       const finalizedRun = await getRun(run.id);
       if (finalizedRun) {
         if (adapterResult.resultJson || stdoutExcerpt) {
@@ -4000,14 +5199,29 @@ export function heartbeatService(db: Db) {
           },
         });
         if (outcome === "failed") {
-          await markIssueBlockedAfterFailedRun(db, {
-            run: finalizedRun,
-            agent,
-            message: adapterResult.errorMessage ?? "Adapter failed",
-            errorCode: adapterResult.errorCode ?? "adapter_failed",
-          }).catch((err) => {
-            logger.debug({ err, runId: finalizedRun.id }, "failed-run issue handoff failed");
-          });
+          // Issue 3 — an MCP/integration auth failure (a 401 even at exit 0)
+          // is a USER action, not a run to review. Pause the issue to
+          // awaiting_user with a provider auth link instead of blocking it,
+          // and circuit-break after 3 consecutive same-provider failures.
+          if (isIntegrationAuthErrorCode(adapterResult.errorCode)) {
+            await pauseIssueForIntegrationAuth(db, {
+              run: finalizedRun,
+              agent,
+              errorCode: adapterResult.errorCode,
+              errorMessage: adapterResult.errorMessage,
+            }).catch((err) => {
+              logger.debug({ err, runId: finalizedRun.id }, "integration-auth pause failed");
+            });
+          } else {
+            await markIssueBlockedAfterFailedRun(db, {
+              run: finalizedRun,
+              agent,
+              message: adapterResult.errorMessage ?? "Adapter failed",
+              errorCode: adapterResult.errorCode ?? "adapter_failed",
+            }).catch((err) => {
+              logger.debug({ err, runId: finalizedRun.id }, "failed-run issue handoff failed");
+            });
+          }
         }
         await releaseIssueExecutionAndPromote(finalizedRun);
         void summarizeRunAndPersist(db, {
@@ -4237,22 +5451,111 @@ export function heartbeatService(db: Db) {
 
         if (runIssueId && outcome === "succeeded" && !smallTaskBudget.hardPause) {
           const completion = summarizeSuccessfulAdapterResult(adapterResult.resultJson, stdoutExcerpt);
-          await autoCloseIssueAfterSuccessfulRun(db, {
-            companyId: finalizedRun.companyId,
-            agentId: finalizedRun.agentId,
-            runId: finalizedRun.id,
-            issueId: runIssueId,
-            questionResult,
-            allowAutoClose: false,
-            summary: completion.summary,
-            changedFiles: completion.changedFiles,
-            checks: completion.checks,
-          }).catch((err) => {
+
+          // Scope-diff guard (P1.A §5c). Before auto-closing, check that the
+          // run stayed inside this issue's scope (no cross-issue commit
+          // references; changed paths didn't cross undeclared service
+          // boundaries). SHIP TELEMETRY-FIRST: we only actually skip the
+          // auto-close when the project opts in via a `scopeExceptions` config;
+          // otherwise we log-only and proceed.
+          let skipAutoCloseForScope = false;
+          try {
+            const scopeIssueRow = await db
+              .select({ identifier: issues.identifier, projectId: issues.projectId })
+              .from(issues)
+              .where(and(eq(issues.id, runIssueId), eq(issues.companyId, finalizedRun.companyId)))
+              .then((rows) => rows[0] ?? null);
+            const projectPolicyForScope = scopeIssueRow?.projectId
+              ? await db
+                  .select({ policy: projects.executionWorkspacePolicy })
+                  .from(projects)
+                  .where(
+                    and(
+                      eq(projects.id, scopeIssueRow.projectId),
+                      eq(projects.companyId, finalizedRun.companyId),
+                    ),
+                  )
+                  .then((rows) => rows[0]?.policy ?? null)
+              : null;
+            const rawScopeExceptions = (parseObject(projectPolicyForScope) as Record<string, unknown>)
+              .scopeExceptions;
+            const scopeExceptionsConfigured = Array.isArray(rawScopeExceptions);
+            const projectScopeExceptions = scopeExceptionsConfigured
+              ? (rawScopeExceptions as unknown[])
+                  .filter((value): value is string => typeof value === "string")
+              : undefined;
+            const worktreeCwd =
+              resolvedWorkspace.source === "execution_workspace"
+                ? resolvedWorkspace.worktreePath ?? resolvedWorkspace.cwd ?? null
+                : resolvedWorkspace.cwd ?? null;
+            const scopeValidation = await validateScopeDiffBeforeAutoClose(db, {
+              issueId: runIssueId,
+              issueIdentifier: scopeIssueRow?.identifier ?? null,
+              changedFiles: completion.changedFiles,
+              worktreeCwd,
+              baseRef: resolvedWorkspace.repoRef ?? null,
+              projectScopeExceptions,
+            });
+            if (!scopeValidation.valid) {
+              await logActivity(db, {
+                companyId: finalizedRun.companyId,
+                actorType: "system",
+                actorId: finalizedRun.agentId,
+                action: "scope_diff_blocked",
+                entityType: "issue",
+                entityId: runIssueId,
+                agentId: finalizedRun.agentId,
+                runId: finalizedRun.id,
+                details: {
+                  gated: scopeExceptionsConfigured,
+                  reason: scopeValidation.reason,
+                  violations: scopeValidation.violations,
+                },
+              }).catch(() => {});
+              if (scopeExceptionsConfigured) {
+                // Opted-in project — actually skip the auto-close and tell the
+                // issue why so a human can decide.
+                skipAutoCloseForScope = true;
+                await db
+                  .insert(issueComments)
+                  .values({
+                    companyId: finalizedRun.companyId,
+                    issueId: runIssueId,
+                    authorAgentId: null,
+                    authorUserId: null,
+                    body:
+                      `Auto-close was skipped because this run appears to have left the scope of this issue. ` +
+                      `${scopeValidation.reason} Review the change set and either split the out-of-scope work into ` +
+                      `its own ticket or close this issue manually.`,
+                  })
+                  .catch(() => {});
+              }
+            }
+          } catch (err) {
             logger.debug(
               { err, runId: finalizedRun.id, issueId: runIssueId },
-              "successful-run auto-close failed",
+              "scope-diff validation failed; proceeding with auto-close",
             );
-          });
+          }
+
+          if (!skipAutoCloseForScope) {
+            await autoCloseIssueAfterSuccessfulRun(db, {
+              companyId: finalizedRun.companyId,
+              agentId: finalizedRun.agentId,
+              runId: finalizedRun.id,
+              issueId: runIssueId,
+              questionResult,
+              allowAutoClose: false,
+              summary: completion.summary,
+              changedFiles: completion.changedFiles,
+              checks: completion.checks,
+            }).catch((err) => {
+              logger.debug(
+                { err, runId: finalizedRun.id, issueId: runIssueId },
+                "successful-run auto-close failed",
+              );
+            });
+          }
           await enforceDelegationPolicyAfterSuccessfulRun(db, {
             companyId: finalizedRun.companyId,
             agentId: finalizedRun.agentId,
@@ -4320,6 +5623,11 @@ export function heartbeatService(db: Db) {
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
       });
+      // Issue 4 — a resumed paused run that threw is now terminally failed;
+      // drop any leftover usage-pause window so the poller never revives it.
+      if (usagePauseEnabled()) {
+        await cleanupUsagePauseWindowForRun(run.id).catch(() => {});
+      }
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: new Date(),
         error: message,
@@ -4722,7 +6030,17 @@ export function heartbeatService(db: Db) {
             .then((rows) => rows[0] ?? null)
           : null;
 
-        if (activeExecutionRun && activeExecutionRun.status !== "queued" && activeExecutionRun.status !== "running") {
+        // Issue 4 LOCK-LIVE: `paused_usage` is a LIVE lock holder. A run parked
+        // on a usage limit keeps its issue lock so a sibling agent can't run
+        // the same issue concurrently. If we treated it as stale here we'd
+        // null the lock and let this wake acquire the issue alongside the
+        // paused run — the exact concurrency bug we must prevent.
+        if (
+          activeExecutionRun &&
+          activeExecutionRun.status !== "queued" &&
+          activeExecutionRun.status !== "running" &&
+          activeExecutionRun.status !== "paused_usage"
+        ) {
           activeExecutionRun = null;
         }
 
@@ -4739,13 +6057,17 @@ export function heartbeatService(db: Db) {
         }
 
         if (!activeExecutionRun) {
+          // Issue 4 LOCK-LIVE: include `paused_usage` so a parked run that
+          // lost its executionRunId pointer is re-adopted as the live lock
+          // holder rather than being ignored (which would let a concurrent run
+          // acquire the issue).
           const legacyRun = await tx
             .select()
             .from(heartbeatRuns)
             .where(
               and(
                 eq(heartbeatRuns.companyId, issue.companyId),
-                inArray(heartbeatRuns.status, ["queued", "running"]),
+                inArray(heartbeatRuns.status, ["queued", "running", "paused_usage"]),
                 sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
               ),
             )
@@ -5211,6 +6533,24 @@ export function heartbeatService(db: Db) {
 
     reapOrphanedRuns,
     reapOrphanedIssueLocks,
+    // Issue 4 — usage-pause engine surface. resumeUsagePausedRuns is the 60s
+    // poller (index.ts) and bootRecoverUsagePausedRuns is the boot recovery
+    // step (ordered BEFORE reapOrphanedRuns at init). Both no-op when the
+    // COMBYNE_USAGE_PAUSE_ENABLED flag is off.
+    resumeUsagePausedRuns,
+    bootRecoverUsagePausedRuns,
+    // Issue 4 — internal usage-pause engine functions exposed ONLY for the
+    // exhaustive engine test suite (heartbeat-usage-pause.test.ts). These let
+    // the tests exercise the REAL pause/resume/fail implementation directly
+    // (rather than reimplementing the decision logic) without driving a live
+    // adapter process. Not part of the public control-plane surface.
+    __usagePauseTestApi: {
+      handleUsageLimitResponse,
+      checkIfQuotaWindowReset,
+      failUsagePausedRun,
+      attemptResumeExecution,
+      cleanupUsagePauseWindowForRun,
+    },
     reopenIssuesAutoClosedAfterTokenPause: (opts?: { limit?: number }) =>
       reopenIssuesAutoClosedAfterTokenPause(db, opts),
     forceUnlockIssue,
@@ -5257,7 +6597,20 @@ export function heartbeatService(db: Db) {
     cancelRun: async (runId: string) => {
       const run = await getRun(runId);
       if (!run) throw notFound("Heartbeat run not found");
-      if (run.status !== "running" && run.status !== "queued") return run;
+      // Issue 4: a `paused_usage` run is cancellable too — an operator may want
+      // to abandon a parked run rather than wait for the window. Cancelling
+      // drops its usage-pause window (below) so the poller never revives it.
+      if (
+        run.status !== "running" &&
+        run.status !== "queued" &&
+        run.status !== "paused_usage"
+      ) {
+        return run;
+      }
+
+      // Drop any usage-pause window first so a concurrent poll can't resume the
+      // run while we're cancelling it.
+      await cleanupUsagePauseWindowForRun(run.id).catch(() => {});
 
       const running = runningProcesses.get(run.id);
       if (running) {
@@ -5298,12 +6651,20 @@ export function heartbeatService(db: Db) {
     },
 
     cancelActiveForAgent: async (agentId: string) => {
+      // Issue 4: include `paused_usage` — pausing the agent must also tear down
+      // any parked usage-pause run, else its held issue lock + window leak.
       const runs = await db
         .select()
         .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, ["queued", "running"])));
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            inArray(heartbeatRuns.status, ["queued", "running", "paused_usage"]),
+          ),
+        );
 
       for (const run of runs) {
+        await cleanupUsagePauseWindowForRun(run.id).catch(() => {});
         await setRunStatus(run.id, "cancelled", {
           finishedAt: new Date(),
           error: "Cancelled due to agent pause",
@@ -5328,12 +6689,21 @@ export function heartbeatService(db: Db) {
 
     cancelActiveForCompany: async (companyId: string, reason = "Cancelled because company is not active") => {
       const now = new Date();
+      // Issue 4: include `paused_usage` — deactivating the company must cancel
+      // parked runs too. A company/budget pause must dominate a usage pause:
+      // we never silently resume across it, and we don't leak the held lock.
       const runs = await db
         .select()
         .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running"])));
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            inArray(heartbeatRuns.status, ["queued", "running", "paused_usage"]),
+          ),
+        );
 
       for (const run of runs) {
+        await cleanupUsagePauseWindowForRun(run.id).catch(() => {});
         await setRunStatus(run.id, "cancelled", {
           finishedAt: now,
           error: reason,

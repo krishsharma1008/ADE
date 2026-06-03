@@ -3,9 +3,17 @@ export { testEnvironment } from "./test.js";
 export {
   parseClaudeStreamJson,
   describeClaudeFailure,
+  detectMcpToolAuthError,
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
+  isClaudeUsageLimitReached,
 } from "./parse.js";
+export {
+  getQuotaWindows,
+  recordUsageLimitObservation,
+  __resetUsageLimitObservation,
+} from "./quota.js";
+export type { McpToolAuthErrorResult, ClaudeUsageLimitResult } from "./parse.js";
 import type { AdapterSessionCodec } from "@combyne/adapter-utils";
 
 function readNonEmptyString(value: unknown): string | null {
