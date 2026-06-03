@@ -107,18 +107,42 @@ Only skip a check with a repo-approved suppression file, never with `-x`.
 - Idempotent where possible (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`).
 - `./gradlew flywayInfo` / `mvn flyway:info` runs clean against a fresh DB.
 
-### 7. Coding-practice self-review
+### 7a. Coding-practice self-review
 Before pushing, re-read your diff and confirm:
 - **Every new public method** has Javadoc or is obviously self-explanatory from name + types.
 - **No swallowed exceptions** (`catch (Exception e) {}` without at minimum a log + rethrow/wrap).
 - **No `Optional.get()` without `isPresent()` / `orElseThrow()`**.
-- **No `@Autowired` on fields** in new code — use constructor injection (Lombok `@RequiredArgsConstructor`).
+- **DI style matches the service** — use constructor injection (`@RequiredArgsConstructor`) for new code **unless** the service's local convention is `@Autowired` fields (confirm via Step 4.5; e.g. BNPL uses field injection).
 - **All external calls** wrapped with `@CircuitBreaker` + `@Retry` where appropriate.
 - **Auth**: every new controller method validates the JWT actor (or is explicitly `/public/**`).
 - **Error handling**: throws `BusinessException`/`ResourceNotFoundException` with a code from the standard set, not a raw `RuntimeException`.
 - **Kafka events**: include `eventId`, `eventType`, `timestamp`, and are backward-compatible (only additive schema changes).
 - **DB access**: goes through a repository, never raw JDBC in a controller/service.
 - **Tests**: new behavior has at least one unit test; bug fixes have a regression test that fails before the fix.
+
+### 7b. ⚠️ MANDATORY design self-review (clean-code / OOP)
+
+PRs that pass the build but read poorly still draw 5–6 Clean-Code/OOP comments. This is a
+**coaching pass you must perform**, not a redundant hard gate — SonarQube still enforces
+metrics post-PR. Re-read your diff against `references/clean-code.md` and confirm each box.
+Where a threshold is given it is **objective** — apply it literally.
+
+- [ ] **(A) Single Responsibility** — every changed class is describable in one sentence with no "and". → `references/clean-code.md` §A
+- [ ] **(B) Method complexity** — no method body `> 25 lines` or `> 3` nesting levels. → §B
+- [ ] **(C) Extract Method + naming** — no comment narrates code that should be a named method; no naked magic numbers. → §C
+- [ ] **(D) DRY** — no block duplicated `≥ 3` times; shared shape extracted. → §D
+- [ ] **(E) Guard clauses** — negative cases return/throw early; the happy path is flat (≤ 1 indent). → §E
+- [ ] **(F) Composition over inheritance** — no base class used purely to share a helper; strategies are composed/injected. → §F
+- [ ] **(G) Intention-revealing tests** — every new test has a behaviour-naming name and Arrange/Act/Assert structure. → §G
+- [ ] **Local convention conformance** — the change matches the target repo's conventions read in Step 4.5.
+
+**If any box fails, refactor NOW — before pushing. Do not push-and-ask the reviewer to flag it.**
+
+> **Rule-vs-framework conflict:** If a clean-code rule above would conflict with a framework
+> idiom or local convention the service already uses (e.g. BNPL's `@Autowired` field injection,
+> the Brick `EventAuditUtil` 4-step audit), **keep the local convention**, document the
+> trade-off in your PR description, and ask the reviewer/architect if you believe the
+> convention itself should change. Do not silently "fix" the framework idiom.
 
 ### 8. Only now: push
 ```bash
@@ -239,6 +263,35 @@ public class Transaction {
 @Retry(name = "externalService")
 public Response callExternal() { }
 ```
+
+### Step 4.5: Read the Target Repo's Conventions (MANDATORY)
+
+**Before writing any code, conform to the local repo, not just the generic patterns above.**
+A change that ignores the service's local conventions attracts review comments even when it
+"works". Do this for every service you touch:
+
+1. **Read the repo's `CLAUDE.md`** (or `AGENTS.md` / `CONTRIBUTING.md`) at the repo root if it
+   exists — it is the authoritative source for that service's local rules and overrides
+   anything generic.
+2. **When there is no such file, sample real classes** in
+   `src/main/java/com/bukuwarung/<service>/` — read 2–3 existing classes of the *same kind*
+   you are about to write (a controller if adding a controller; a `…ServiceImpl` if adding a
+   service; the matching adapter for hexagonal services) plus their tests.
+3. **Extract and conform to** the local choices, e.g.:
+   - DI style — constructor injection (`@RequiredArgsConstructor`) vs `@Autowired` fields.
+     These differ **per service** (Brick uses constructor injection; BNPL uses `@Autowired`
+     fields — see `references/implementation-best-practices.md` §7).
+   - Lombok on entities — `@Data` vs `@Setter @Getter`.
+   - Response style — `ResponseEntity<?>` direct object vs typed `ResponseEntity<T>`.
+   - Mandatory cross-cutting patterns — e.g. the Brick `EventAuditUtil` 4-step audit, MDC
+     logging, `@RequestAttribute("x-request-id")`.
+   - DTO package layout, naming suffixes, test framework (`@WebMvcTest` vs
+     `@ExtendWith(MockitoExtension.class)`).
+
+**The local convention wins over the generic example in these references.** If a local
+convention conflicts with a clean-code rule (see `references/clean-code.md`), keep the local
+convention, note the trade-off in your PR description, and ask the reviewer/architect if the
+convention itself should change.
 
 ### Step 5: Use Code Templates
 
@@ -436,6 +489,7 @@ Many services    → dracula-v2 (events)
 
 ## Additional References
 
+- `references/clean-code.md` — Clean-Code / OOP design self-review (sections A–G) with objective thresholds and Java BEFORE/AFTER snippets; backs Pre-Push Step 7b.
 - `references/reasoning.md` — 12 architectural decisions with rationale for the lending services (why Java Spring Boot, why separate services, 4-step audit pattern, etc.)
 - `references/implementation-best-practices.md` — Detailed implementation patterns for BNPL and Brick service tickets
 

@@ -13,6 +13,8 @@ export {
   INBOX_MINE_ISSUE_STATUS_FILTER,
   OPEN_ISSUE_STATUSES,
   ISSUE_PRIORITIES,
+  ISSUE_COMPLEXITIES,
+  ISSUE_COMPLEXITY_LABELS,
   ISSUE_ORIGIN_KINDS,
   GOAL_LEVELS,
   GOAL_STATUSES,
@@ -81,6 +83,7 @@ export {
   type IssueStatus,
   type OpenIssueStatus,
   type IssuePriority,
+  type IssueComplexity,
   type IssueOriginKind,
   type GoalLevel,
   type GoalStatus,
@@ -168,6 +171,7 @@ export type {
   InstanceExperimentalSettings,
   InstanceGeneralSettings,
   InstanceSettings,
+  DefaultIsolationMode,
   Agent,
   AgentPermissions,
   AgentKeyCreated,
@@ -400,6 +404,7 @@ export {
   instanceExperimentalSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   type PatchInstanceExperimentalSettings,
+  DEFAULT_ISOLATION_MODES,
 } from "./validators/index.js";
 
 export {
@@ -673,6 +678,7 @@ export {
   acceptedWorkCreateMemorySchema,
   issuePullRequestUpsertSchema,
   issuePullRequestMergeSchema,
+  issuePullRequestFeedbackOptInSchema,
   qaPlatforms,
   qaRunnerTypes,
   qaParserTypes,
@@ -704,6 +710,7 @@ export {
   type AcceptedWorkCreateMemory,
   type IssuePullRequestUpsert,
   type IssuePullRequestMerge,
+  type IssuePullRequestFeedbackOptIn,
   type QaArtifactCreate,
   type QaDeviceRegister,
   type QaLocalAndroidDiscovery,

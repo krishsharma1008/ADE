@@ -345,7 +345,7 @@ export function acceptedWorkService(db: Db) {
         "",
         `## ${event.repo}#${event.pullNumber} — ${event.title}`,
         `- Event id: ${event.id}`,
-        `- PR: ${event.pullUrl ?? "(no URL)"}`,
+        `- PR: ${event.repo}#${event.pullNumber} (request a review task if review is needed)`,
         `- Merged SHA: ${event.mergedSha ?? "(unknown)"}`,
         `- Merged at: ${event.mergedAt ?? "(unknown)"}`,
         `- Linked issue: ${issue?.identifier ?? event.issueId ?? "(none inferred)"}`,

@@ -554,8 +554,9 @@ export function IssueDetail() {
     onSuccess: () => invalidateIssue(),
   });
 
-  const wakePrFeedback = useMutation({
-    mutationFn: (pullRequestId: string) => issuesApi.wakePullRequestFeedback(pullRequestId),
+  const feedbackOptIn = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
+      issuesApi.setPullRequestFeedbackOptIn(id, enabled),
     onSuccess: () => {
       invalidateIssue();
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
@@ -1397,6 +1398,7 @@ export function IssueDetail() {
               const blockers = Array.isArray(metadata?.blockers)
                 ? metadata.blockers.filter((value): value is string => typeof value === "string")
                 : [];
+              const awaitingHuman = pr.feedbackStatus === "awaiting_human";
               const canMerge =
                 pr.mergeStatus === "ready" &&
                 pr.ciStatus === "passed" &&
@@ -1406,7 +1408,7 @@ export function IssueDetail() {
                 !!pr.headSha;
               const isWorking =
                 reconcilePr.variables === pr.id ||
-                wakePrFeedback.variables === pr.id ||
+                feedbackOptIn.variables?.id === pr.id ||
                 mergePr.variables?.id === pr.id;
               return (
                 <div key={pr.id} className="px-3 py-3 space-y-2">
@@ -1440,15 +1442,16 @@ export function IssueDetail() {
                         <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
                         Refresh
                       </Button>
-                      {blockers.length > 0 && (
+                      {awaitingHuman && (
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={() => wakePrFeedback.mutate(pr.id)}
+                          onClick={() => feedbackOptIn.mutate({ id: pr.id, enabled: true })}
                           disabled={isWorking}
+                          title="Release this round of review feedback to agents. The next reviewer round will hold for you again."
                         >
                           <MessageSquare className="h-3.5 w-3.5 mr-1.5" />
-                          Wake agent
+                          Let agents fix
                         </Button>
                       )}
                       <Button
@@ -1485,6 +1488,14 @@ export function IssueDetail() {
                       {blockers.slice(0, 4).map((blocker) => (
                         <div key={blocker}>- {blocker}</div>
                       ))}
+                    </div>
+                  )}
+                  {awaitingHuman && (
+                    <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-300">
+                      Review changes were requested. Agents are holding for your review and
+                      won't touch the code until you choose <span className="font-medium">Let agents fix</span>{" "}
+                      (which releases just this round — the next review holds for you again) — or
+                      you can merge / close this PR yourself.
                     </div>
                   )}
                 </div>

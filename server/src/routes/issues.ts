@@ -8,6 +8,7 @@ import {
   createIssueLabelSchema,
   checkoutIssueSchema,
   createIssueSchema,
+  ISSUE_COMPLEXITIES,
   linkIssueApprovalSchema,
   updateIssueSchema,
 } from "@combyne/shared";
@@ -795,10 +796,22 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const assigneeChanged = assigneeWillChange;
-    const statusChangedFromBacklog =
-      existing.status === "backlog" &&
-      issue.status !== "backlog" &&
-      req.body.status !== undefined;
+    const statusChanged =
+      req.body.status !== undefined &&
+      existing.status !== issue.status;
+    const shouldWakeAssignedIssueForStatusChange =
+      !assigneeChanged &&
+      statusChanged &&
+      !!issue.assigneeAgentId &&
+      ["todo", "in_progress", "in_review"].includes(issue.status);
+    const statusWakeReason =
+      existing.status === "backlog"
+        ? "issue_status_changed"
+        : existing.status === "done" || existing.status === "cancelled"
+          ? "issue_reopened"
+          : existing.status === "blocked" || existing.status === "awaiting_user"
+            ? "issue_unblocked"
+            : "issue_status_changed";
 
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
     void (async () => {
@@ -816,15 +829,31 @@ export function issueRoutes(db: Db, storage: StorageService) {
         });
       }
 
-      if (!assigneeChanged && statusChangedFromBacklog && issue.assigneeAgentId) {
+      if (shouldWakeAssignedIssueForStatusChange && issue.assigneeAgentId) {
         wakeups.set(issue.assigneeAgentId, {
           source: "automation",
           triggerDetail: "system",
-          reason: "issue_status_changed",
-          payload: { issueId: issue.id, mutation: "update" },
+          reason: statusWakeReason,
+          payload: {
+            issueId: issue.id,
+            commentId: comment?.id ?? null,
+            mutation: "update",
+            previousStatus: existing.status,
+            nextStatus: issue.status,
+          },
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
-          contextSnapshot: { issueId: issue.id, source: "issue.status_change" },
+          contextSnapshot: {
+            issueId: issue.id,
+            taskId: issue.id,
+            taskKey: issue.id,
+            commentId: comment?.id ?? null,
+            wakeCommentId: comment?.id ?? null,
+            wakeReason: statusWakeReason,
+            previousStatus: existing.status,
+            nextStatus: issue.status,
+            source: "issue.status_change",
+          },
         });
       }
 
@@ -1146,6 +1175,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
       typeof req.body?.description === "string" ? req.body.description.trim() : "";
     const priority =
       typeof req.body?.priority === "string" ? (req.body.priority as string) : "medium";
+    const rawComplexity = typeof req.body?.complexity === "string" ? req.body.complexity : "";
+    const complexity = ISSUE_COMPLEXITIES.find((value) => value === rawComplexity) ?? "small";
     const labelIds = Array.isArray(req.body?.labelIds)
       ? (req.body.labelIds as unknown[]).filter((v): v is string => typeof v === "string")
       : undefined;
@@ -1172,6 +1203,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       description: description || null,
       status: "in_progress",
       priority,
+      complexity,
       parentId: parent.id,
       assigneeAgentId: toAgentId,
       createdByAgentId: actor.actorType === "agent" ? actor.agentId ?? null : null,

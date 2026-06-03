@@ -17,13 +17,30 @@ import { formatDate, cn, projectUrl } from "../lib/utils";
 import { timeAgo } from "../lib/timeAgo";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { User, Hexagon, ArrowUpRight, Tag, Plus, Trash2 } from "lucide-react";
+import { User, Hexagon, ArrowUpRight, Tag, Plus, Trash2, Gauge } from "lucide-react";
 import { AgentIcon } from "./AgentIconPicker";
 
 interface IssuePropertiesProps {
   issue: Issue;
   onUpdate: (data: Record<string, unknown>) => void;
   inline?: boolean;
+}
+
+const complexityOptions = [
+  { value: "small", label: "S", description: "Small", color: "text-emerald-500" },
+  { value: "medium", label: "M", description: "Medium", color: "text-amber-500" },
+  { value: "large", label: "L", description: "Large", color: "text-rose-500" },
+];
+
+function displayedIssueComplexity(issue: Issue): "small" | "medium" | "large" {
+  if (issue.complexity === "small" || issue.complexity === "medium" || issue.complexity === "large") {
+    return issue.complexity;
+  }
+  const prefix = issue.title.trim().match(/^(?:\[(s|m|l|small|medium|large)\]|\((s|m|l|small|medium|large)\)|(s|m|l|small|medium|large)\s*[:\-])/i);
+  const token = prefix?.slice(1).find(Boolean)?.toLowerCase();
+  if (token === "s" || token === "small") return "small";
+  if (token === "l" || token === "large") return "large";
+  return "medium";
 }
 
 function PropertyRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -102,6 +119,7 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
   const queryClient = useQueryClient();
   const companyId = issue.companyId ?? selectedCompanyId;
   const [assigneeOpen, setAssigneeOpen] = useState(false);
+  const [complexityOpen, setComplexityOpen] = useState(false);
   const [assigneeSearch, setAssigneeSearch] = useState("");
   const [projectOpen, setProjectOpen] = useState(false);
   const [projectSearch, setProjectSearch] = useState("");
@@ -201,6 +219,7 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
       : null;
   const assigneeUserLabel = userLabel(issue.assigneeUserId);
   const creatorUserLabel = userLabel(issue.createdByUserId);
+  const currentComplexity = complexityOptions.find((item) => item.value === displayedIssueComplexity(issue)) ?? complexityOptions[1]!;
 
   const labelsTrigger = (issue.labels ?? []).length > 0 ? (
     <div className="flex items-center gap-1 flex-wrap">
@@ -432,6 +451,25 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
     </>
   );
 
+  const complexityContent = (
+    <div className="space-y-0.5">
+      {complexityOptions.map((item) => (
+        <button
+          key={item.value}
+          className={cn(
+            "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 whitespace-nowrap",
+            item.value === currentComplexity.value && "bg-accent"
+          )}
+          onClick={() => { onUpdate({ complexity: item.value }); setComplexityOpen(false); }}
+        >
+          <Gauge className={cn("h-3.5 w-3.5", item.color)} />
+          <span className="font-medium">{item.label}</span>
+          <span className="text-muted-foreground">{item.description}</span>
+        </button>
+      ))}
+    </div>
+  );
+
   return (
     <div className="space-y-4">
       <div className="space-y-1">
@@ -450,6 +488,23 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
             showLabel
           />
         </PropertyRow>
+
+        <PropertyPicker
+          inline={inline}
+          label="Complexity"
+          open={complexityOpen}
+          onOpenChange={setComplexityOpen}
+          triggerContent={
+            <>
+              <Gauge className={cn("h-3.5 w-3.5", currentComplexity.color)} />
+              <span className="text-sm">{currentComplexity.label}</span>
+              <span className="text-xs text-muted-foreground">{currentComplexity.description}</span>
+            </>
+          }
+          popoverClassName="w-40"
+        >
+          {complexityContent}
+        </PropertyPicker>
 
         <PropertyPicker
           inline={inline}

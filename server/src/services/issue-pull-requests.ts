@@ -25,6 +25,47 @@ const PR_FEEDBACK_RECONCILE_INTERVAL_MS =
   Number(process.env.COMBYNE_PR_FEEDBACK_RECONCILE_INTERVAL_MS) || 2 * 60 * 1000;
 const prFeedbackReconcileThrottle = new Map<string, number>();
 
+// Default behavior holds review feedback for a human: agents are NOT auto-woken to
+// rewrite the source when a reviewer requests changes. A board member releases it one
+// round at a time via the PR panel ("Let agents fix" -> setFeedbackOptIn). Set
+// COMBYNE_PR_FEEDBACK_AUTOPILOT=true to restore the legacy fully-autonomous loop.
+function prFeedbackAutopilotEnabled(): boolean {
+  return String(process.env.COMBYNE_PR_FEEDBACK_AUTOPILOT ?? "").trim().toLowerCase() === "true";
+}
+
+// In autopilot mode, cap how many consecutive fix cycles agents may auto-run before
+// re-holding for a human. Prevents an unbounded review <-> fix ping-pong. (In the
+// default human-gated mode each round requires an explicit human click, so the cap is
+// not consulted.)
+const PR_FEEDBACK_MAX_AUTO_ROUNDS = Math.max(
+  0,
+  Number(process.env.COMBYNE_PR_FEEDBACK_MAX_ROUNDS) || 3,
+);
+
+type FeedbackHoldReason = "awaiting_human_optin" | "max_rounds_reached";
+
+type FeedbackGate =
+  | { allowed: true; rounds: number }
+  | { allowed: false; reason: FeedbackHoldReason; rounds: number };
+
+// Gate for the AUTOMATIC (poll-driven) dispatch path only. Human-forced releases
+// (forceWake) bypass this entirely — see dispatchFeedbackToAssignee. By default this
+// always holds; only autopilot mode auto-allows (bounded by the round cap).
+function resolveFeedbackGate(metadata: Record<string, unknown> | null | undefined): FeedbackGate {
+  const rounds = Number(metadata?.feedbackRounds ?? 0) || 0;
+  if (!prFeedbackAutopilotEnabled()) {
+    return { allowed: false, reason: "awaiting_human_optin", rounds };
+  }
+  if (PR_FEEDBACK_MAX_AUTO_ROUNDS > 0 && rounds >= PR_FEEDBACK_MAX_AUTO_ROUNDS) {
+    return { allowed: false, reason: "max_rounds_reached", rounds };
+  }
+  return { allowed: true, rounds };
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
 function now() {
   return new Date();
 }
@@ -258,7 +299,14 @@ export function issuePullRequestService(db: Db) {
     const mergeStatus = pr.merged ? "merged" : blockers.length === 0 ? "ready" : blockers.some((b) => b.includes("failed") || b.includes("requested")) ? "blocked" : "pending";
     const feedback = buildFeedback({ repo: row.repo, pullNumber: row.pullNumber, checks, reviews, qualityGate, blockers });
     const hash = feedbackHash(feedback);
-    const feedbackStatus = blockers.length > 0 && row.lastFeedbackHash !== hash ? "needs_agent" : row.feedbackStatus;
+    const feedbackStatus =
+      blockers.length === 0 && row.feedbackStatus === "awaiting_human"
+        ? // The reviewer's concerns cleared (e.g. they dismissed/approved) while the PR was
+          // held — release the hold so the issue is no longer frozen.
+          "idle"
+        : blockers.length > 0 && row.lastFeedbackHash !== hash
+          ? "needs_agent"
+          : row.feedbackStatus;
 
     const updated = await db
       .update(issuePullRequests)
@@ -293,7 +341,12 @@ export function issuePullRequestService(db: Db) {
     const row = status.pullRequest as unknown as typeof issuePullRequests.$inferSelect;
     if (status.blockers.length === 0) return { status, sent: false, commentId: null as string | null };
     const hash = feedbackHash(status.feedback);
-    if (row.lastFeedbackHash === hash && row.feedbackStatus === "sent") {
+    if (
+      row.lastFeedbackHash === hash &&
+      (row.feedbackStatus === "sent" || row.feedbackStatus === "awaiting_human")
+    ) {
+      // Identical feedback already surfaced (either dispatched to the agent or held for a
+      // human). Don't repost the comment on every reconcile poll.
       return { status, sent: false, commentId: null as string | null };
     }
     const [comment] = await db
@@ -309,14 +362,76 @@ export function issuePullRequestService(db: Db) {
       .returning({ id: issueComments.id });
     await db
       .update(issuePullRequests)
-      .set({ feedbackStatus: "sent", lastFeedbackHash: hash, lastFeedbackAt: now(), updatedAt: now() })
+      .set({
+        feedbackStatus: "sent",
+        lastFeedbackHash: hash,
+        lastFeedbackAt: now(),
+        // Remember the comment id so a later one-shot release (which dedups and posts no
+        // new comment) can still reference it as the wake's comment anchor.
+        metadata: { ...(row.metadata ?? {}), lastFeedbackCommentId: comment?.id ?? null },
+        updatedAt: now(),
+      })
       .where(eq(issuePullRequests.id, row.id));
     return { status, sent: true, commentId: comment?.id ?? null };
   }
 
+  async function markFeedbackHeld(rowId: string, reason: FeedbackHoldReason) {
+    // Re-read the current metadata so we never clobber keys (e.g. lastFeedbackCommentId)
+    // written by sendFeedback earlier in this same dispatch.
+    const current = await getById(rowId);
+    await db
+      .update(issuePullRequests)
+      .set({
+        feedbackStatus: "awaiting_human",
+        metadata: {
+          ...(current?.metadata ?? {}),
+          feedbackHoldReason: reason,
+          feedbackHeldAt: now().toISOString(),
+        },
+        updatedAt: now(),
+      })
+      .where(eq(issuePullRequests.id, rowId));
+  }
+
+  async function recordFeedbackRound(rowId: string) {
+    // Lock the row so concurrent dispatches (manual routes bypass the poll throttle, and
+    // multi-instance deploys share no in-memory throttle) can't lose-update the counter
+    // and slip past the autopilot round cap.
+    await db.transaction(async (tx) => {
+      const locked = await tx
+        .select({ metadata: issuePullRequests.metadata })
+        .from(issuePullRequests)
+        .where(eq(issuePullRequests.id, rowId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      const meta = (locked?.metadata ?? {}) as Record<string, unknown>;
+      const rounds = Number(meta.feedbackRounds ?? 0) || 0;
+      await tx
+        .update(issuePullRequests)
+        .set({
+          // Agents are now acting on this feedback, so clear the human-hold marker.
+          feedbackStatus: "sent",
+          metadata: {
+            ...meta,
+            feedbackRounds: rounds + 1,
+            feedbackHoldReason: null,
+            lastFeedbackDispatchedAt: now().toISOString(),
+          },
+          updatedAt: now(),
+        })
+        .where(eq(issuePullRequests.id, rowId));
+    });
+  }
+
   async function dispatchFeedbackToAssignee(
     id: string,
-    opts: { requestedByActorType: "user" | "agent" | "system"; requestedByActorId: string | null },
+    opts: {
+      requestedByActorType: "user" | "agent" | "system";
+      requestedByActorId: string | null;
+      // Set by the board-only opt-in control to dispatch the currently-pending feedback
+      // even when it was already surfaced (and to bypass the default human hold).
+      forceWake?: boolean;
+    },
   ) {
     const result = await sendFeedback(id, opts);
     const row = result.status.pullRequest as unknown as typeof issuePullRequests.$inferSelect;
@@ -325,33 +440,96 @@ export function issuePullRequestService(db: Db) {
       .from(issues)
       .where(eq(issues.id, row.issueId))
       .then((rows) => rows[0] ?? null);
-    let wakeRunId: string | null = null;
-    if (issue?.assigneeAgentId && result.sent && result.status.blockers.length > 0) {
-      const wake = await heartbeatService(db).wakeup(issue.assigneeAgentId, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "pr_feedback",
-        payload: {
-          issueId: row.issueId,
-          issuePullRequestId: row.id,
-          commentId: result.commentId,
-          feedback: result.status.feedback,
-        },
-        requestedByActorType: opts.requestedByActorType,
-        requestedByActorId: opts.requestedByActorId,
-        contextSnapshot: {
-          issueId: row.issueId,
-          taskId: row.issueId,
-          commentId: result.commentId,
-          wakeCommentId: result.commentId,
-          wakeReason: "pr_feedback",
-          issuePullRequestId: row.id,
-          prFeedback: result.status.feedback,
-        },
-      });
-      wakeRunId = wake?.id ?? null;
+
+    const assigneeAgentId = issue?.assigneeAgentId ?? null;
+    const hasBlockers = result.status.blockers.length > 0;
+    const forceWake = opts.forceWake === true;
+    // Consider waking only when there is fresh feedback (result.sent) or a human is
+    // explicitly forcing dispatch (forceWake) — and there is someone to wake.
+    const shouldConsiderWake =
+      hasBlockers && assigneeAgentId !== null && (result.sent || forceWake);
+
+    if (!shouldConsiderWake || assigneeAgentId === null) {
+      return {
+        ...result,
+        wakeRunId: null as string | null,
+        held: false as const,
+        holdReason: null as FeedbackHoldReason | null,
+      };
     }
-    return { ...result, wakeRunId };
+
+    // Human-forced release is one-shot and always allowed; the automatic poll path is
+    // gated (held by default, auto-allowed only under autopilot within the round cap).
+    if (!forceWake) {
+      const gate = resolveFeedbackGate(row.metadata);
+      if (!gate.allowed) {
+        await markFeedbackHeld(row.id, gate.reason);
+        return {
+          ...result,
+          wakeRunId: null as string | null,
+          held: true as const,
+          holdReason: gate.reason,
+        };
+      }
+    }
+
+    // When the human releases a held PR, sendFeedback dedups and returns no fresh comment;
+    // fall back to the comment id stored when the feedback was first surfaced so the wake
+    // carries a real comment anchor (otherwise it can be coalesced into a running run
+    // instead of producing an actionable follow-up).
+    const feedbackCommentId =
+      result.commentId ?? (readNonEmptyString(row.metadata?.lastFeedbackCommentId) ?? null);
+
+    const wake = await heartbeatService(db).wakeup(assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "pr_feedback",
+      payload: {
+        issueId: row.issueId,
+        issuePullRequestId: row.id,
+        commentId: feedbackCommentId,
+        feedback: result.status.feedback,
+      },
+      // Forced releases are an explicit human action — mark them user-originated so the
+      // per-issue review-hold gate in enqueueWakeup lets them through.
+      requestedByActorType: forceWake ? "user" : opts.requestedByActorType,
+      requestedByActorId: opts.requestedByActorId,
+      contextSnapshot: {
+        issueId: row.issueId,
+        taskId: row.issueId,
+        commentId: feedbackCommentId,
+        wakeCommentId: feedbackCommentId,
+        wakeReason: "pr_feedback",
+        issuePullRequestId: row.id,
+        prFeedback: result.status.feedback,
+      },
+    });
+    const wakeRunId = wake?.id ?? null;
+    if (wakeRunId) {
+      await recordFeedbackRound(row.id);
+    }
+    return { ...result, wakeRunId, held: false as const, holdReason: null as FeedbackHoldReason | null };
+  }
+
+  // Board-only one-shot control. enabled:true releases the currently-pending review
+  // feedback to the assignee exactly once (the next reviewer round re-holds for the
+  // human). enabled:false re-holds immediately without dispatching.
+  async function setFeedbackOptIn(
+    id: string,
+    enabled: boolean,
+    actor: { requestedByActorType: "user" | "agent" | "system"; requestedByActorId: string | null },
+  ) {
+    const row = await getById(id);
+    if (!row) throw notFound("Pull request tracking record not found");
+    if (!enabled) {
+      await db
+        .update(issuePullRequests)
+        .set({ feedbackStatus: "awaiting_human", updatedAt: now() })
+        .where(eq(issuePullRequests.id, row.id));
+      return { pullRequest: await getById(row.id), dispatched: null };
+    }
+    const dispatched = await dispatchFeedbackToAssignee(id, { ...actor, forceWake: true });
+    return { pullRequest: await getById(row.id), dispatched };
   }
 
   async function dispatchFeedbackForCompany(companyId: string) {
@@ -520,6 +698,7 @@ export function issuePullRequestService(db: Db) {
     reconcile,
     sendFeedback,
     dispatchFeedbackToAssignee,
+    setFeedbackOptIn,
     dispatchFeedbackForCompany,
     maybeDispatchFeedbackForCompany,
     merge,

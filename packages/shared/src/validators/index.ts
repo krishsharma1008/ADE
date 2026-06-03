@@ -7,6 +7,8 @@ export {
   patchInstanceExperimentalSettingsSchema,
   type InstanceExperimentalSettings,
   type PatchInstanceExperimentalSettings,
+  DEFAULT_ISOLATION_MODES,
+  type DefaultIsolationMode,
 } from "./instance.js";
 
 export {
@@ -360,8 +362,10 @@ export {
 export {
   issuePullRequestUpsertSchema,
   issuePullRequestMergeSchema,
+  issuePullRequestFeedbackOptInSchema,
   type IssuePullRequestUpsert,
   type IssuePullRequestMerge,
+  type IssuePullRequestFeedbackOptIn,
 } from "./issue-pull-request.js";
 export {
   qaPlatforms,

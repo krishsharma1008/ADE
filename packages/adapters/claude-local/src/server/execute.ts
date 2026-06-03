@@ -23,9 +23,12 @@ import {
   parseClaudeStreamJson,
   describeClaudeFailure,
   detectClaudeLoginRequired,
+  detectMcpToolAuthError,
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
+  isClaudeUsageLimitReached,
 } from "./parse.js";
+import { recordUsageLimitObservation } from "./quota.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const COMBYNE_SKILLS_CANDIDATES = [
@@ -554,6 +557,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }
         : undefined;
 
+    // Issue 4 — usage / subscription-limit detection. Scoped to the top-level
+    // result/error text (NOT tool_result output). On a hit we PRESERVE the
+    // session (never clearSession) and emit `claude_usage_limit_reached` with a
+    // non-null errorMessage so the usage-pause engine can resume the exact
+    // conversation once the provider window resets. A timeout is a distinct
+    // condition and keeps its own branch below; the usage-limit branch is
+    // checked first inside the `!parsed` branch and the main branch.
+    const usageLimit = isClaudeUsageLimitReached({
+      parsed,
+      stdout: proc.stdout,
+      stderr: proc.stderr,
+    });
+    if (usageLimit.isLimit) {
+      // Best-effort: feed the observation to the derived quota-windows hook.
+      recordUsageLimitObservation({
+        resetsAt: usageLimit.resetsAt,
+        message: usageLimit.message,
+      });
+    }
+
     if (proc.timedOut) {
       return {
         exitCode: proc.exitCode,
@@ -567,6 +590,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     if (!parsed) {
+      // Usage limit on a bare error (no parseable stream-json). Preserve the
+      // resume session id from the fallback so the engine can continue; never
+      // clear the session for a usage limit.
+      if (usageLimit.isLimit) {
+        const resumeSessionId = opts.fallbackSessionId ?? null;
+        return {
+          exitCode: proc.exitCode,
+          signal: proc.signal,
+          timedOut: false,
+          errorMessage: usageLimit.message ?? "Claude usage limit reached",
+          errorCode: "claude_usage_limit_reached",
+          errorMeta: {
+            ...(errorMeta ?? {}),
+            ...(usageLimit.resetsAt ? { resetsAt: usageLimit.resetsAt } : {}),
+          },
+          sessionId: resumeSessionId,
+          sessionDisplayId: resumeSessionId,
+          resultJson: {
+            stdout: proc.stdout,
+            stderr: proc.stderr,
+          },
+          // PRESERVE the session — do NOT clearSession on a usage limit.
+          clearSession: false,
+        };
+      }
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
@@ -607,16 +655,71 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
 
+    // Issue 4 — usage / subscription-limit. Takes precedence over the MCP-auth /
+    // normal-failure branches below: PRESERVE the session (never clearSession)
+    // and emit `claude_usage_limit_reached` with a non-null errorMessage. The
+    // usage-pause engine resumes `resolvedSessionId` once the window resets;
+    // `resetsAt` (when parsed) is stashed in errorMeta.
+    if (usageLimit.isLimit) {
+      return {
+        exitCode: proc.exitCode,
+        signal: proc.signal,
+        timedOut: false,
+        errorMessage: usageLimit.message ?? "Claude usage limit reached",
+        errorCode: "claude_usage_limit_reached",
+        errorMeta: {
+          ...(errorMeta ?? {}),
+          ...(usageLimit.resetsAt ? { resetsAt: usageLimit.resetsAt } : {}),
+        },
+        usage,
+        sessionId: resolvedSessionId,
+        sessionParams: resolvedSessionParams,
+        sessionDisplayId: resolvedSessionId,
+        provider: "anthropic",
+        model: parsedStream.model || asString(parsed.model, model),
+        billingType,
+        costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
+        resultJson: parsed,
+        summary: parsedStream.summary || asString(parsed.result, ""),
+        // PRESERVE the session — do NOT clearSession on a usage limit.
+        clearSession: false,
+      };
+    }
+
+    // Issue 3 — MCP / integration auth-failure detection. An MCP tool that
+    // returns a 401/403 still lets Claude exit 0 with a well-formed result
+    // block, so without this check the run would be reported as a success and
+    // the issue auto-closed. We re-scan raw stdout for a `type:"user"`
+    // tool_result with `is_error===true` AND an auth pattern; the auth branch
+    // is evaluated FIRST so we never null errorMessage on an auth failure,
+    // even at exit 0.
+    const mcpAuth = detectMcpToolAuthError(proc.stdout);
+    const authProviderSlug = mcpAuth.provider ?? "integration";
+    const authErrorCode = mcpAuth.requiresAuth
+      ? `integration_auth_required:${authProviderSlug}`
+      : null;
+    const exitZero = (proc.exitCode ?? 0) === 0;
+    const errorMessage = mcpAuth.requiresAuth
+      ? `${authProviderSlug} auth required`
+      : exitZero
+        ? null
+        : describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`;
+    const errorCode = authErrorCode ?? (loginMeta.requiresLogin ? "claude_auth_required" : null);
+    const authErrorMeta = mcpAuth.requiresAuth
+      ? {
+          ...(errorMeta ?? {}),
+          integrationProvider: authProviderSlug,
+          ...(mcpAuth.toolName ? { integrationToolName: mcpAuth.toolName } : {}),
+        }
+      : errorMeta;
+
     return {
       exitCode: proc.exitCode,
       signal: proc.signal,
       timedOut: false,
-      errorMessage:
-        (proc.exitCode ?? 0) === 0
-          ? null
-          : describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`,
-      errorCode: loginMeta.requiresLogin ? "claude_auth_required" : null,
-      errorMeta,
+      errorMessage,
+      errorCode,
+      errorMeta: authErrorMeta,
       usage,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,

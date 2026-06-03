@@ -36,15 +36,31 @@ const PRIORITY_ORDER: Record<string, number> = {
   low: 3,
 };
 
-const FOCUS_DIRECTIVE =
-  "Respond only to the current focus issue. Other items below are context for " +
-  "awareness only — do not work on them unless explicitly reassigned.";
+/**
+ * Scope-aware focus directive. Always names the current issue so the model
+ * stays inside its ticket boundary and is told explicitly to STOP and file
+ * separate tickets for cross-service / dependency work rather than implement
+ * it inline. Produced whenever there is a current issue, independent of
+ * whether the focus body renders.
+ */
+function FOCUS_DIRECTIVE(issueIdentifier: string | null, title: string): string {
+  const ident = issueIdentifier ? issueIdentifier : "the current issue";
+  const scopeLabel = issueIdentifier ? `${issueIdentifier}: ${title}` : title;
+  return (
+    `Respond only to the scope of ${scopeLabel}. ` +
+    `Do not make changes that affect other issues or services unless they have their own tickets. ` +
+    `If cross-service/dependency work is needed, STOP and create separate issues — do not implement them here. ` +
+    `Other items below are context for awareness only — do not work on them unless explicitly reassigned to ${ident}.`
+  );
+}
 
 export interface LoadAssignedQueueOptions {
   companyId: string;
   agentId: string;
   currentIssueId?: string | null;
   currentIssueBody?: string | null;
+  issueIdentifier?: string | null;
+  issueTitle?: string | null;
   limit?: number;
   focusMode?: boolean;
   includeReviewIssues?: boolean;
@@ -158,12 +174,22 @@ export async function loadAssignedIssueQueue(
   const currentIssueMissing = Boolean(currentId) && focusItem === null;
   const otherItems = focusItem ? items.filter((i) => i.id !== focusItem.id) : items;
 
-  // Focus block — only present when focusMode is on AND a real focus issue resolved.
+  // Scope directive — a SAFETY guardrail, produced whenever there is a current
+  // issue (even if its queue row never resolved, i.e. currentIssueMissing) and
+  // INDEPENDENT of focusMode. focusMode controls the loud rendered presentation
+  // (the "## 🎯 Current focus" block + the "Other open issues" digest heading),
+  // not whether the scope fence exists: preventing scope creep is exactly what
+  // the directive does, so it must reach the model whether or not focus is on.
+  // The rendered focusBody block is still gated on focusMode + a resolved row.
   let focusBody = "";
   let directive: string | null = null;
-  if (focusMode && focusItem) {
-    directive = FOCUS_DIRECTIVE;
-    focusBody = renderFocusSection(focusItem, opts.currentIssueBody ?? null, directive);
+  if (currentId) {
+    const directiveIdentifier = focusItem?.identifier ?? opts.issueIdentifier ?? null;
+    const directiveTitle = focusItem?.title ?? opts.issueTitle ?? "the current issue";
+    directive = FOCUS_DIRECTIVE(directiveIdentifier, directiveTitle);
+    if (focusMode && focusItem) {
+      focusBody = renderFocusSection(focusItem, opts.currentIssueBody ?? null, directive);
+    }
   }
 
   // Digest block — one line per other open issue (labelled only when focus is on).

@@ -34,7 +34,8 @@
     "test:smoke": "npx playwright test --config tests/e2e/playwright.config.ts --grep @smoke",
     "test:regression": "npx playwright test --config tests/e2e/playwright.config.ts --grep @regression",
     "audit:em-autonomy": "node scripts/em-autonomy-audit.mjs",
-    "audit:em-autonomy:wide-claude": "node scripts/em-autonomy-wide-claude-audit.mjs"
+    "audit:em-autonomy:wide-claude": "node scripts/em-autonomy-wide-claude-audit.mjs",
+    "audit:em-autonomy:wide-codex": "node scripts/em-autonomy-wide-claude-audit.mjs --adapter codex_local"
   },
   "devDependencies": {
     "@changesets/cli": "^2.30.0",

@@ -317,6 +317,7 @@ const ADAPTER_BUDGETS: Record<string, number> = {
 export function resolveContextBudgetTokens(
   adapterType: string,
   adapterConfig: Record<string, unknown> | null | undefined,
+  context?: Record<string, unknown> | null,
 ): number {
   const fromConfig = adapterConfig?.contextBudgetTokens;
   if (typeof fromConfig === "number" && Number.isFinite(fromConfig) && fromConfig > 0) {
@@ -327,6 +328,16 @@ export function resolveContextBudgetTokens(
   if (fromEnv) {
     const parsed = Number(fromEnv);
     if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+  }
+  const policy = readObject(context?.combyneContextPolicy);
+  const issueComplexity = readString(policy?.issueComplexity);
+  const contextProfile = readString(policy?.contextProfile);
+  const isClaude = adapterType === "claude_local" || adapterType === "claude-local";
+  if (isClaude && (issueComplexity === "small" || contextProfile === "focused_small")) {
+    return 12_000;
+  }
+  if (isClaude && issueComplexity === "medium") {
+    return 32_000;
   }
   return ADAPTER_BUDGETS[adapterType] ?? 160_000;
 }
@@ -611,7 +622,7 @@ export function composeAndApplyBudget(
     if (sections.length === 0) {
       return { composed: emptyComposed(), applied: false, skippedReason: "no_sections" };
     }
-    const budget = resolveContextBudgetTokens(opts.adapterType, opts.adapterConfig);
+    const budget = resolveContextBudgetTokens(opts.adapterType, opts.adapterConfig, context);
     const composed = composeBudgetedPreamble(sections, {
       budget,
       model: opts.model,
@@ -758,7 +769,7 @@ export function runShadowComposer(opts: {
   try {
     const sections = buildPreambleSectionsFromContext(opts.context);
     if (sections.length === 0) return null;
-    const budget = resolveContextBudgetTokens(opts.adapterType, opts.adapterConfig);
+    const budget = resolveContextBudgetTokens(opts.adapterType, opts.adapterConfig, opts.context);
     const composed = composeBudgetedPreamble(sections, {
       budget,
       model: opts.model,

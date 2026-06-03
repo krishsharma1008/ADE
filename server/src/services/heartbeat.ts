@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   activityLog,
@@ -12,10 +12,17 @@ import {
   companies,
   heartbeatRunEvents,
   heartbeatRuns,
+  executionWorkspaces,
   issueComments,
+  issueLabels,
+  issuePullRequests,
   costEvents,
   issues,
+  labels,
+  projects,
   projectWorkspaces,
+  qaFeedbackEvents,
+  usagePauseWindows,
 } from "@combyne/db";
 import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -50,9 +57,12 @@ import {
 } from "./context-budget-telemetry.js";
 import { resolveModel } from "@combyne/context-budget";
 import { inspectGitStateForIssue } from "./git-state.js";
+import { verifyCleanBaseCheckoutForIssue } from "./workspace-scope-guard.js";
+import { validateScopeDiffBeforeAutoClose } from "./scope-diff-validator.js";
 import { probeAdapterAvailability } from "./adapter-availability.js";
 import { extractAndPostQuestions, extractQuestionsFromText, type ExtractedQuestionsResult } from "./agent-question-extract.js";
 import { issueService } from "./issues.js";
+import { resolveIssueComplexity } from "./issue-complexity.js";
 import { logActivity } from "./activity-log.js";
 import { loadCompanyProjectOverview } from "./agent-company-context.js";
 import {
@@ -81,6 +91,15 @@ import { parseObject, asBoolean, asNumber, asString, appendWithCap, MAX_EXCERPT_
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { loadIssueContextRefs, renderIssueContextRefs } from "./issue-context-refs.js";
+import {
+  buildExecutionWorkspaceAdapterConfig,
+  gateProjectExecutionWorkspacePolicy,
+  parseIssueExecutionWorkspaceSettings,
+  parseProjectExecutionWorkspacePolicy,
+  resolveExecutionWorkspaceMode,
+} from "./execution-workspace-policy.js";
+import { instanceSettingsService } from "./instance-settings.js";
+import { realizeExecutionWorkspace } from "./workspace-runtime.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
@@ -97,6 +116,7 @@ const SERVER_HOST_ID = process.env.COMBYNE_HOST_ID ?? `${os.hostname()}:${proces
 const SERVER_RESTART_GENERATION = Number(process.env.COMBYNE_RESTART_GENERATION ?? 0);
 
 const AUTO_CLOSE_SUCCESS_STATUSES = new Set(["todo", "in_progress"]);
+const RUN_FAILURE_BLOCK_SKIP_STATUSES = new Set(["done", "cancelled"]);
 const TOKEN_PAUSE_COMMENT_PREFIXES = [
   "Run paused after crossing the small-task token threshold",
   "Run paused after crossing the small-task active-token threshold",
@@ -104,6 +124,341 @@ const TOKEN_PAUSE_COMMENT_PREFIXES = [
 
 function autoCloseManualIssueRunsEnabled(): boolean {
   return asBoolean(process.env.COMBYNE_AUTO_CLOSE_MANUAL_ISSUES, false);
+}
+
+/**
+ * Issue 4 — master flag for the usage-pause engine. Default OFF.
+ *
+ * When false:
+ *   - the run-completion path treats a `claude_usage_limit_reached` adapter
+ *     result as an ordinary failure (no pause, no window), and
+ *   - the resume scheduler (resumeUsagePausedRuns) no-ops.
+ *
+ * Read live (not cached) so it can be flipped in env without a code path
+ * change, matching the COMBYNE_SUMMARIZER_ENABLED pattern in index.ts.
+ */
+export function usagePauseEnabled(): boolean {
+  return process.env.COMBYNE_USAGE_PAUSE_ENABLED === "true";
+}
+
+// Resume backoff ceiling — never wait more than 5 minutes between resume
+// polls for a given window, even after repeated "not reset yet" re-polls.
+const USAGE_PAUSE_MAX_BACKOFF_MS = 5 * 60 * 1000;
+
+// What a single resume attempt actually did, so the poller's
+// {resumed,deferred,failed} counters are accurate (a defer/fail inside
+// attemptResumeExecution must not be miscounted as a resume).
+type ResumeOutcome = "resumed" | "deferred" | "failed";
+
+function runIssueIdFromContext(run: typeof heartbeatRuns.$inferSelect): string | null {
+  const snapshot = parseObject(run.contextSnapshot);
+  const direct = readNonEmptyString(snapshot.issueId) ?? readNonEmptyString(snapshot.taskId);
+  if (direct) return direct;
+  const wake = parseObject(snapshot[DEFERRED_WAKE_CONTEXT_KEY]);
+  return readNonEmptyString(wake.issueId) ?? readNonEmptyString(wake.taskId) ?? null;
+}
+
+function compactFailureText(value: string | null | undefined, maxChars = 900) {
+  const compacted = (value ?? "Adapter run failed").trim().replace(/\s+/g, " ");
+  if (compacted.length <= maxChars) return compacted;
+  return `${compacted.slice(0, maxChars - 3).trimEnd()}...`;
+}
+
+export async function markIssueBlockedAfterFailedRun(
+  db: Db,
+  input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: Pick<typeof agents.$inferSelect, "id" | "name">;
+    message: string | null | undefined;
+    errorCode?: string | null;
+  },
+): Promise<{ blocked: boolean; issueId: string | null; reason: string }> {
+  const issueId = runIssueIdFromContext(input.run);
+  if (!issueId) return { blocked: false, issueId: null, reason: "missing_issue_scope" };
+
+  const issue = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      parentId: issues.parentId,
+      status: issues.status,
+      identifier: issues.identifier,
+      title: issues.title,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId)))
+    .then((rows) => rows[0] ?? null);
+
+  if (!issue) return { blocked: false, issueId, reason: "issue_not_found" };
+  if (RUN_FAILURE_BLOCK_SKIP_STATUSES.has(issue.status)) {
+    return { blocked: false, issueId, reason: `status_${issue.status}` };
+  }
+
+  const errorSummary = compactFailureText(input.message);
+  const body = [
+    "Agent run failed before this issue could continue.",
+    "",
+    `- Run: ${input.run.id}`,
+    `- Agent: ${input.agent.name}`,
+    ...(input.errorCode ? [`- Error code: ${input.errorCode}`] : []),
+    `- Error: ${errorSummary}`,
+    "",
+    issue.parentId
+      ? "The child issue is blocked and the parent assignee was notified to split, reassign, retry, or make the next coordination decision."
+      : "The issue is blocked for run review. This is not a user question; review the failed run before waking the assignee again.",
+  ];
+
+  await issueService(db).addComment(issue.id, body.join("\n"), { kind: "system" });
+  await issueService(db).update(
+    issue.id,
+    {
+      status: "blocked",
+      blockedSource: "agent",
+      blockedReason: `Run ${input.run.id} failed: ${errorSummary}`,
+    },
+    {
+      parentNotificationActor: { actorType: "system", actorId: null },
+    },
+  );
+
+  return { blocked: true, issueId, reason: "blocked_after_failed_run" };
+}
+
+// ── Issue 3 — MCP / integration auth-failure loop ─────────────────────────
+//
+// A 401 from an MCP tool must NEVER be reported as success or silently
+// auto-close. The adapter encodes the provider in the errorCode as
+// `integration_auth_required:<provider>` (heartbeat_runs has no error_meta
+// column, so the code IS the channel). The heartbeat then (a) transitions the
+// issue to awaiting_user with a provider auth link instead of blocking it, and
+// (b) circuit-breaks after 3 consecutive failed runs so we stop auto-retrying
+// against a broken integration.
+
+const INTEGRATION_AUTH_ERROR_PREFIX = "integration_auth_required";
+
+/** Provider slug -> friendly label for human-facing comments. */
+const INTEGRATION_PROVIDER_LABELS: Record<string, string> = {
+  atlassian: "Atlassian (Jira / Confluence)",
+  jira: "Jira",
+  linear: "Linear",
+  slack: "Slack",
+  "google-drive": "Google Drive",
+  gmail: "Gmail",
+  "google-calendar": "Google Calendar",
+  supabase: "Supabase",
+  integration: "the integration",
+};
+
+function isIntegrationAuthErrorCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && code.startsWith(INTEGRATION_AUTH_ERROR_PREFIX);
+}
+
+/**
+ * Parse the provider slug out of an `integration_auth_required:<provider>`
+ * code. Returns `"integration"` (generic) when no slug is present.
+ */
+function providerFromAuthErrorCode(code: string | null | undefined): string {
+  if (!isIntegrationAuthErrorCode(code)) return "integration";
+  const slug = String(code).split(":")[1]?.trim();
+  return slug && slug.length > 0 ? slug : "integration";
+}
+
+function integrationProviderLabel(provider: string): string {
+  return INTEGRATION_PROVIDER_LABELS[provider] ?? provider;
+}
+
+function dashboardBaseUrl(): string {
+  return (
+    process.env.COMBYNE_PUBLIC_URL?.trim().replace(/\/$/, "") ||
+    `http://127.0.0.1:${process.env.PORT?.trim() || "3100"}`
+  );
+}
+
+/**
+ * Best-effort deep link to re-authenticate a provider. Known providers map to
+ * their canonical OAuth / login entry point; everything else falls back to the
+ * Combyne integrations settings page (or a localhost equivalent when no public
+ * dashboard URL is configured).
+ */
+export function inferAuthUrlForProvider(provider: string): string {
+  const slug = (provider || "integration").trim().toLowerCase();
+  const known: Record<string, string> = {
+    atlassian: "https://id.atlassian.com/login",
+    jira: "https://id.atlassian.com/login",
+    linear: "https://linear.app/settings/account/security",
+    slack: "https://slack.com/signin",
+    "google-drive": "https://accounts.google.com/signin",
+    gmail: "https://accounts.google.com/signin",
+    "google-calendar": "https://accounts.google.com/signin",
+    supabase: "https://supabase.com/dashboard/sign-in",
+  };
+  if (known[slug]) return known[slug];
+  return `${dashboardBaseUrl()}/settings/integrations/${slug}`;
+}
+
+function buildIntegrationAuthComment(input: {
+  provider: string;
+  runId: string;
+  agentName: string;
+  errorMessage: string | null | undefined;
+  authUrl: string;
+  breaker?: boolean;
+}): string {
+  const label = integrationProviderLabel(input.provider);
+  const summary = compactFailureText(input.errorMessage ?? `${input.provider} auth required`);
+  if (input.breaker) {
+    return [
+      `Integration auth still failing for ${label} after 3 consecutive runs — pausing automatic retries.`,
+      "",
+      `- Latest run: ${input.runId}`,
+      `- Agent: ${input.agentName}`,
+      `- Error: ${summary}`,
+      "",
+      `Reconnect ${label} here: ${input.authUrl}`,
+      "",
+      "Once the integration is reconnected, wake the agent again to resume. The agent will not auto-retry until then.",
+    ].join("\n");
+  }
+  return [
+    `This issue is paused: the agent's ${label} integration returned an authentication error (401/403), so the run could not complete.`,
+    "",
+    `- Run: ${input.runId}`,
+    `- Agent: ${input.agentName}`,
+    `- Error: ${summary}`,
+    "",
+    `Reconnect ${label} here: ${input.authUrl}`,
+    "",
+    "After reconnecting the integration, wake the agent again to continue. This was NOT auto-closed — no real work happened on this run.",
+  ].join("\n");
+}
+
+/**
+ * Count how many of this issue's recent runs failed with the SAME provider's
+ * integration-auth error inside the last 24h. Filters to `status="failed"`
+ * (so in-progress / queued runs can't false-trip the count) and limits the
+ * scan to 3 rows. Returns the count plus whether the breaker should fire.
+ *
+ * heartbeat_runs has no issueId column, so we scope by company + agent +
+ * errorCode + window in SQL, then filter to this issue via the JSON context
+ * snapshot in JS (cheap — the window + limit keep the row set tiny).
+ */
+export async function trackConsecutiveAuthFailure(
+  db: Db,
+  input: {
+    issueId: string;
+    provider: string;
+    companyId: string;
+    agentId: string;
+  },
+): Promise<{ count: number; breakerTripped: boolean }> {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const errorCode = `${INTEGRATION_AUTH_ERROR_PREFIX}:${input.provider}`;
+
+  // Scope to THIS issue in SQL so the `LIMIT 3` is never consumed by other
+  // issues' runs for the same agent/provider. issueId lives in the JSON
+  // context_snapshot — match the direct `issueId`/`taskId` keys as well as the
+  // deferred-wake nested form (mirrors `runIssueIdFromContext`).
+  const issueScope = sql`(
+    ${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}
+    OR ${heartbeatRuns.contextSnapshot}->>'taskId' = ${input.issueId}
+    OR ${heartbeatRuns.contextSnapshot}->${DEFERRED_WAKE_CONTEXT_KEY}->>'issueId' = ${input.issueId}
+    OR ${heartbeatRuns.contextSnapshot}->${DEFERRED_WAKE_CONTEXT_KEY}->>'taskId' = ${input.issueId}
+  )`;
+
+  const rows = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        eq(heartbeatRuns.status, "failed"),
+        eq(heartbeatRuns.errorCode, errorCode),
+        gt(heartbeatRuns.finishedAt, since),
+        issueScope,
+      ),
+    )
+    .orderBy(desc(heartbeatRuns.finishedAt))
+    .limit(3);
+
+  const count = rows.length;
+  return { count, breakerTripped: count >= 3 };
+}
+
+/**
+ * Transition an issue to `awaiting_user` after an MCP/integration auth failure
+ * and post a provider auth link. Mirrors the small-task pause precedent
+ * (issueComments.insert + issueService.update). Fires the circuit-breaker
+ * comment once 3 consecutive same-provider failures have accumulated.
+ */
+export async function pauseIssueForIntegrationAuth(
+  db: Db,
+  input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: Pick<typeof agents.$inferSelect, "id" | "name">;
+    errorCode: string | null | undefined;
+    errorMessage: string | null | undefined;
+  },
+): Promise<{ paused: boolean; issueId: string | null; reason: string; breakerTripped: boolean }> {
+  const issueId = runIssueIdFromContext(input.run);
+  if (!issueId) return { paused: false, issueId: null, reason: "missing_issue_scope", breakerTripped: false };
+
+  const issue = await db
+    .select({ id: issues.id, companyId: issues.companyId, status: issues.status })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId)))
+    .then((rows) => rows[0] ?? null);
+
+  if (!issue) return { paused: false, issueId, reason: "issue_not_found", breakerTripped: false };
+  if (issue.status === "done" || issue.status === "cancelled") {
+    return { paused: false, issueId, reason: `status_${issue.status}`, breakerTripped: false };
+  }
+
+  const provider = providerFromAuthErrorCode(input.errorCode);
+  const authUrl = inferAuthUrlForProvider(provider);
+
+  const breaker = await trackConsecutiveAuthFailure(db, {
+    issueId,
+    provider,
+    companyId: issue.companyId,
+    agentId: input.run.agentId,
+  });
+
+  const commentBody = buildIntegrationAuthComment({
+    provider,
+    runId: input.run.id,
+    agentName: input.agent.name,
+    errorMessage: input.errorMessage,
+    authUrl,
+    breaker: breaker.breakerTripped,
+  });
+
+  await db.insert(issueComments).values({
+    companyId: issue.companyId,
+    issueId: issue.id,
+    authorAgentId: null,
+    authorUserId: null,
+    body: commentBody,
+    kind: "system",
+  });
+
+  await issueService(db).update(
+    issue.id,
+    {
+      status: "awaiting_user",
+      latestUserFacingAgentMessage: `${integrationProviderLabel(provider)} authentication required. Reconnect the integration: ${authUrl}`,
+    },
+    {
+      parentNotificationActor: { actorType: "system", actorId: null },
+    },
+  );
+
+  return {
+    paused: true,
+    issueId,
+    reason: breaker.breakerTripped ? "integration_auth_breaker_tripped" : "integration_auth_awaiting_user",
+    breakerTripped: breaker.breakerTripped,
+  };
 }
 
 export async function autoCloseIssueAfterSuccessfulRun(
@@ -115,13 +470,18 @@ export async function autoCloseIssueAfterSuccessfulRun(
     issueId: string;
     questionResult?: ExtractedQuestionsResult | null;
     allowAutoClose?: boolean;
+    summary?: string | null;
+    changedFiles?: string[];
+    checks?: string[];
   },
 ): Promise<{ closed: boolean; reason: string }> {
   const issue = await db
     .select({
       id: issues.id,
       companyId: issues.companyId,
+      title: issues.title,
       status: issues.status,
+      complexity: issues.complexity,
       originKind: issues.originKind,
     })
     .from(issues)
@@ -135,9 +495,24 @@ export async function autoCloseIssueAfterSuccessfulRun(
   if (!AUTO_CLOSE_SUCCESS_STATUSES.has(issue.status)) {
     return { closed: false, reason: `status_${issue.status}` };
   }
+  const issueLabelsForComplexity = await db
+    .select({ name: labels.name })
+    .from(issueLabels)
+    .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+    .where(eq(issueLabels.issueId, issue.id));
+  const complexity = resolveIssueComplexity({
+    complexity: issue.complexity,
+    title: issue.title,
+    labels: issueLabelsForComplexity,
+  });
+  if (complexity !== "small" && issue.originKind !== "routine_execution" && !input.allowAutoClose) {
+    return { closed: false, reason: `complexity_${complexity}_requires_policy_close` };
+  }
   if (
     input.questionResult &&
-    (input.questionResult.posted > 0 || input.questionResult.skippedExisting > 0)
+    (input.questionResult.posted > 0 ||
+      input.questionResult.skippedExisting > 0 ||
+      input.questionResult.routedToManager)
   ) {
     return { closed: false, reason: "questions_extracted" };
   }
@@ -148,7 +523,7 @@ export async function autoCloseIssueAfterSuccessfulRun(
     .where(
       and(
         eq(issueComments.issueId, issue.id),
-        eq(issueComments.kind, "question"),
+        inArray(issueComments.kind, ["question", "manager_question"]),
         isNull(issueComments.answeredAt),
       ),
     )
@@ -156,13 +531,85 @@ export async function autoCloseIssueAfterSuccessfulRun(
     .then((rows) => rows[0] ?? null);
   if (openQuestion) return { closed: false, reason: "open_questions" };
 
+  const openChildIssue = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(and(eq(issues.parentId, issue.id), notInArray(issues.status, ["done", "cancelled"])))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (openChildIssue) return { closed: false, reason: "open_child_issues" };
+
+  const unresolvedPullRequestBlocker = await db
+    .select({ id: issuePullRequests.id })
+    .from(issuePullRequests)
+    .where(
+      and(
+        eq(issuePullRequests.companyId, issue.companyId),
+        eq(issuePullRequests.issueId, issue.id),
+        eq(issuePullRequests.state, "open"),
+        sql<boolean>`(
+          ${issuePullRequests.mergeStatus} = 'blocked'
+          OR ${issuePullRequests.reviewStatus} = 'changes_requested'
+          OR ${issuePullRequests.ciStatus} IN ('failed', 'failing')
+          OR ${issuePullRequests.qualityStatus} IN ('failed', 'blocked')
+          OR ${issuePullRequests.feedbackStatus} IN ('needs_agent', 'sent', 'awaiting_human')
+        )`,
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (unresolvedPullRequestBlocker) return { closed: false, reason: "unresolved_pr_feedback" };
+
+  const unresolvedQaFeedback = await db
+    .select({ id: qaFeedbackEvents.id })
+    .from(qaFeedbackEvents)
+    .where(
+      and(
+        eq(qaFeedbackEvents.companyId, issue.companyId),
+        eq(qaFeedbackEvents.issueId, issue.id),
+        notInArray(qaFeedbackEvents.status, [
+          "known_issue",
+          "deferred",
+          "needs_product_decision",
+          "acknowledged",
+          "resolved",
+        ]),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (unresolvedQaFeedback) return { closed: false, reason: "unresolved_qa_feedback" };
+
   if (
     !input.allowAutoClose &&
+    complexity !== "small" &&
     issue.originKind !== "routine_execution" &&
     !autoCloseManualIssueRunsEnabled()
   ) {
     return { closed: false, reason: "manual_auto_close_disabled" };
   }
+
+  const details: string[] = [
+    "Run completed successfully and no open questions, blockers, child issues, QA feedback, or review feedback remain.",
+    "",
+    `- Run: ${input.runId}`,
+  ];
+  if (input.summary?.trim()) details.push(`- Summary: ${input.summary.trim().slice(0, 500)}`);
+  if (input.changedFiles && input.changedFiles.length > 0) {
+    details.push(`- Changed files: ${input.changedFiles.slice(0, 8).join(", ")}`);
+  }
+  if (input.checks && input.checks.length > 0) {
+    details.push(`- Checks: ${input.checks.slice(0, 8).join(", ")}`);
+  }
+
+  await db.insert(issueComments).values({
+    companyId: issue.companyId,
+    issueId: issue.id,
+    authorAgentId: null,
+    authorUserId: null,
+    body: details.join("\n"),
+    kind: "system",
+  });
 
   const updated = await issueService(db).update(issue.id, { status: "done" });
   if (!updated) return { closed: false, reason: "update_failed" };
@@ -179,10 +626,194 @@ export async function autoCloseIssueAfterSuccessfulRun(
     details: {
       reason: "successful_run_without_questions",
       previousStatus: issue.status,
+      issueComplexity: complexity,
     },
   });
 
   return { closed: true, reason: "successful_run_without_questions" };
+}
+
+async function mergeRunPromptBudgetMetadata(
+  db: Db,
+  runId: string,
+  patch: Record<string, unknown>,
+) {
+  const row = await db
+    .select({ promptBudgetJson: heartbeatRuns.promptBudgetJson })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then((rows) => rows[0] ?? null);
+  if (!row) return;
+  const existing = parseObject(row.promptBudgetJson);
+  await db
+    .update(heartbeatRuns)
+    .set({
+      promptBudgetJson: {
+        ...existing,
+        ...patch,
+      },
+      updatedAt: new Date(),
+    })
+    .where(eq(heartbeatRuns.id, runId));
+}
+
+export async function enforceDelegationPolicyAfterSuccessfulRun(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    issueId: string;
+    currentWakeReason?: string | null;
+    wakeAssignee?: boolean;
+  },
+): Promise<{ enforced: boolean; reason: string; wakeCommentId?: string | null }> {
+  const issue = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      title: issues.title,
+      status: issues.status,
+      complexity: issues.complexity,
+      assigneeAgentId: issues.assigneeAgentId,
+      originKind: issues.originKind,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!issue) return { enforced: false, reason: "issue_not_found" };
+  if (issue.originKind === "terminal_session") return { enforced: false, reason: "terminal_session_issue" };
+  if (issue.status === "done" || issue.status === "cancelled") return { enforced: false, reason: "terminal_issue" };
+  if (issue.status === "blocked" || issue.status === "awaiting_user") {
+    return { enforced: false, reason: `status_${issue.status}` };
+  }
+
+  const issueLabelsForComplexity = await db
+    .select({ name: labels.name })
+    .from(issueLabels)
+    .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+    .where(eq(issueLabels.issueId, issue.id));
+  const complexity = resolveIssueComplexity({
+    complexity: issue.complexity,
+    title: issue.title,
+    labels: issueLabelsForComplexity,
+  });
+  if (complexity === "small") return { enforced: false, reason: "small_issue" };
+
+  const assignee = issue.assigneeAgentId
+    ? await db
+        .select({ role: agents.role, permissions: agents.permissions })
+        .from(agents)
+        .where(eq(agents.id, issue.assigneeAgentId))
+        .then((rows) => rows[0] ?? null)
+    : null;
+  const permissions = parseObject(assignee?.permissions);
+  const role = assignee?.role?.trim().toLowerCase() ?? "";
+  const coordinatorOwned =
+    COORDINATOR_HEARTBEAT_ROLES.has(role) ||
+    permissions.canCreateAgents === true ||
+    hasCompanyAssignmentPermission(permissions);
+  if (!coordinatorOwned) return { enforced: false, reason: "not_coordinator_owned" };
+
+  const childRows = await db
+    .select({ id: issues.id, status: issues.status })
+    .from(issues)
+    .where(eq(issues.parentId, issue.id));
+  if (childRows.length > 0) {
+    const openChildCount = childRows.filter((child) => child.status !== "done" && child.status !== "cancelled").length;
+    return { enforced: false, reason: openChildCount > 0 ? "children_still_open" : "delegation_evidence_present" };
+  }
+
+  const existingComment = await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.issueId, issue.id),
+        eq(issueComments.kind, "system"),
+        sql`${issueComments.body} like 'Delegation required before this medium/large coordinator issue can complete.%'`,
+      ),
+    )
+    .orderBy(desc(issueComments.createdAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  const repeatedDelegationWake =
+    existingComment && input.currentWakeReason === "delegation_required";
+  const comment =
+    existingComment ??
+    (await db
+      .insert(issueComments)
+      .values({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        authorAgentId: null,
+        authorUserId: null,
+        kind: "system",
+        body:
+          "Delegation required before this medium/large coordinator issue can complete.\n\n" +
+          `- Issue complexity: ${complexity}\n` +
+          "- Current evidence: no child issues were created.\n" +
+          "- Required next step: create/delegate at least one child issue, wait for child completion, then add verification evidence before closing the parent.",
+      })
+      .returning({ id: issueComments.id })
+      .then((rows) => rows[0] ?? null));
+
+  if (issue.status === "backlog" || issue.status === "todo" || issue.status === "in_review") {
+    await issueService(db).update(issue.id, { status: "in_progress" }, { suppressParentNotification: true });
+  }
+
+  const policyMetadata = {
+    issueComplexity: complexity,
+    orchestrationPolicy: {
+      name: "medium_large_delegation_required",
+      action: repeatedDelegationWake ? "hold_in_progress" : "wake_coordinator",
+      violation: "missing_child_issues",
+      wakeReason: "delegation_required",
+      wakeCommentId: comment?.id ?? null,
+      runAgentId: input.agentId,
+      repeatedDelegationWake: Boolean(repeatedDelegationWake),
+    },
+  };
+  await mergeRunPromptBudgetMetadata(db, input.runId, policyMetadata);
+
+  await logActivity(db, {
+    companyId: issue.companyId,
+    actorType: "system",
+    actorId: "heartbeat",
+    agentId: input.agentId,
+    runId: input.runId,
+    action: "issue.delegation_required",
+    entityType: "issue",
+    entityId: issue.id,
+    details: policyMetadata,
+  });
+
+  if (issue.assigneeAgentId && input.wakeAssignee !== false && !repeatedDelegationWake) {
+    await heartbeatService(db).wakeup(issue.assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "delegation_required",
+      payload: { issueId: issue.id, runId: input.runId, commentId: comment?.id ?? null },
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat",
+      contextSnapshot: {
+        issueId: issue.id,
+        taskId: issue.id,
+        taskKey: issue.id,
+        wakeReason: "delegation_required",
+        wakeCommentId: comment?.id ?? null,
+        source: "orchestration_policy",
+        recommendedNextAction:
+          "Create and delegate child issues for this medium/large issue, then verify child completion before closing.",
+      },
+    });
+  }
+
+  return {
+    enforced: true,
+    reason: repeatedDelegationWake ? "delegation_required_already_pending" : "delegation_required",
+    wakeCommentId: comment?.id ?? null,
+  };
 }
 
 export async function reopenIssuesAutoClosedAfterTokenPause(
@@ -273,18 +904,28 @@ function hasCompanyAssignmentPermission(permissions: Record<string, unknown> | n
   return permissions?.canAssignTasks === true && permissions.taskAssignmentScope === "company";
 }
 
-export function defaultMaxConcurrentRunsForAgent(agent: {
+function parseAgentPermissions(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function isCoordinatorAgent(agent: {
   role?: string | null;
   permissions?: Record<string, unknown> | null;
 }) {
   const role = typeof agent.role === "string" ? agent.role.trim().toLowerCase() : "";
-  const permissions =
-    !!agent.permissions && typeof agent.permissions === "object"
-      ? (agent.permissions as Record<string, unknown>)
-      : null;
-  const canCreateAgents = permissions?.canCreateAgents === true;
-  const canAssignCompanyTasks = hasCompanyAssignmentPermission(permissions);
-  if (COORDINATOR_HEARTBEAT_ROLES.has(role) || canCreateAgents || canAssignCompanyTasks) {
+  const permissions = parseAgentPermissions(agent.permissions);
+  return (
+    COORDINATOR_HEARTBEAT_ROLES.has(role) ||
+    permissions?.canCreateAgents === true ||
+    hasCompanyAssignmentPermission(permissions)
+  );
+}
+
+export function defaultMaxConcurrentRunsForAgent(agent: {
+  role?: string | null;
+  permissions?: Record<string, unknown> | null;
+}) {
+  if (isCoordinatorAgent(agent)) {
     return HEARTBEAT_COORDINATOR_MAX_CONCURRENT_RUNS_DEFAULT;
   }
   return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
@@ -294,24 +935,71 @@ function buildCoordinatorGuidance(agent: {
   role?: string | null;
   permissions?: Record<string, unknown> | null;
 }) {
-  const role = typeof agent.role === "string" ? agent.role.trim().toLowerCase() : "";
-  const permissions =
-    !!agent.permissions && typeof agent.permissions === "object"
-      ? (agent.permissions as Record<string, unknown>)
-      : null;
-  const isCoordinator =
-    COORDINATOR_HEARTBEAT_ROLES.has(role) ||
-    permissions?.canCreateAgents === true ||
-    hasCompanyAssignmentPermission(permissions);
-  if (!isCoordinator) return null;
+  if (!isCoordinatorAgent(agent)) return null;
   return [
     "## Coordinator execution guidance",
     "",
-    "- Default to hands-off execution for small tasks. Do not wait for a human nudge after child/reviewer/QA feedback.",
+    "- Default to hands-off execution for small tasks: keep internal work moving on child/QA feedback without waiting for a human nudge.",
+    "- EXCEPTION — pull request review feedback is human-gated. When a reviewer requests changes (or post-PR CI/quality feedback lands) on a PR awaiting review, the dashboard holds it for the human by default. Do NOT proactively rewrite and push in response to review feedback. Only act on it when you are explicitly woken with reason `pr_feedback`, which happens after a board member opts in from the PR panel (or merges). Until then, leave the PR in `in_review` and let the human review.",
     "- If a child agent asks a question and the answer is available from parent issue context, comments, QA/review feedback, repo state, or company memory, answer it yourself with `POST /api/issues/{issueId}/internal-questions/{commentId}/answer` and body `{ \"answer\": \"...\", \"assumption\": true }` when you are choosing a reasonable default.",
     "- Answer internal child questions before escalating. Escalate to the human only for credentials/access, approval gates, destructive actions, budget/legal risk, or a true product/business decision with no reasonable default.",
     "- Parallelize independent work across available agents, but keep same-issue code changes serialized by the issue execution lock.",
     "- Before push/merge, verify child issues, review feedback, QA feedback, and open questions are closed or explicitly assigned.",
+  ].join("\n");
+}
+
+function buildMediumLargeDelegationGuidance(input: {
+  issueId: string;
+  complexity: string | null;
+  agent: {
+    id: string;
+    role?: string | null;
+    permissions?: Record<string, unknown> | null;
+  };
+  candidates: Array<{
+    id: string;
+    name: string;
+    role: string | null;
+    reportsTo: string | null;
+    capabilities: string | null;
+  }>;
+}) {
+  if (input.complexity !== "medium" && input.complexity !== "large") return null;
+  if (!isCoordinatorAgent(input.agent)) return null;
+  const candidateLines =
+    input.candidates.length > 0
+      ? input.candidates
+          .map((candidate) => {
+            const role = candidate.role ? ` · ${candidate.role}` : "";
+            const reportsTo = candidate.reportsTo === input.agent.id ? " · direct report" : "";
+            const capabilities = candidate.capabilities
+              ? ` · ${candidate.capabilities.replace(/\s+/g, " ").slice(0, 160)}`
+              : "";
+            return `- ${candidate.name}${role}${reportsTo}: ${candidate.id}${capabilities}`;
+          })
+          .join("\n")
+      : "- No eligible child assignees were found. Create/hire an agent first or escalate this as a staffing blocker.";
+
+  return [
+    "## Medium/large delegation requirement",
+    "",
+    `This focused issue is ${input.complexity}. Server policy will keep coordinator-owned medium/large issues in progress until delegated child work exists, all child issues are terminal, and the parent has verification evidence.`,
+    "",
+    "If this wake reason is `delegation_required`, do not repeat the parent implementation work. Create child issue(s) now, then wait for those child issues to complete.",
+    "",
+    "Use the delegation endpoint from the run terminal:",
+    "",
+    "```sh",
+    `curl -sS -X POST "$COMBYNE_API_URL/api/issues/${input.issueId}/delegate" \\`,
+    '  -H "Authorization: Bearer $COMBYNE_API_KEY" \\',
+    '  -H "Content-Type: application/json" \\',
+    `  --data '{"toAgentId":"<agent-id>","title":"<child title>","description":"<focused child brief>","priority":"medium","complexity":"small"}'`,
+    "```",
+    "",
+    "Available child assignees:",
+    candidateLines,
+    "",
+    "After child completion, post a concise verification comment on the parent covering child outcomes and checks before marking the parent done.",
   ].join("\n");
 }
 
@@ -502,9 +1190,14 @@ interface ParsedIssueAssigneeAdapterOverrides {
 
 export type ResolvedWorkspaceForRun = {
   cwd: string;
-  source: "project_primary" | "task_session" | "agent_home";
+  source: "project_primary" | "execution_workspace" | "task_session" | "agent_home";
   projectId: string | null;
   workspaceId: string | null;
+  projectWorkspaceId?: string | null;
+  executionWorkspaceId?: string | null;
+  executionWorkspaceMode?: string | null;
+  branchName?: string | null;
+  worktreePath?: string | null;
   repoUrl: string | null;
   repoRef: string | null;
   workspaceHints: Array<{
@@ -514,10 +1207,576 @@ export type ResolvedWorkspaceForRun = {
     repoRef: string | null;
   }>;
   warnings: string[];
+  /**
+   * Set when the per-issue workspace scope guard refused to fork an isolated
+   * workspace from a base checkout contaminated by another issue's
+   * uncommitted work. The caller must abort the run (do not invoke the
+   * adapter), post the supplied comment to the issue, and leave the issue for
+   * a human to triage. Null on the normal path.
+   */
+  scopeRefusal?: {
+    issueId: string;
+    reason: string;
+    suggestion: string;
+    baseCwd: string;
+  } | null;
 };
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+export async function resolveWorkspaceForHeartbeatRun(
+  db: Db,
+  input: {
+    agent: typeof agents.$inferSelect;
+    context: Record<string, unknown>;
+    previousSessionParams: Record<string, unknown> | null;
+    useProjectWorkspace?: boolean | null;
+  },
+): Promise<ResolvedWorkspaceForRun> {
+  const { agent, context, previousSessionParams } = input;
+  const issueId = readNonEmptyString(context.issueId);
+  const contextProjectId = readNonEmptyString(context.projectId);
+  const issueRow = issueId
+    ? await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+        .then((rows) => rows[0] ?? null)
+    : null;
+  const resolvedProjectId = issueRow?.projectId ?? contextProjectId;
+  const useProjectWorkspace = input.useProjectWorkspace !== false;
+  const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
+
+  const projectRow = workspaceProjectId
+    ? await db
+        .select({
+          id: projects.id,
+          executionWorkspacePolicy: projects.executionWorkspacePolicy,
+        })
+        .from(projects)
+        .where(and(eq(projects.id, workspaceProjectId), eq(projects.companyId, agent.companyId)))
+        .then((rows) => rows[0] ?? null)
+    : null;
+  const experimentalSettings = await instanceSettingsService(db)
+    .getExperimental()
+    .catch(() => ({
+      enableIsolatedWorkspaces: false,
+      autoRestartDevServerWhenIdle: false,
+      defaultIsolationMode: "shared_workspace" as const,
+    }));
+  const isolatedWorkspacesEnabled = experimentalSettings.enableIsolatedWorkspaces === true;
+  const defaultIsolationMode = experimentalSettings.defaultIsolationMode ?? "shared_workspace";
+  const projectPolicy = gateProjectExecutionWorkspacePolicy(
+    parseProjectExecutionWorkspacePolicy(projectRow?.executionWorkspacePolicy),
+    isolatedWorkspacesEnabled,
+  );
+  const rawIssueSettings = {
+    ...parseObject(issueRow?.executionWorkspaceSettings),
+  };
+  if (!readNonEmptyString(rawIssueSettings.mode) && issueRow?.executionWorkspacePreference) {
+    rawIssueSettings.mode = issueRow.executionWorkspacePreference;
+  }
+  const issueSettings = parseIssueExecutionWorkspaceSettings(rawIssueSettings);
+  let executionWorkspaceMode = resolveExecutionWorkspaceMode({
+    projectPolicy,
+    issueSettings,
+    legacyUseProjectWorkspace: input.useProjectWorkspace ?? null,
+  });
+
+  // Default-isolation upgrade (P1.A §5d): when the resolved mode is
+  // shared_workspace but this issue resolves a real project repo and the
+  // instance flag opts into per-issue worktrees, upgrade to isolation so a
+  // "code ticket" runs in its own fenced checkout. Gated on
+  // isolatedWorkspacesEnabled because the worktree realization path itself is
+  // gated on it; without it the upgrade would have no effect.
+  if (
+    executionWorkspaceMode === "shared_workspace" &&
+    defaultIsolationMode === "per_issue_worktree" &&
+    isolatedWorkspacesEnabled &&
+    Boolean(issueRow) &&
+    Boolean(workspaceProjectId)
+  ) {
+    executionWorkspaceMode = "isolated_workspace";
+    logger.debug(
+      { agentId: agent.id, issueId: issueRow?.id, projectId: resolvedProjectId },
+      "workspace_isolation.default_upgrade_to_isolated",
+    );
+  }
+
+  const projectWorkspaceRows = workspaceProjectId
+    ? await db
+        .select()
+        .from(projectWorkspaces)
+        .where(
+          and(
+            eq(projectWorkspaces.companyId, agent.companyId),
+            eq(projectWorkspaces.projectId, workspaceProjectId),
+          ),
+        )
+        .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+    : [];
+  const preferredWorkspaceId = projectPolicy?.defaultProjectWorkspaceId ?? null;
+  if (preferredWorkspaceId) {
+    projectWorkspaceRows.sort((left, right) => {
+      if (left.id === preferredWorkspaceId && right.id !== preferredWorkspaceId) return -1;
+      if (right.id === preferredWorkspaceId && left.id !== preferredWorkspaceId) return 1;
+      return 0;
+    });
+  }
+
+  const hideProjectWorkspaceCwds =
+    isolatedWorkspacesEnabled &&
+    Boolean(issueRow) &&
+    executionWorkspaceMode === "isolated_workspace";
+  const workspaceHints = projectWorkspaceRows.map((workspace) => ({
+    workspaceId: workspace.id,
+    cwd: hideProjectWorkspaceCwds ? null : readNonEmptyString(workspace.cwd),
+    repoUrl: readNonEmptyString(workspace.repoUrl),
+    repoRef: readNonEmptyString(workspace.repoRef),
+  }));
+
+  if (projectWorkspaceRows.length > 0) {
+    const missingProjectCwds: string[] = [];
+    let hasConfiguredProjectCwd = false;
+    for (const workspace of projectWorkspaceRows) {
+      const projectCwd = readNonEmptyString(workspace.cwd);
+      if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
+        continue;
+      }
+      hasConfiguredProjectCwd = true;
+      const projectCwdExists = await fs
+        .stat(projectCwd)
+        .then((stats) => stats.isDirectory())
+        .catch(() => false);
+      if (!projectCwdExists) {
+        missingProjectCwds.push(projectCwd);
+        continue;
+      }
+
+      if (
+        isolatedWorkspacesEnabled &&
+        issueRow &&
+        executionWorkspaceMode === "isolated_workspace"
+      ) {
+        const now = new Date();
+        const reusableWorkspace = await loadReusableExecutionWorkspaceForIssue(db, {
+          companyId: agent.companyId,
+          issueId: issueRow.id,
+          executionWorkspaceId: issueRow.executionWorkspaceId,
+        });
+        if (reusableWorkspace?.cwd) {
+          await db
+            .update(executionWorkspaces)
+            .set({ status: "active", lastUsedAt: now, updatedAt: now })
+            .where(eq(executionWorkspaces.id, reusableWorkspace.id));
+          if (issueRow.executionWorkspaceId !== reusableWorkspace.id) {
+            await db
+              .update(issues)
+              .set({ executionWorkspaceId: reusableWorkspace.id, updatedAt: now })
+              .where(and(eq(issues.id, issueRow.id), eq(issues.companyId, agent.companyId)));
+          }
+          return {
+            cwd: reusableWorkspace.cwd,
+            source: "execution_workspace" as const,
+            projectId: resolvedProjectId,
+            workspaceId: reusableWorkspace.id,
+            projectWorkspaceId: reusableWorkspace.projectWorkspaceId ?? workspace.id,
+            executionWorkspaceId: reusableWorkspace.id,
+            executionWorkspaceMode,
+            branchName: reusableWorkspace.branchName ?? null,
+            worktreePath: reusableWorkspace.cwd,
+            repoUrl: reusableWorkspace.repoUrl ?? workspace.repoUrl,
+            repoRef: reusableWorkspace.baseRef ?? workspace.repoRef,
+            workspaceHints,
+            warnings: [],
+          };
+        }
+
+        // Per-issue workspace scope guard (P1.A §5b). Before forking an
+        // isolated worktree from the shared BASE checkout, verify that base is
+        // not contaminated by another issue's uncommitted work. We only reach
+        // here when there is no reusable workspace for this issue, i.e. this is
+        // a fresh isolation. If the issue has never had an execution workspace
+        // and is not already on the isolated preference, treat a dirty-base as
+        // first-time isolation of a previously-shared checkout → SOFT WARN
+        // (proceed + comment). Otherwise a dirty-unrelated base is a hard
+        // refusal.
+        const scopeWarnings: string[] = [];
+        try {
+          const scopeCheck = await verifyCleanBaseCheckoutForIssue(db, {
+            baseCwd: projectCwd,
+            issueId: issueRow.id,
+            issueIdentifier: issueRow.identifier ?? null,
+          });
+          if (!scopeCheck.clean) {
+            const firstTimeIsolation =
+              !issueRow.executionWorkspaceId &&
+              issueRow.executionWorkspacePreference !== "isolated_workspace";
+            if (firstTimeIsolation) {
+              // Soft warn — proceed, but surface a comment so a human can
+              // confirm the leftover work is intentional.
+              const softMessage =
+                `Heads up: this issue is moving to an isolated per-issue workspace for the first time, ` +
+                `but the shared base checkout \`${projectCwd}\` has uncommitted changes that are not obviously ` +
+                `attributable to this issue. Proceeding with isolation; the new worktree forks from the current ` +
+                `base state. ${scopeCheck.suggestion}`;
+              scopeWarnings.push(softMessage);
+              await logActivity(db, {
+                companyId: agent.companyId,
+                actorType: "system",
+                actorId: agent.id,
+                action: "workspace_scope_violation",
+                entityType: "issue",
+                entityId: issueRow.id,
+                agentId: agent.id,
+                details: {
+                  severity: "soft_warn",
+                  baseCwd: projectCwd,
+                  reason: scopeCheck.reason,
+                  issueIdentifier: issueRow.identifier ?? null,
+                },
+              }).catch(() => {});
+              await db
+                .insert(issueComments)
+                .values({
+                  companyId: agent.companyId,
+                  issueId: issueRow.id,
+                  authorAgentId: null,
+                  authorUserId: null,
+                  body: softMessage,
+                })
+                .catch(() => {});
+            } else {
+              // Hard refuse — the base is contaminated and we have no reason to
+              // believe the dirty work is ours. Do not fork; abort the run.
+              await logActivity(db, {
+                companyId: agent.companyId,
+                actorType: "system",
+                actorId: agent.id,
+                action: "workspace_scope_violation",
+                entityType: "issue",
+                entityId: issueRow.id,
+                agentId: agent.id,
+                details: {
+                  severity: "refused",
+                  baseCwd: projectCwd,
+                  reason: scopeCheck.reason,
+                  suggestion: scopeCheck.suggestion,
+                  issueIdentifier: issueRow.identifier ?? null,
+                },
+              }).catch(() => {});
+              return {
+                cwd: projectCwd,
+                source: "project_primary" as const,
+                projectId: resolvedProjectId,
+                workspaceId: workspace.id,
+                projectWorkspaceId: workspace.id,
+                executionWorkspaceId: null,
+                executionWorkspaceMode,
+                repoUrl: workspace.repoUrl,
+                repoRef: workspace.repoRef,
+                workspaceHints,
+                warnings: [scopeCheck.reason, scopeCheck.suggestion],
+                scopeRefusal: {
+                  issueId: issueRow.id,
+                  reason: scopeCheck.reason,
+                  suggestion: scopeCheck.suggestion,
+                  baseCwd: projectCwd,
+                },
+              };
+            }
+          }
+        } catch (err) {
+          logger.debug(
+            { err, agentId: agent.id, issueId: issueRow.id },
+            "workspace scope guard check failed; proceeding without scope enforcement",
+          );
+        }
+
+        try {
+          const adapterConfig = buildExecutionWorkspaceAdapterConfig({
+            agentConfig: parseObject(agent.adapterConfig),
+            projectPolicy,
+            issueSettings,
+            mode: executionWorkspaceMode,
+            legacyUseProjectWorkspace: input.useProjectWorkspace ?? null,
+          });
+          const realized = await realizeExecutionWorkspace({
+            base: {
+              baseCwd: projectCwd,
+              source: "project_primary",
+              projectId: resolvedProjectId,
+              workspaceId: workspace.id,
+              repoUrl: workspace.repoUrl,
+              repoRef: workspace.repoRef,
+            },
+            config: adapterConfig,
+            issue: {
+              id: issueRow.id,
+              identifier: issueRow.identifier,
+              title: issueRow.title,
+            },
+            agent: {
+              id: agent.id,
+              name: agent.name,
+              companyId: agent.companyId,
+            },
+            recorder: null,
+          });
+
+          if (realized.strategy === "git_worktree") {
+            const strategy = parseObject(adapterConfig.workspaceStrategy);
+            const baseRef = readNonEmptyString(strategy.baseRef) ?? workspace.repoRef ?? null;
+            const executionProjectId = workspaceProjectId ?? resolvedProjectId;
+            if (!executionProjectId) {
+              return {
+                cwd: projectCwd,
+                source: "project_primary" as const,
+                projectId: resolvedProjectId,
+                workspaceId: workspace.id,
+                projectWorkspaceId: workspace.id,
+                executionWorkspaceId: null,
+                executionWorkspaceMode,
+                repoUrl: workspace.repoUrl,
+                repoRef: workspace.repoRef,
+                workspaceHints,
+                warnings: [
+                  `Isolated execution workspace could not be persisted because no project id is available. Using project workspace "${projectCwd}" for this run.`,
+                ],
+              };
+            }
+            const executionWorkspaceData = {
+              companyId: agent.companyId,
+              projectId: executionProjectId,
+              projectWorkspaceId: workspace.id,
+              sourceIssueId: issueRow.id,
+              mode: "isolated_workspace" as const,
+              strategyType: "git_worktree" as const,
+              name: `${issueRow.identifier ?? "Issue"} execution workspace`,
+              status: "active" as const,
+              cwd: realized.cwd,
+              repoUrl: workspace.repoUrl,
+              baseRef,
+              branchName: realized.branchName,
+              providerType: "git_worktree" as const,
+              providerRef: realized.worktreePath,
+              lastUsedAt: now,
+              metadata: {
+                createdByRuntime: true,
+                baseCwd: projectCwd,
+                baseRef,
+                branchName: realized.branchName,
+                worktreePath: realized.worktreePath,
+                sourceIssueId: issueRow.id,
+                issueIdentifier: issueRow.identifier,
+                agentId: agent.id,
+                projectWorkspaceId: workspace.id,
+                workspaceStrategy: strategy,
+              },
+              updatedAt: now,
+            };
+            const existingAfterRealize = await loadReusableExecutionWorkspaceForIssue(db, {
+              companyId: agent.companyId,
+              issueId: issueRow.id,
+              executionWorkspaceId: issueRow.executionWorkspaceId,
+            });
+            const [persistedWorkspace] = existingAfterRealize
+              ? await db
+                  .update(executionWorkspaces)
+                  .set(executionWorkspaceData)
+                  .where(eq(executionWorkspaces.id, existingAfterRealize.id))
+                  .returning()
+              : await db
+                  .insert(executionWorkspaces)
+                  .values({
+                    ...executionWorkspaceData,
+                    openedAt: now,
+                    createdAt: now,
+                  })
+                  .returning();
+            await db
+              .update(issues)
+              .set({
+                executionWorkspaceId: persistedWorkspace.id,
+                executionWorkspacePreference: issueRow.executionWorkspacePreference ?? "isolated_workspace",
+                updatedAt: now,
+              })
+              .where(and(eq(issues.id, issueRow.id), eq(issues.companyId, agent.companyId)));
+
+            return {
+              cwd: realized.cwd,
+              source: "execution_workspace" as const,
+              projectId: resolvedProjectId,
+              workspaceId: persistedWorkspace.id,
+              projectWorkspaceId: workspace.id,
+              executionWorkspaceId: persistedWorkspace.id,
+              executionWorkspaceMode,
+              branchName: realized.branchName,
+              worktreePath: realized.worktreePath,
+              repoUrl: workspace.repoUrl,
+              repoRef: baseRef,
+              workspaceHints,
+              warnings: [...scopeWarnings, ...realized.warnings],
+            };
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            { err, agentId: agent.id, issueId: issueRow.id, projectId: resolvedProjectId },
+            "failed to realize isolated execution workspace; falling back to project workspace",
+          );
+          return {
+            cwd: projectCwd,
+            source: "project_primary" as const,
+            projectId: resolvedProjectId,
+            workspaceId: workspace.id,
+            projectWorkspaceId: workspace.id,
+            executionWorkspaceId: null,
+            executionWorkspaceMode,
+            repoUrl: workspace.repoUrl,
+            repoRef: workspace.repoRef,
+            workspaceHints,
+            warnings: [
+              `Isolated execution workspace could not be prepared (${compactFailureText(message, 240)}). Using project workspace "${projectCwd}" for this run.`,
+            ],
+          };
+        }
+      }
+
+      return {
+        cwd: projectCwd,
+        source: "project_primary" as const,
+        projectId: resolvedProjectId,
+        workspaceId: workspace.id,
+        projectWorkspaceId: workspace.id,
+        executionWorkspaceId: null,
+        executionWorkspaceMode,
+        repoUrl: workspace.repoUrl,
+        repoRef: workspace.repoRef,
+        workspaceHints,
+        warnings: [],
+      };
+    }
+
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
+    await fs.mkdir(fallbackCwd, { recursive: true });
+    const warnings: string[] = [];
+    if (missingProjectCwds.length > 0) {
+      const firstMissing = missingProjectCwds[0];
+      const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
+      warnings.push(
+        extraMissingCount > 0
+          ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
+          : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
+      );
+    } else if (!hasConfiguredProjectCwd) {
+      warnings.push(
+        `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
+      );
+    }
+    return {
+      cwd: fallbackCwd,
+      source: "project_primary" as const,
+      projectId: resolvedProjectId,
+      workspaceId: projectWorkspaceRows[0]?.id ?? null,
+      projectWorkspaceId: projectWorkspaceRows[0]?.id ?? null,
+      executionWorkspaceId: null,
+      executionWorkspaceMode,
+      repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
+      repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
+      workspaceHints,
+      warnings,
+    };
+  }
+
+  const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
+  if (sessionCwd) {
+    const sessionCwdExists = await fs
+      .stat(sessionCwd)
+      .then((stats) => stats.isDirectory())
+      .catch(() => false);
+    if (sessionCwdExists) {
+      return {
+        cwd: sessionCwd,
+        source: "task_session" as const,
+        projectId: resolvedProjectId,
+        workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
+        projectWorkspaceId: null,
+        executionWorkspaceId: null,
+        executionWorkspaceMode,
+        repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
+        repoRef: readNonEmptyString(previousSessionParams?.repoRef),
+        workspaceHints,
+        warnings: [],
+      };
+    }
+  }
+
+  const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
+  await fs.mkdir(cwd, { recursive: true });
+  const warnings: string[] = [];
+  if (sessionCwd) {
+    warnings.push(
+      `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
+    );
+  } else if (resolvedProjectId) {
+    warnings.push(
+      `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
+    );
+  } else {
+    warnings.push(
+      `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
+    );
+  }
+  return {
+    cwd,
+    source: "agent_home" as const,
+    projectId: resolvedProjectId,
+    workspaceId: null,
+    projectWorkspaceId: null,
+    executionWorkspaceId: null,
+    executionWorkspaceMode,
+    repoUrl: null,
+    repoRef: null,
+    workspaceHints,
+    warnings,
+  };
+}
+
+async function loadReusableExecutionWorkspaceForIssue(
+  db: Db,
+  input: { companyId: string; issueId: string; executionWorkspaceId: string | null },
+): Promise<typeof executionWorkspaces.$inferSelect | null> {
+  const reusableStatuses = ["active", "idle", "in_review"];
+  if (input.executionWorkspaceId) {
+    const existing = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, input.companyId),
+          inArray(executionWorkspaces.status, reusableStatuses),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (existing) return existing;
+  }
+
+  return db
+    .select()
+    .from(executionWorkspaces)
+    .where(
+      and(
+        eq(executionWorkspaces.companyId, input.companyId),
+        eq(executionWorkspaces.sourceIssueId, input.issueId),
+        inArray(executionWorkspaces.status, reusableStatuses),
+      ),
+    )
+    .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.updatedAt), desc(executionWorkspaces.createdAt))
+    .then((rows) => rows[0] ?? null);
 }
 
 export function deriveLatestUserFacingAgentMessage(sourceText: string, resultJson: unknown): string | null {
@@ -533,6 +1792,34 @@ export function deriveLatestUserFacingAgentMessage(sourceText: string, resultJso
   if (structured) return structured.slice(0, 4000);
 
   return null;
+}
+
+function summarizeSuccessfulAdapterResult(
+  resultJson: unknown,
+  stdoutExcerpt: string,
+): { summary: string | null; changedFiles: string[]; checks: string[] } {
+  const result = parseObject(resultJson);
+  const summary =
+    readNonEmptyString(result?.summary) ??
+    readNonEmptyString(result?.message) ??
+    readNonEmptyString(result?.result) ??
+    readNonEmptyString(result?.final) ??
+    stdoutExcerpt
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0 && line.length <= 240) ??
+    null;
+  const toStringArray = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value
+          .map((item) => (typeof item === "string" ? item.trim() : ""))
+          .filter((item) => item.length > 0)
+      : [];
+  return {
+    summary: summary ? summary.slice(0, 600) : null,
+    changedFiles: toStringArray(result?.changedFiles ?? result?.filesChanged ?? result?.files),
+    checks: toStringArray(result?.checks ?? result?.commandsRun ?? result?.tests),
+  };
 }
 
 function contextSectionNames(context: Record<string, unknown>): string[] {
@@ -568,14 +1855,16 @@ function contextSectionNames(context: Record<string, unknown>): string[] {
 function setContextPolicy(
   context: Record<string, unknown>,
   input: {
-    profile: AgentContextProfile;
+    profile: AgentContextProfile | "focused_small";
     focusIssueId: string | null;
     focusIssueSource: string | null;
     queueDigest: "included" | "omitted" | "none";
+    issueComplexity?: string | null;
   },
 ) {
   context.combyneContextPolicy = {
     contextProfile: input.profile,
+    issueComplexity: input.issueComplexity ?? null,
     contextFocusIssueId: input.focusIssueId,
     focusIssueSource: input.focusIssueSource,
     queueDigest: input.queueDigest,
@@ -594,6 +1883,7 @@ function buildContextAuditSnapshot(
     taskId: readNonEmptyString(context.taskId) ?? readNonEmptyString(base?.taskId),
     taskKey: readNonEmptyString(context.taskKey) ?? readNonEmptyString(base?.taskKey),
     contextProfile: readNonEmptyString(policy?.contextProfile),
+    issueComplexity: readNonEmptyString(policy?.issueComplexity),
     contextFocusIssueId: readNonEmptyString(policy?.contextFocusIssueId),
     contextFocusIssueSource: readNonEmptyString(policy?.focusIssueSource),
     contextQueueDigest: readNonEmptyString(policy?.queueDigest),
@@ -610,6 +1900,19 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
   const previousSessionId = readNonEmptyString(previousSessionParams?.sessionId);
   const previousCwd = readNonEmptyString(previousSessionParams?.cwd);
   if (!previousSessionId || !previousCwd) {
+    return {
+      sessionParams: previousSessionParams,
+      warning: null as string | null,
+    };
+  }
+  if (resolvedWorkspace.source === "execution_workspace") {
+    const executionCwd = readNonEmptyString(resolvedWorkspace.cwd);
+    if (executionCwd && path.resolve(previousCwd) !== path.resolve(executionCwd)) {
+      return {
+        sessionParams: null,
+        warning: `Skipping saved session resume because the issue now runs in isolated workspace "${executionCwd}" instead of "${previousCwd}".`,
+      };
+    }
     return {
       sessionParams: previousSessionParams,
       warning: null as string | null,
@@ -1025,141 +2328,12 @@ export function heartbeatService(db: Db) {
     previousSessionParams: Record<string, unknown> | null,
     opts?: { useProjectWorkspace?: boolean | null },
   ): Promise<ResolvedWorkspaceForRun> {
-    const issueId = readNonEmptyString(context.issueId);
-    const contextProjectId = readNonEmptyString(context.projectId);
-    const issueProjectId = issueId
-      ? await db
-          .select({ projectId: issues.projectId })
-          .from(issues)
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
-          .then((rows) => rows[0]?.projectId ?? null)
-      : null;
-    const resolvedProjectId = issueProjectId ?? contextProjectId;
-    const useProjectWorkspace = opts?.useProjectWorkspace !== false;
-    const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
-
-    const projectWorkspaceRows = workspaceProjectId
-      ? await db
-          .select()
-          .from(projectWorkspaces)
-          .where(
-            and(
-              eq(projectWorkspaces.companyId, agent.companyId),
-              eq(projectWorkspaces.projectId, workspaceProjectId),
-            ),
-          )
-          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
-      : [];
-
-    const workspaceHints = projectWorkspaceRows.map((workspace) => ({
-      workspaceId: workspace.id,
-      cwd: readNonEmptyString(workspace.cwd),
-      repoUrl: readNonEmptyString(workspace.repoUrl),
-      repoRef: readNonEmptyString(workspace.repoRef),
-    }));
-
-    if (projectWorkspaceRows.length > 0) {
-      const missingProjectCwds: string[] = [];
-      let hasConfiguredProjectCwd = false;
-      for (const workspace of projectWorkspaceRows) {
-        const projectCwd = readNonEmptyString(workspace.cwd);
-        if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
-          continue;
-        }
-        hasConfiguredProjectCwd = true;
-        const projectCwdExists = await fs
-          .stat(projectCwd)
-          .then((stats) => stats.isDirectory())
-          .catch(() => false);
-        if (projectCwdExists) {
-          return {
-            cwd: projectCwd,
-            source: "project_primary" as const,
-            projectId: resolvedProjectId,
-            workspaceId: workspace.id,
-            repoUrl: workspace.repoUrl,
-            repoRef: workspace.repoRef,
-            workspaceHints,
-            warnings: [],
-          };
-        }
-        missingProjectCwds.push(projectCwd);
-      }
-
-      const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
-      await fs.mkdir(fallbackCwd, { recursive: true });
-      const warnings: string[] = [];
-      if (missingProjectCwds.length > 0) {
-        const firstMissing = missingProjectCwds[0];
-        const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
-        warnings.push(
-          extraMissingCount > 0
-            ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
-            : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      } else if (!hasConfiguredProjectCwd) {
-        warnings.push(
-          `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      }
-      return {
-        cwd: fallbackCwd,
-        source: "project_primary" as const,
-        projectId: resolvedProjectId,
-        workspaceId: projectWorkspaceRows[0]?.id ?? null,
-        repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
-        repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
-        workspaceHints,
-        warnings,
-      };
-    }
-
-    const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
-    if (sessionCwd) {
-      const sessionCwdExists = await fs
-        .stat(sessionCwd)
-        .then((stats) => stats.isDirectory())
-        .catch(() => false);
-      if (sessionCwdExists) {
-        return {
-          cwd: sessionCwd,
-          source: "task_session" as const,
-          projectId: resolvedProjectId,
-          workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
-          repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
-          repoRef: readNonEmptyString(previousSessionParams?.repoRef),
-          workspaceHints,
-          warnings: [],
-        };
-      }
-    }
-
-    const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
-    await fs.mkdir(cwd, { recursive: true });
-    const warnings: string[] = [];
-    if (sessionCwd) {
-      warnings.push(
-        `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
-      );
-    } else if (resolvedProjectId) {
-      warnings.push(
-        `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
-      );
-    } else {
-      warnings.push(
-        `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
-      );
-    }
-    return {
-      cwd,
-      source: "agent_home" as const,
-      projectId: resolvedProjectId,
-      workspaceId: null,
-      repoUrl: null,
-      repoRef: null,
-      workspaceHints,
-      warnings,
-    };
+    return resolveWorkspaceForHeartbeatRun(db, {
+      agent,
+      context,
+      previousSessionParams,
+      useProjectWorkspace: opts?.useProjectWorkspace ?? null,
+    });
   }
 
   async function upsertTaskSession(input: {
@@ -1236,7 +2410,11 @@ export function heartbeatService(db: Db) {
     const existing = await getRuntimeState(agent.id);
     if (existing) return existing;
 
-    return db
+    // Idempotent insert. agentId is the PK, so two concurrent callers (e.g. the
+    // usage-pause resume poller racing another wake on the same agent) could
+    // both pass the existence check and both INSERT — the second would throw a
+    // duplicate-key error. onConflictDoNothing + a re-read makes this safe.
+    const inserted = await db
       .insert(agentRuntimeState)
       .values({
         agentId: agent.id,
@@ -1244,8 +2422,12 @@ export function heartbeatService(db: Db) {
         adapterType: agent.adapterType,
         stateJson: {},
       })
+      .onConflictDoNothing({ target: agentRuntimeState.agentId })
       .returning()
-      .then((rows) => rows[0]);
+      .then((rows) => rows[0] ?? null);
+    if (inserted) return inserted;
+    // Lost the insert race — the row now exists; read it back.
+    return getRuntimeState(agent.id);
   }
 
   async function setRunStatus(
@@ -1533,6 +2715,616 @@ export function heartbeatService(db: Db) {
     }
   }
 
+  // ────────────────────────────────────────────────────────────────────────
+  // Issue 4 — usage-pause / resume engine.
+  //
+  // When the Claude adapter reports a usage/subscription-window limit, the
+  // run-completion path calls handleUsageLimitResponse(), which parks the run
+  // as `paused_usage`, keeps the issue lock held, and writes a
+  // usage_pause_windows row. A 60s poller (resumeUsagePausedRuns) later checks
+  // whether the provider window has reset and, if so, re-dispatches the paused
+  // run through the EXISTING run pipeline (set 'queued' + startNextQueuedRun).
+  //
+  // Everything here is gated by usagePauseEnabled() (default OFF) at the
+  // call sites in the completion path and in index.ts; the functions
+  // themselves are defensive but assume the caller already checked the flag.
+  // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Park a run on a Claude usage limit instead of failing it.
+   *
+   * - upserts a usage_pause_windows row keyed by runId (idempotent on conflict),
+   * - sets the run status AND its wakeup status to `paused_usage`,
+   * - does NOT release the issue lock (releaseIssueExecutionAndPromote) — the
+   *   lock stays held so a sibling agent can't grab the issue,
+   * - does NOT finalize the agent status,
+   * - logs a `usage_pause` activity,
+   *
+   * Returns true when the run was parked (caller must RETURN early), false when
+   * it declined to park (caller falls through to normal failure handling).
+   */
+  async function handleUsageLimitResponse(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    adapterResult: AdapterExecutionResult;
+    sessionIdToResume: string | null;
+    sessionCwd: string | null;
+    seq: number;
+  }): Promise<boolean> {
+    const { run, agent, adapterResult, sessionIdToResume, sessionCwd, seq } = input;
+
+    // Without a session id to resume from we cannot continue the exact
+    // conversation the limit interrupted. Decline the pause and let the normal
+    // failure path handle it (so the work isn't silently lost in a pause we
+    // could never resume).
+    if (!sessionIdToResume) {
+      logger.warn(
+        { runId: run.id, agentId: agent.id },
+        "usage_pause.declined_no_session",
+      );
+      return false;
+    }
+
+    const errorMeta = parseObject(adapterResult.errorMeta ?? null);
+    const resetsAtRaw = readNonEmptyString(errorMeta.resetsAt);
+    const resetsAtMs = resetsAtRaw ? Date.parse(resetsAtRaw) : NaN;
+    const resetsAt = Number.isFinite(resetsAtMs) ? new Date(resetsAtMs) : null;
+    const pauseReason = resetsAt ? "subscription_limit" : "unknown_reset_time";
+    const now = new Date();
+    // First retry: at the reported reset (when known), else after one backoff
+    // step. The poller re-checks the real window before resuming regardless.
+    const firstRetryAt = resetsAt ?? new Date(now.getTime() + 30_000);
+    const lastErrorMessage = adapterResult.errorMessage ?? "Claude usage limit reached";
+
+    await db
+      .insert(usagePauseWindows)
+      .values({
+        companyId: run.companyId,
+        agentId: agent.id,
+        runId: run.id,
+        sessionIdToResume,
+        sessionCwd: sessionCwd ?? null,
+        pausedAt: now,
+        resetsAt,
+        pauseReason,
+        nextRetryAt: firstRetryAt,
+        lastErrorMessage,
+        lastResumeAttemptResult: {
+          ok: false,
+          code: "claude_usage_limit_reached",
+        },
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: usagePauseWindows.runId,
+        set: {
+          // Idempotent re-pause (e.g. a resume that hit the limit again). Keep
+          // the existing attemptCount/backoff (the resume path bumps those);
+          // refresh the session, reset time, and error.
+          sessionIdToResume,
+          sessionCwd: sessionCwd ?? null,
+          resetsAt,
+          pauseReason,
+          nextRetryAt: firstRetryAt,
+          lastErrorMessage,
+          lastResumeAttemptResult: {
+            ok: false,
+            code: "claude_usage_limit_reached",
+          },
+          updatedAt: now,
+        },
+      });
+
+    await setRunStatus(run.id, "paused_usage", {
+      finishedAt: null,
+      error: lastErrorMessage,
+      errorCode: "claude_usage_limit_reached",
+      exitCode: adapterResult.exitCode ?? null,
+      signal: adapterResult.signal ?? null,
+    });
+    await setWakeupStatus(run.wakeupRequestId, "paused_usage", {
+      error: lastErrorMessage,
+    });
+
+    const parkedRun = await getRun(run.id);
+    if (parkedRun) {
+      await appendRunEvent(parkedRun, seq, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "run paused on Claude usage limit",
+        payload: {
+          status: "paused_usage",
+          resetsAt: resetsAt ? resetsAt.toISOString() : null,
+          pauseReason,
+        },
+      });
+    }
+
+    const issueId = resolveRunIssueId(run);
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "usage-pause-engine",
+      action: "usage_pause",
+      entityType: issueId ? "issue" : "agent",
+      entityId: issueId ?? agent.id,
+      agentId: agent.id,
+      runId: run.id,
+      details: {
+        reason: pauseReason,
+        resetsAt: resetsAt ? resetsAt.toISOString() : null,
+        sessionIdToResume,
+        sessionCwd: sessionCwd ?? null,
+        message: lastErrorMessage,
+      },
+    }).catch((err) => {
+      logger.debug({ err, runId: run.id }, "usage_pause activity log failed");
+    });
+
+    logger.warn(
+      {
+        runId: run.id,
+        agentId: agent.id,
+        companyId: run.companyId,
+        resetsAt: resetsAt ? resetsAt.toISOString() : null,
+        pauseReason,
+      },
+      "run.paused_usage",
+    );
+
+    return true;
+  }
+
+  /**
+   * Has the provider window reset? Per the plan:
+   *   - stored resetsAt is null → re-poll the adapter's getQuotaWindows; if it
+   *     reports a future reset, treat as NOT reset; otherwise NOT reset (we
+   *     don't fabricate a reset out of "unknown"). → false unless we can prove
+   *     the window has reset.
+   *   - stored resetsAt > now → false (still throttled).
+   *   - stored resetsAt <= now → true (reset).
+   */
+  async function checkIfQuotaWindowReset(
+    adapterType: string,
+    resetsAt: Date | null,
+    now: Date,
+  ): Promise<boolean> {
+    if (resetsAt) {
+      return resetsAt.getTime() <= now.getTime();
+    }
+    // No stored reset time — re-poll the adapter best-effort. The claude
+    // adapter derives a 5h window from its last in-process limit observation.
+    try {
+      const adapter = getServerAdapter(adapterType);
+      if (!adapter.getQuotaWindows) {
+        // Adapter can't tell us anything; without evidence we stay paused and
+        // rely on the capped backoff to keep re-polling cheaply.
+        return false;
+      }
+      const result = await adapter.getQuotaWindows();
+      if (!result.ok) return false;
+      // If ANY window still reports a future reset / 100% usage we're still
+      // throttled. If no window reports a future reset, the observation has
+      // aged out → treat the window as reset. The adapter-utils type is
+      // `unknown[]`, so narrow each window defensively.
+      for (const raw of result.windows) {
+        const w = parseObject(raw);
+        const wResetAt = readNonEmptyString(w.resetsAt);
+        const wResetMs = wResetAt ? Date.parse(wResetAt) : NaN;
+        if (Number.isFinite(wResetMs) && wResetMs > now.getTime()) {
+          return false;
+        }
+        const usedPercent = typeof w.usedPercent === "number" ? w.usedPercent : 0;
+        if (usedPercent >= 100 && !wResetAt) {
+          // Throttled with an unknown reset — can't prove a reset yet.
+          return false;
+        }
+      }
+      return true;
+    } catch (err) {
+      logger.debug({ err, adapterType }, "checkIfQuotaWindowReset poll failed");
+      return false;
+    }
+  }
+
+  /**
+   * Fail a usage-paused run for good (retry budget exhausted, or a
+   * non-retryable resume error). NOW we release the issue lock and finalize the
+   * agent — the things handleUsageLimitResponse deliberately deferred.
+   */
+  async function failUsagePausedRun(
+    window: typeof usagePauseWindows.$inferSelect,
+    reason: string,
+    errorCode = "usage_pause_max_retries",
+  ): Promise<void> {
+    const run = await getRun(window.runId);
+    // Always remove the window first so no poller picks it up again.
+    await db.delete(usagePauseWindows).where(eq(usagePauseWindows.id, window.id));
+
+    if (!run) {
+      logger.warn(
+        { runId: window.runId, windowId: window.id },
+        "failUsagePausedRun.run_missing",
+      );
+      return;
+    }
+
+    const failedRun = await setRunStatus(run.id, "failed", {
+      finishedAt: new Date(),
+      error: reason,
+      errorCode,
+    });
+    await setWakeupStatus(run.wakeupRequestId, "failed", {
+      finishedAt: new Date(),
+      error: reason,
+    });
+
+    const target = failedRun ?? run;
+    await appendRunEvent(target, 1, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "error",
+      message: reason,
+      payload: { status: "failed", errorCode },
+    }).catch(() => {});
+
+    const agent = await getAgent(run.agentId);
+    if (agent) {
+      await markIssueBlockedAfterFailedRun(db, {
+        run: target,
+        agent,
+        message: reason,
+        errorCode,
+      }).catch((err) => {
+        logger.debug({ err, runId: run.id }, "usage_pause fail handoff failed");
+      });
+    }
+
+    await releaseIssueExecutionAndPromote(target);
+    await finalizeAgentStatus(run.agentId, "failed");
+    await startNextQueuedRunForAgent(run.agentId);
+
+    logger.warn(
+      { runId: run.id, agentId: run.agentId, errorCode, reason },
+      "usage_pause.run_failed",
+    );
+  }
+
+  /**
+   * Resume a single usage-paused run whose window is believed reset.
+   *
+   * Gates (every "defer" bumps attempt + backs off so we don't spin):
+   *   - company must be active (never bypass a company/budget pause),
+   *   - the saved sessionCwd must still match the currently-resolved workspace
+   *     cwd (mismatch → defer; the workspace moved out from under the session).
+   *
+   * On a green light we re-dispatch through the EXISTING run pipeline: write
+   * the resume session into runtime state, set the run back to `queued`, and
+   * call startNextQueuedRunForAgent. The normal completion path then handles
+   * the outcome — including a fresh usage limit, which re-pauses idempotently
+   * via handleUsageLimitResponse. The window is deleted by the completion path
+   * once the resumed run reaches a terminal (non-paused) status, OR here on a
+   * non-retryable failure.
+   */
+  async function attemptResumeExecution(
+    window: typeof usagePauseWindows.$inferSelect,
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now: Date,
+  ): Promise<ResumeOutcome> {
+    // Report what actually happened so the poller's {resumed,deferred,failed}
+    // counters are accurate. A "defer" (company inactive, cwd mismatch,
+    // workspace resolution error, lost CAS race) must NOT be counted as a
+    // resume — otherwise operational telemetry hides runs that are silently
+    // stuck. A defer whose attempt budget is now exhausted escalates to a fail.
+    const deferRetryable = async (reason: string): Promise<ResumeOutcome> => {
+      const attemptCount = window.attemptCount + 1;
+      if (attemptCount >= window.maxRetries) {
+        await failUsagePausedRun(
+          window,
+          `Usage-paused run exceeded ${window.maxRetries} resume attempts: ${reason}`,
+        );
+        return "failed";
+      }
+      const backoff = Math.min(
+        window.retryBackoffMs * 2,
+        USAGE_PAUSE_MAX_BACKOFF_MS,
+      );
+      await db
+        .update(usagePauseWindows)
+        .set({
+          attemptCount,
+          retryBackoffMs: backoff,
+          nextRetryAt: new Date(now.getTime() + backoff),
+          lastErrorMessage: reason,
+          lastResumeAttemptResult: { ok: false, deferred: true, reason },
+          updatedAt: now,
+        })
+        .where(eq(usagePauseWindows.id, window.id));
+      logger.info(
+        { runId: run.id, agentId: agent.id, attemptCount, reason },
+        "usage_pause.resume_deferred",
+      );
+      return "deferred";
+    };
+
+    // GATE: company must be active. A company/budget pause must NEVER be
+    // bypassed by the resume path — defer (retryable) until it's reactivated.
+    if (!(await isCompanyActive(agent.companyId))) {
+      return deferRetryable("company is not active");
+    }
+
+    // VALIDATE: the saved cwd must still match where this issue/agent would run
+    // now. If the workspace moved (e.g. an isolated execution workspace was
+    // realized), resuming the old session in the wrong cwd is unsafe.
+    if (window.sessionCwd) {
+      try {
+        const context = parseObject(run.contextSnapshot);
+        const resolvedWorkspace = await resolveWorkspaceForRun(
+          agent,
+          context,
+          { sessionId: window.sessionIdToResume, cwd: window.sessionCwd },
+          { useProjectWorkspace: null },
+        );
+        const currentCwd = readNonEmptyString(resolvedWorkspace.cwd);
+        if (
+          currentCwd &&
+          path.resolve(currentCwd) !== path.resolve(window.sessionCwd)
+        ) {
+          return deferRetryable(
+            `workspace cwd changed (${window.sessionCwd} -> ${currentCwd})`,
+          );
+        }
+      } catch (err) {
+        return deferRetryable(
+          `workspace resolution failed: ${err instanceof Error ? err.message : "unknown"}`,
+        );
+      }
+    }
+
+    // Green light. Persist the resume session onto the agent runtime so the
+    // existing executeRun() session-resolution path resumes the exact session
+    // (adapter invokes `--resume <sessionIdToResume>` in the matching cwd).
+    //
+    // For the non-task-keyed path executeRun reads runtime.sessionId (the
+    // agentRuntimeState.sessionId column) as the resume id; the cwd is resolved
+    // fresh by resolveWorkspaceForRun and we already validated it still matches
+    // window.sessionCwd above. Setting the column is therefore sufficient — we
+    // intentionally do NOT touch a task session here (the paused run resumes
+    // its own session, not a per-task one).
+    await ensureRuntimeState(agent);
+
+    // Re-queue the paused run FIRST. CAS from 'paused_usage' → 'queued' so two
+    // concurrent pollers can't both flip it. We win the run-CAS BEFORE touching
+    // the window or runtime state: a poller that LOSES the race then leaves the
+    // window completely untouched (no attempt bump to roll back), which closes
+    // the multi-process clobber race where a loser's "rollback" would stomp the
+    // winner's bump (or a fresh re-pause's ON CONFLICT attemptCount) and hand
+    // out unbounded extra retries — a budget/lock leak. With this ordering the
+    // attempt is only ever bumped by the poller that actually owns the resume.
+    const requeued = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "queued",
+        finishedAt: null,
+        error: null,
+        errorCode: null,
+        recoveryStatus: null,
+        updatedAt: now,
+      })
+      .where(
+        and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "paused_usage")),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+
+    if (!requeued) {
+      // Lost the race (another poller, or the run changed state). The window is
+      // untouched — nothing to roll back — so we just report a non-resume.
+      logger.info(
+        { runId: run.id, agentId: agent.id },
+        "usage_pause.resume_requeue_lost_race",
+      );
+      // Lost the CAS race — NOT a resume. Report as deferred so the counters
+      // reflect that this poll did not actually re-dispatch the run.
+      return "deferred";
+    }
+
+    // We own the resume. Now bump the attempt + backoff and push nextRetryAt out
+    // so the poller won't double-resume while this run executes, and write the
+    // resume session onto runtime state for executeRun's --resume path. We KEEP
+    // the window (we do NOT delete it here): the retry budget must persist
+    // across re-pauses. The window is removed by the completion path when the
+    // resumed run reaches a terminal, non-paused status
+    // (cleanupUsagePauseWindowForRun), or by failUsagePausedRun when the budget
+    // is exhausted. If the resume hits the limit again,
+    // handleUsageLimitResponse's ON CONFLICT preserves this attemptCount.
+    //
+    // The window attempt-bump is itself guarded on the attemptCount we observed
+    // (an optimistic CAS): if a concurrent re-pause already advanced it, we do
+    // NOT overwrite — we never lower a budget counter.
+    const attemptCount = window.attemptCount + 1;
+    await db
+      .update(usagePauseWindows)
+      .set({
+        attemptCount,
+        nextRetryAt: new Date(now.getTime() + USAGE_PAUSE_MAX_BACKOFF_MS),
+        lastResumeAttemptResult: { ok: true, resumedAt: now.toISOString() },
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(usagePauseWindows.id, window.id),
+          eq(usagePauseWindows.attemptCount, window.attemptCount),
+        ),
+      );
+
+    await db
+      .update(agentRuntimeState)
+      .set({
+        sessionId: window.sessionIdToResume,
+        updatedAt: now,
+      })
+      .where(eq(agentRuntimeState.agentId, agent.id));
+
+    await setWakeupStatus(requeued.wakeupRequestId, "queued", {});
+
+    await startNextQueuedRunForAgent(agent.id);
+
+    logger.info(
+      { runId: run.id, agentId: agent.id, attemptCount },
+      "usage_pause.resumed",
+    );
+    return "resumed";
+  }
+
+  /**
+   * 60s poller. Picks windows that are due (nextRetryAt <= now) and under the
+   * retry budget, earliest resetsAt first (fairness), and tries to resume them.
+   * No-ops entirely when the feature is disabled.
+   */
+  async function resumeUsagePausedRuns(now = new Date()) {
+    if (!usagePauseEnabled()) return { checked: 0, resumed: 0, deferred: 0, failed: 0 };
+
+    // Select all DUE windows (no nextRetryAt, or it's in the past). We do NOT
+    // filter on attemptCount in SQL: a window that has exhausted its budget
+    // must be FAILED here (failUsagePausedRun), not silently filtered out —
+    // otherwise it would leak forever (never resumed, never cleaned up). Typed
+    // operators bind the Date via the column codec (a raw `${now}` in an sql``
+    // template can't be serialized by postgres-js).
+    const windows = await db
+      .select()
+      .from(usagePauseWindows)
+      .where(
+        or(
+          isNull(usagePauseWindows.nextRetryAt),
+          lte(usagePauseWindows.nextRetryAt, now),
+        ),
+      )
+      // Earliest reset first so the agent that's been waiting longest wins.
+      // NULLS LAST so unknown-reset windows don't starve known-reset ones.
+      .orderBy(sql`${usagePauseWindows.resetsAt} ASC NULLS LAST`);
+
+    let resumed = 0;
+    let deferred = 0;
+    let failed = 0;
+
+    for (const window of windows) {
+      try {
+        const run = await getRun(window.runId);
+        const agent = await getAgent(window.agentId);
+        // Run gone or no longer paused (or agent gone) → stale window, delete.
+        if (!run || !agent || run.status !== "paused_usage") {
+          await db
+            .delete(usagePauseWindows)
+            .where(eq(usagePauseWindows.id, window.id));
+          continue;
+        }
+
+        // Budget exhausted → fail terminally (releases the lock + finalizes the
+        // agent + deletes the window). Guards the leak where a resume bumped
+        // attemptCount to maxRetries and the run then re-paused.
+        if (window.attemptCount >= window.maxRetries) {
+          await failUsagePausedRun(
+            window,
+            `Usage-paused run exceeded ${window.maxRetries} resume attempts`,
+          );
+          failed += 1;
+          continue;
+        }
+
+        const isReset = await checkIfQuotaWindowReset(
+          agent.adapterType,
+          window.resetsAt,
+          now,
+        );
+        if (!isReset) {
+          // Not reset yet — back off (capped) and re-poll later.
+          const backoff = Math.min(
+            window.retryBackoffMs * 2,
+            USAGE_PAUSE_MAX_BACKOFF_MS,
+          );
+          await db
+            .update(usagePauseWindows)
+            .set({
+              retryBackoffMs: backoff,
+              nextRetryAt: new Date(now.getTime() + backoff),
+              updatedAt: now,
+            })
+            .where(eq(usagePauseWindows.id, window.id));
+          deferred += 1;
+          continue;
+        }
+
+        const outcome = await attemptResumeExecution(window, run, agent, now);
+        // attemptResumeExecution can internally defer (company inactive, cwd
+        // mismatch, workspace resolution error, lost CAS race) or escalate to a
+        // fail (defer with the budget now exhausted). Count what actually
+        // happened so the telemetry doesn't hide stuck runs.
+        if (outcome === "resumed") resumed += 1;
+        else if (outcome === "failed") failed += 1;
+        else deferred += 1;
+      } catch (err) {
+        logger.error(
+          { err, windowId: window.id, runId: window.runId },
+          "resumeUsagePausedRuns window failed",
+        );
+      }
+    }
+
+    if (resumed > 0 || deferred > 0 || failed > 0) {
+      logger.info({ resumed, deferred, failed, checked: windows.length }, "usage_pause.poll");
+    }
+    return { checked: windows.length, resumed, deferred, failed };
+  }
+
+  /**
+   * Boot recovery for usage-paused runs. Runs IN A TRANSACTION during heartbeat
+   * init, ORDERED BEFORE reapOrphanedRuns, so the reaper sees a consistent set
+   * of windows. Per window:
+   *   - run missing → delete the window,
+   *   - run not `paused_usage` → delete the window (it already resolved),
+   *   - valid → leave it (the poller resumes it; a window whose reset elapsed
+   *     while ADE was down is picked up immediately on the first post-boot poll
+   *     because nextRetryAt/resetsAt <= now).
+   */
+  async function bootRecoverUsagePausedRuns(): Promise<{ kept: number; deleted: number }> {
+    if (!usagePauseEnabled()) return { kept: 0, deleted: 0 };
+    return db.transaction(async (tx) => {
+      const windows = await tx.select().from(usagePauseWindows);
+      let kept = 0;
+      let deleted = 0;
+      for (const window of windows) {
+        const [run] = await tx
+          .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, window.runId))
+          .limit(1);
+        if (!run || run.status !== "paused_usage") {
+          await tx.delete(usagePauseWindows).where(eq(usagePauseWindows.id, window.id));
+          deleted += 1;
+          continue;
+        }
+        kept += 1;
+      }
+      if (deleted > 0 || kept > 0) {
+        logger.info({ kept, deleted }, "usage_pause.boot_recover");
+      }
+      return { kept, deleted };
+    });
+  }
+
+  /**
+   * Delete any usage_pause_window for a run that has reached a terminal,
+   * non-paused status. Called from the completion path: a resumed run that
+   * finally succeeds/fails (and was NOT re-paused) no longer needs its window.
+   * Idempotent — a no-op when there is no window.
+   */
+  async function cleanupUsagePauseWindowForRun(runId: string): Promise<void> {
+    await db.delete(usagePauseWindows).where(eq(usagePauseWindows.runId, runId));
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; hardCapMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     // Round 3 Phase 8 — wall-clock hard cap. A run that started >hardCapMs ago
@@ -1542,16 +3334,42 @@ export function heartbeatService(db: Db) {
     const hardCapMs = opts?.hardCapMs ?? 60 * 60 * 1000;
     const now = new Date();
 
-    // Find all runs in "queued" or "running" state
+    // Find all runs in "queued" or "running" state.
+    //
+    // Issue 4 LOCK-LIVE: also scan `paused_usage` runs. These hold their issue
+    // lock on purpose (the resume poller owns them), so we must NOT blindly
+    // reap them. For each paused_usage run we look up its usage_pause_windows
+    // row: if the window exists the run is healthy and parked — SKIP it and
+    // leave it for resumeUsagePausedRuns. If the window is MISSING the pause is
+    // corrupt (we can never resume it), so we fall through and recover the run
+    // normally, which also releases the lock.
     const activeRuns = await db
       .select()
       .from(heartbeatRuns)
-      .where(inArray(heartbeatRuns.status, ["queued", "running"]));
+      .where(inArray(heartbeatRuns.status, ["queued", "running", "paused_usage"]));
 
     const reaped: string[] = [];
 
     for (const run of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
+
+      if (run.status === "paused_usage") {
+        const [pauseWindow] = await db
+          .select({ id: usagePauseWindows.id })
+          .from(usagePauseWindows)
+          .where(eq(usagePauseWindows.runId, run.id))
+          .limit(1);
+        if (pauseWindow) {
+          // Healthy parked run — the resume poller owns it. Leave the lock held.
+          continue;
+        }
+        logger.warn(
+          { runId: run.id, agentId: run.agentId },
+          "reapOrphanedRuns.paused_usage_window_missing",
+        );
+        // No window → corrupt pause. Fall through and recover the run normally
+        // below, which releases the issue lock.
+      }
 
       // Hard-cap short-circuit: if the run started long enough ago, reap it
       // regardless of updatedAt. Uses startedAt when present, falls back to
@@ -1649,8 +3467,16 @@ export function heartbeatService(db: Db) {
       // Only clear when the run is terminal or absent. Live runs
       // ('queued' or 'running') are left alone — the run-side reaper
       // owns them.
+      //
+      // Issue 4 LOCK-LIVE: a `paused_usage` run is ALSO live for lock
+      // purposes — it is parked on a provider usage limit with its session
+      // preserved and its issue lock intentionally held, and the resume
+      // poller (resumeUsagePausedRuns) owns it. If we cleared its lock here a
+      // sibling agent could grab the same issue and run concurrently against
+      // the paused run's work. So `paused_usage` MUST be treated as live.
       const runStatus = row.runStatus;
-      const isLive = runStatus === "queued" || runStatus === "running";
+      const isLive =
+        runStatus === "queued" || runStatus === "running" || runStatus === "paused_usage";
       if (isLive) continue;
 
       await db
@@ -1878,6 +3704,8 @@ export function heartbeatService(db: Db) {
     });
     let memoryIssueId = readNonEmptyString(context.issueId);
     let focusIssueSource: string | null = memoryIssueId ? "context" : null;
+    let issueComplexity: string | null = null;
+    let effectiveContextProfile: AgentContextProfile | "focused_small" = contextProfile;
     let queueDigestPolicy: "included" | "omitted" | "none" =
       contextProfile === "focused" ? "none" : "included";
     if (contextProfile === "focused" && !memoryIssueId && run.invocationSource === "timer") {
@@ -1893,11 +3721,43 @@ export function heartbeatService(db: Db) {
         context.taskKey = nextIssue.identifier ?? nextIssue.id;
       }
     }
+    if (memoryIssueId) {
+      try {
+        const focusIssue = await db
+          .select({
+            id: issues.id,
+            title: issues.title,
+            complexity: issues.complexity,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (focusIssue) {
+          const complexityLabels = await db
+            .select({ name: labels.name })
+            .from(issueLabels)
+            .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+            .where(eq(issueLabels.issueId, focusIssue.id));
+          issueComplexity = resolveIssueComplexity({
+            complexity: focusIssue.complexity,
+            title: focusIssue.title,
+            labels: complexityLabels,
+          });
+          if (issueComplexity === "small") {
+            effectiveContextProfile = "focused_small";
+            queueDigestPolicy = "none";
+          }
+        }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId, issueId: memoryIssueId }, "failed to resolve issue complexity");
+      }
+    }
     setContextPolicy(context, {
-      profile: contextProfile,
+      profile: effectiveContextProfile,
       focusIssueId: memoryIssueId ?? null,
       focusIssueSource,
       queueDigest: queueDigestPolicy,
+      issueComplexity,
     });
     const acceptedWorkSvc = acceptedWorkService(db);
     void acceptedWorkSvc
@@ -1968,7 +3828,7 @@ export function heartbeatService(db: Db) {
     } catch (err) {
       logger.debug({ err, agentId: agent.id }, "failed to load pending handoff");
     }
-    if (contextProfile !== "focused" || memoryIssueId) {
+    if (effectiveContextProfile !== "focused_small" && (contextProfile !== "focused" || memoryIssueId)) {
       try {
         const memoryRows = await loadRecentMemory(db, {
           companyId: agent.companyId,
@@ -1994,7 +3854,7 @@ export function heartbeatService(db: Db) {
         logger.debug({ err, agentId: agent.id, runId }, "failed to load agent memory preamble");
       }
     }
-    if (contextProfile !== "focused") {
+    if (effectiveContextProfile !== "focused" && effectiveContextProfile !== "focused_small") {
       try {
         const acceptedWorkEventId = readNonEmptyString(context.acceptedWorkEventId);
         const events = await acceptedWorkSvc.pendingForManager(
@@ -2161,6 +4021,49 @@ export function heartbeatService(db: Db) {
       previousSessionParams,
       { useProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null },
     );
+
+    // Per-issue workspace scope refusal (P1.A §5b). The scope guard refused to
+    // fork an isolated workspace from a contaminated base. Do not invoke the
+    // adapter — post a stash hint to the issue, pause it for a human, and
+    // finalize this run as cancelled.
+    if (resolvedWorkspace.scopeRefusal) {
+      const refusal = resolvedWorkspace.scopeRefusal;
+      const refusalMessage =
+        `Run blocked: cannot fork an isolated workspace for this issue. ${refusal.reason} ${refusal.suggestion}`;
+      try {
+        await db.insert(issueComments).values({
+          companyId: run.companyId,
+          issueId: refusal.issueId,
+          authorAgentId: null,
+          authorUserId: null,
+          body: refusalMessage,
+        });
+      } catch (err) {
+        logger.debug({ err, runId, issueId: refusal.issueId }, "failed to post scope-refusal comment");
+      }
+      try {
+        await issueService(db).update(refusal.issueId, {
+          status: "awaiting_user",
+          latestUserFacingAgentMessage: refusalMessage,
+        });
+      } catch (err) {
+        logger.debug({ err, runId, issueId: refusal.issueId }, "failed to pause issue after scope refusal");
+      }
+      await setRunStatus(runId, "cancelled", {
+        error: "workspace_scope_violation",
+        errorCode: "workspace_scope_violation",
+        finishedAt: new Date(),
+      });
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: new Date(),
+        error: "workspace_scope_violation",
+      });
+      await finalizeAgentStatus(agent.id, "cancelled");
+      const refusedRun = await getRun(runId);
+      if (refusedRun) await releaseIssueExecutionAndPromote(refusedRun);
+      return;
+    }
+
     const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
       agentId: agent.id,
       previousSessionParams,
@@ -2183,6 +4086,11 @@ export function heartbeatService(db: Db) {
       source: resolvedWorkspace.source,
       projectId: resolvedWorkspace.projectId,
       workspaceId: resolvedWorkspace.workspaceId,
+      projectWorkspaceId: resolvedWorkspace.projectWorkspaceId ?? null,
+      executionWorkspaceId: resolvedWorkspace.executionWorkspaceId ?? null,
+      executionWorkspaceMode: resolvedWorkspace.executionWorkspaceMode ?? null,
+      branchName: resolvedWorkspace.branchName ?? null,
+      worktreePath: resolvedWorkspace.worktreePath ?? null,
       repoUrl: resolvedWorkspace.repoUrl,
       repoRef: resolvedWorkspace.repoRef,
     };
@@ -2202,6 +4110,48 @@ export function heartbeatService(db: Db) {
       context.combyneCoordinatorGuidance = {
         body: coordinatorGuidance,
       };
+    }
+    if (memoryIssueId && (issueComplexity === "medium" || issueComplexity === "large")) {
+      try {
+        const candidateAgents = await db
+          .select({
+            id: agents.id,
+            name: agents.name,
+            role: agents.role,
+            reportsTo: agents.reportsTo,
+            capabilities: agents.capabilities,
+          })
+          .from(agents)
+          .where(
+            and(
+              eq(agents.companyId, agent.companyId),
+              notInArray(agents.id, [agent.id]),
+              notInArray(agents.status, ["terminated", "pending_approval"]),
+            ),
+          )
+          .orderBy(asc(agents.reportsTo), asc(agents.name))
+          .limit(12);
+        const delegationGuidance = buildMediumLargeDelegationGuidance({
+          issueId: memoryIssueId,
+          complexity: issueComplexity,
+          agent: {
+            id: agent.id,
+            role: agent.role,
+            permissions: parseAgentPermissions(agent.permissions),
+          },
+          candidates: candidateAgents,
+        });
+        if (delegationGuidance) {
+          context.combyneDelegationGuidance = {
+            body: delegationGuidance,
+            issueId: memoryIssueId,
+            complexity: issueComplexity,
+            candidateAgentIds: candidateAgents.map((candidate) => candidate.id),
+          };
+        }
+      } catch (err) {
+        logger.debug({ err, agentId: agent.id, runId, issueId: memoryIssueId }, "failed to build delegation guidance");
+      }
     }
     const bukuPrePushGovernance = buildBukuPrePushGovernance({
       cwd: resolvedWorkspace.cwd,
@@ -2233,13 +4183,21 @@ export function heartbeatService(db: Db) {
       // Pull a short description body for the focus-block preview. Bounded
       // inside renderFocusSection; we only fetch when a focus issue exists.
       let focusIssueBody: string | null = null;
+      let focusIssueIdentifier: string | null = null;
+      let focusIssueTitle: string | null = null;
       if (memoryIssueId && focusMode) {
         const focusRow = await db
-          .select({ description: issues.description })
+          .select({
+            description: issues.description,
+            identifier: issues.identifier,
+            title: issues.title,
+          })
           .from(issues)
           .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null);
         focusIssueBody = focusRow?.description ?? null;
+        focusIssueIdentifier = focusRow?.identifier ?? null;
+        focusIssueTitle = focusRow?.title ?? null;
         const managerQuestionBody = readNonEmptyString(context.managerQuestionBody);
         const managerAnswerBody = readNonEmptyString(context.managerAnswerBody);
         const managerAction = readNonEmptyString(context.recommendedNextAction);
@@ -2253,6 +4211,31 @@ export function heartbeatService(db: Db) {
         if (managerAction) {
           internalContextLines.push("## Recommended next action", managerAction);
         }
+        if (effectiveContextProfile === "focused_small") {
+          const recentComments = await db
+            .select({
+              kind: issueComments.kind,
+              body: issueComments.body,
+              createdAt: issueComments.createdAt,
+            })
+            .from(issueComments)
+            .where(eq(issueComments.issueId, memoryIssueId))
+            .orderBy(desc(issueComments.createdAt))
+            .limit(4);
+          if (recentComments.length > 0) {
+            internalContextLines.push(
+              "## Latest relevant issue comments",
+              recentComments
+                .reverse()
+                .map((comment) => {
+                  const kind = comment.kind ?? "comment";
+                  const body = comment.body.length > 1200 ? `${comment.body.slice(0, 1200)}\n...(truncated)` : comment.body;
+                  return `### ${kind} · ${comment.createdAt.toISOString()}\n${body}`;
+                })
+                .join("\n\n"),
+            );
+          }
+        }
         if (internalContextLines.length > 0) {
           focusIssueBody = [focusIssueBody, internalContextLines.join("\n\n")]
             .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
@@ -2261,7 +4244,7 @@ export function heartbeatService(db: Db) {
       }
 
       const queue =
-        contextProfile === "focused" && !memoryIssueId
+        effectiveContextProfile === "focused" && !memoryIssueId
           ? {
               items: [],
               totalOpen: 0,
@@ -2278,15 +4261,18 @@ export function heartbeatService(db: Db) {
               agentId: agent.id,
               currentIssueId: memoryIssueId ?? null,
               currentIssueBody: focusIssueBody,
+              issueIdentifier: focusIssueIdentifier,
+              issueTitle: focusIssueTitle,
               focusMode,
               includeReviewIssues:
-                contextProfile === "focused" ||
+                effectiveContextProfile === "focused" ||
+                effectiveContextProfile === "focused_small" ||
                 run.invocationSource !== "timer" ||
                 Boolean(memoryIssueId),
-              limit: contextProfile === "focused" ? 100 : undefined,
+              limit: effectiveContextProfile === "focused" || effectiveContextProfile === "focused_small" ? 100 : undefined,
             });
 
-      if (contextProfile === "focused") {
+      if (effectiveContextProfile === "focused" || effectiveContextProfile === "focused_small") {
         const focusOnlyItems = queue.focusItem ? [queue.focusItem] : [];
         context.combyneAssignedIssues = {
           ...queue,
@@ -2302,9 +4288,21 @@ export function heartbeatService(db: Db) {
         queueDigestPolicy = queue.digestBody ? "included" : "none";
       }
 
-      if (queue.focusBody && queue.directive && memoryIssueId) {
+      // Inject the scope directive whenever there is a current issue and a
+      // directive was produced — independent of whether the focus body
+      // rendered. This keeps the always-on scope fence in front of the model
+      // even when the focus issue row did not resolve into the queue. The
+      // rendered focus block already embeds the directive; when there is no
+      // focus block (issue row missing) we surface the directive text on its
+      // own so the scope fence still reaches the adapter, which renders only
+      // the `body` field.
+      if (queue.directive && memoryIssueId) {
+        const directiveBody =
+          queue.focusBody && queue.focusBody.trim().length > 0
+            ? queue.focusBody
+            : `## 🎯 Current focus\n> ${queue.directive}`;
         context.combyneFocusDirective = {
-          body: queue.focusBody,
+          body: directiveBody,
           directive: queue.directive,
           issueId: memoryIssueId,
         };
@@ -2323,7 +4321,7 @@ export function heartbeatService(db: Db) {
             runId,
             issueId: queue.focusItem.id,
             bodyChars: queue.focusBody.length,
-            contextProfile,
+            contextProfile: effectiveContextProfile,
           },
           "agent_queue.focus_section_rendered",
         );
@@ -2349,21 +4347,24 @@ export function heartbeatService(db: Db) {
         }
       }
       setContextPolicy(context, {
-        profile: contextProfile,
+        profile: effectiveContextProfile,
         focusIssueId: memoryIssueId ?? null,
         focusIssueSource,
         queueDigest: queueDigestPolicy,
+        issueComplexity,
       });
     } catch (err) {
       logger.debug({ err, agentId: agent.id, runId }, "failed to load assigned issue queue");
     }
 
-    // Surface Combyne-managed project workspaces to the adapter so it can
-    // ls/read/write across them — same fix as the terminal preamble,
-    // mirrored here so heartbeat runs don't ask "project not found" either.
-    if (contextProfile !== "focused") {
+    // Surface Combyne-managed projects to the adapter so agents know what
+    // exists. When this run has a focused execution workspace, hide primary
+    // checkout paths so parallel issue runs do not write outside isolation.
+    if (effectiveContextProfile !== "focused" && effectiveContextProfile !== "focused_small") {
       try {
-        const overview = await loadCompanyProjectOverview(db, agent.companyId);
+        const overview = await loadCompanyProjectOverview(db, agent.companyId, {
+          redactLocalWorkspacePaths: resolvedWorkspace.source === "execution_workspace",
+        });
         if (overview.items.length > 0) {
           context.combyneCompanyProjects = overview;
           const dirs: string[] = [];
@@ -2374,10 +4375,11 @@ export function heartbeatService(db: Db) {
           }
           if (dirs.length > 0) context.combyneProjectWorkspaceDirs = dirs.slice(0, 10);
           setContextPolicy(context, {
-            profile: contextProfile,
+            profile: effectiveContextProfile,
             focusIssueId: memoryIssueId ?? null,
             focusIssueSource,
             queueDigest: queueDigestPolicy,
+            issueComplexity,
           });
         }
       } catch (err) {
@@ -2447,10 +4449,11 @@ export function heartbeatService(db: Db) {
       }
     }
     setContextPolicy(context, {
-      profile: contextProfile,
+      profile: effectiveContextProfile,
       focusIssueId: memoryIssueId ?? null,
       focusIssueSource,
       queueDigest: queueDigestPolicy,
+      issueComplexity,
     });
     const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
     const previousSessionDisplayId = truncateDisplayId(
@@ -2635,7 +4638,7 @@ export function heartbeatService(db: Db) {
           : undefined;
         const summarizerEnabled = summarizerCfg?.enabled !== false;
         if (summarizerEnabled) {
-          if (contextProfile !== "focused") {
+          if (effectiveContextProfile !== "focused" && effectiveContextProfile !== "focused_small") {
             const standingLatest = await loadLatestSummary(db, {
               agentId: agent.id,
               scopeKind: "standing",
@@ -2671,7 +4674,7 @@ export function heartbeatService(db: Db) {
           // Recent raw turns since the most relevant cutoff. Prefer the
           // working cutoff when an issue is in focus (keeps the block
           // ticket-scoped); fall back to the standing cutoff.
-          if (contextProfile !== "focused" || memoryIssueId) {
+          if (effectiveContextProfile !== "focused_small" && (effectiveContextProfile !== "focused" || memoryIssueId)) {
             const scopeForRecent: SummaryScope = memoryIssueId ? "working" : "standing";
             const recent = await unsummarizedTokensFor(db, {
               companyId: agent.companyId,
@@ -2706,10 +4709,11 @@ export function heartbeatService(db: Db) {
         );
       }
       setContextPolicy(context, {
-        profile: contextProfile,
+        profile: effectiveContextProfile,
         focusIssueId: memoryIssueId ?? null,
         focusIssueSource,
         queueDigest: queueDigestPolicy,
+        issueComplexity,
       });
       await db
         .update(heartbeatRuns)
@@ -2805,7 +4809,8 @@ export function heartbeatService(db: Db) {
           }
           snapshot.pruningMode = pruningMode;
           snapshot.contextPolicy = {
-            profile: contextProfile,
+            profile: effectiveContextProfile,
+            issueComplexity,
             focusIssueId: memoryIssueId ?? null,
             focusIssueSource,
             queueDigest: queueDigestPolicy,
@@ -2843,6 +4848,7 @@ export function heartbeatService(db: Db) {
                 budget: resolveContextBudgetTokens(
                   agent.adapterType,
                   (agent.adapterConfig ?? {}) as Record<string, unknown>,
+                  context,
                 ),
                 composedTokens: shadow.composed.totalTokens,
                 stableTokens: shadow.composed.stableTokens,
@@ -2947,12 +4953,81 @@ export function heartbeatService(db: Db) {
         previousLegacySessionId: runtimeForAdapter.sessionId,
       });
 
+      // Issue 4 — usage-limit pause. If the adapter reported a Claude
+      // usage/subscription-window limit AND the feature is enabled AND the run
+      // wasn't cancelled out from under us, park the run as `paused_usage`
+      // instead of failing it. handleUsageLimitResponse keeps the issue lock
+      // held, does NOT finalize the agent, and RETURNS so we skip the normal
+      // completion + auto-close machinery below. The resume poller takes over.
+      if (
+        usagePauseEnabled() &&
+        adapterResult.errorCode === "claude_usage_limit_reached"
+      ) {
+        const cancelledNow = await getRun(run.id);
+        if (cancelledNow?.status !== "cancelled") {
+          // The session to resume is the POST session id the adapter just
+          // produced (it preserves the session on a usage limit), falling back
+          // to whatever session we resumed from this run.
+          const sessionIdToResume =
+            nextSessionState.legacySessionId ??
+            nextSessionState.displayId ??
+            runtimeForAdapter.sessionId ??
+            null;
+          const handled = await handleUsageLimitResponse({
+            run,
+            agent,
+            adapterResult,
+            sessionIdToResume,
+            sessionCwd: readNonEmptyString(resolvedWorkspace.cwd),
+            seq: seq++,
+          });
+          if (handled) {
+            // Task-keyed runs resume off the TASK SESSION (executeRun zeroes the
+            // runtime.sessionId fallback when taskKey is set), so the resume
+            // path that the engine drives via agentRuntimeState would NOT pick
+            // up the limit-interrupted session. handleUsageLimitResponse returns
+            // BEFORE the normal completion-path task-session upsert, so persist
+            // the POST (limit) session into the task session here — otherwise
+            // the resume would replay the PRE-run session and lose the
+            // conversation state the limit interrupted. Mirror the success-path
+            // upsert at the completion block below.
+            if (taskKey && (nextSessionState.params || nextSessionState.displayId)) {
+              await upsertTaskSession({
+                companyId: agent.companyId,
+                agentId: agent.id,
+                adapterType: agent.adapterType,
+                taskKey,
+                sessionParamsJson: nextSessionState.params,
+                sessionDisplayId: nextSessionState.displayId,
+                lastRunId: run.id,
+                lastError: adapterResult.errorMessage ?? "claude_usage_limit_reached",
+              }).catch((err) => {
+                logger.warn(
+                  { err, runId: run.id, taskKey },
+                  "usage_pause.task_session_persist_failed",
+                );
+              });
+            }
+            // finally{} still runs startNextQueuedRunForAgent(agent.id), which
+            // is correct: OTHER queued runs for this agent may proceed; only
+            // THIS paused run keeps its lock.
+            return;
+          }
+        }
+      }
+
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
       if (latestRun?.status === "cancelled") {
         outcome = "cancelled";
       } else if (adapterResult.timedOut) {
         outcome = "timed_out";
+        // Issue 3 — an MCP/integration 401 makes the adapter exit 0 with a
+        // well-formed result block. The error-code is the only reliable signal
+        // (the run "succeeded" by exit code), so force the outcome to failed
+        // BEFORE the exit-0 success check so it can never auto-close.
+      } else if (adapterResult.errorCode?.startsWith("integration_auth_required")) {
+        outcome = "failed";
       } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
         outcome = "succeeded";
       } else {
@@ -3001,6 +5076,22 @@ export function heartbeatService(db: Db) {
         context,
         usage: (adapterResult.usage ?? {}) as Record<string, unknown>,
       });
+      try {
+        const contextPolicy = parseObject(context.combyneContextPolicy);
+        await mergeRunPromptBudgetMetadata(db, run.id, {
+          issueComplexity: readNonEmptyString(contextPolicy.issueComplexity) ?? null,
+          contextProfile: readNonEmptyString(contextPolicy.contextProfile) ?? null,
+          contextBudgetTokens: resolveContextBudgetTokens(
+            agent.adapterType,
+            (agent.adapterConfig ?? {}) as Record<string, unknown>,
+            context,
+          ),
+          activeTokens: smallTaskBudget.usage.activeTokens,
+          cachedInputTokens: smallTaskBudget.usage.cachedInputTokens,
+        });
+      } catch (err) {
+        logger.debug({ err, runId: run.id }, "prompt budget usage metadata update failed");
+      }
 
       // Round 3 Phase 3 — close the calibration loop. Compares our
       // pre-run estimate with the adapter-reported actual usage.inputTokens
@@ -3065,6 +5156,16 @@ export function heartbeatService(db: Db) {
         error: outcome === "cancelled" ? cancelledError : adapterResult.errorMessage ?? null,
       });
 
+      // Issue 4 — reaching here means the run finalized to a terminal status
+      // and was NOT re-paused (handleUsageLimitResponse returns early before
+      // this point). If this run had ever been usage-paused, its window is now
+      // stale — drop it so no poller resurrects a completed run.
+      if (usagePauseEnabled()) {
+        await cleanupUsagePauseWindowForRun(run.id).catch((err) => {
+          logger.debug({ err, runId: run.id }, "usage_pause window cleanup failed");
+        });
+      }
+
       const finalizedRun = await getRun(run.id);
       if (finalizedRun) {
         if (adapterResult.resultJson || stdoutExcerpt) {
@@ -3097,6 +5198,31 @@ export function heartbeatService(db: Db) {
             exitCode: adapterResult.exitCode,
           },
         });
+        if (outcome === "failed") {
+          // Issue 3 — an MCP/integration auth failure (a 401 even at exit 0)
+          // is a USER action, not a run to review. Pause the issue to
+          // awaiting_user with a provider auth link instead of blocking it,
+          // and circuit-break after 3 consecutive same-provider failures.
+          if (isIntegrationAuthErrorCode(adapterResult.errorCode)) {
+            await pauseIssueForIntegrationAuth(db, {
+              run: finalizedRun,
+              agent,
+              errorCode: adapterResult.errorCode,
+              errorMessage: adapterResult.errorMessage,
+            }).catch((err) => {
+              logger.debug({ err, runId: finalizedRun.id }, "integration-auth pause failed");
+            });
+          } else {
+            await markIssueBlockedAfterFailedRun(db, {
+              run: finalizedRun,
+              agent,
+              message: adapterResult.errorMessage ?? "Adapter failed",
+              errorCode: adapterResult.errorCode ?? "adapter_failed",
+            }).catch((err) => {
+              logger.debug({ err, runId: finalizedRun.id }, "failed-run issue handoff failed");
+            });
+          }
+        }
         await releaseIssueExecutionAndPromote(finalizedRun);
         void summarizeRunAndPersist(db, {
           runId: finalizedRun.id,
@@ -3324,17 +5450,122 @@ export function heartbeatService(db: Db) {
         }
 
         if (runIssueId && outcome === "succeeded" && !smallTaskBudget.hardPause) {
-          await autoCloseIssueAfterSuccessfulRun(db, {
+          const completion = summarizeSuccessfulAdapterResult(adapterResult.resultJson, stdoutExcerpt);
+
+          // Scope-diff guard (P1.A §5c). Before auto-closing, check that the
+          // run stayed inside this issue's scope (no cross-issue commit
+          // references; changed paths didn't cross undeclared service
+          // boundaries). SHIP TELEMETRY-FIRST: we only actually skip the
+          // auto-close when the project opts in via a `scopeExceptions` config;
+          // otherwise we log-only and proceed.
+          let skipAutoCloseForScope = false;
+          try {
+            const scopeIssueRow = await db
+              .select({ identifier: issues.identifier, projectId: issues.projectId })
+              .from(issues)
+              .where(and(eq(issues.id, runIssueId), eq(issues.companyId, finalizedRun.companyId)))
+              .then((rows) => rows[0] ?? null);
+            const projectPolicyForScope = scopeIssueRow?.projectId
+              ? await db
+                  .select({ policy: projects.executionWorkspacePolicy })
+                  .from(projects)
+                  .where(
+                    and(
+                      eq(projects.id, scopeIssueRow.projectId),
+                      eq(projects.companyId, finalizedRun.companyId),
+                    ),
+                  )
+                  .then((rows) => rows[0]?.policy ?? null)
+              : null;
+            const rawScopeExceptions = (parseObject(projectPolicyForScope) as Record<string, unknown>)
+              .scopeExceptions;
+            const scopeExceptionsConfigured = Array.isArray(rawScopeExceptions);
+            const projectScopeExceptions = scopeExceptionsConfigured
+              ? (rawScopeExceptions as unknown[])
+                  .filter((value): value is string => typeof value === "string")
+              : undefined;
+            const worktreeCwd =
+              resolvedWorkspace.source === "execution_workspace"
+                ? resolvedWorkspace.worktreePath ?? resolvedWorkspace.cwd ?? null
+                : resolvedWorkspace.cwd ?? null;
+            const scopeValidation = await validateScopeDiffBeforeAutoClose(db, {
+              issueId: runIssueId,
+              issueIdentifier: scopeIssueRow?.identifier ?? null,
+              changedFiles: completion.changedFiles,
+              worktreeCwd,
+              baseRef: resolvedWorkspace.repoRef ?? null,
+              projectScopeExceptions,
+            });
+            if (!scopeValidation.valid) {
+              await logActivity(db, {
+                companyId: finalizedRun.companyId,
+                actorType: "system",
+                actorId: finalizedRun.agentId,
+                action: "scope_diff_blocked",
+                entityType: "issue",
+                entityId: runIssueId,
+                agentId: finalizedRun.agentId,
+                runId: finalizedRun.id,
+                details: {
+                  gated: scopeExceptionsConfigured,
+                  reason: scopeValidation.reason,
+                  violations: scopeValidation.violations,
+                },
+              }).catch(() => {});
+              if (scopeExceptionsConfigured) {
+                // Opted-in project — actually skip the auto-close and tell the
+                // issue why so a human can decide.
+                skipAutoCloseForScope = true;
+                await db
+                  .insert(issueComments)
+                  .values({
+                    companyId: finalizedRun.companyId,
+                    issueId: runIssueId,
+                    authorAgentId: null,
+                    authorUserId: null,
+                    body:
+                      `Auto-close was skipped because this run appears to have left the scope of this issue. ` +
+                      `${scopeValidation.reason} Review the change set and either split the out-of-scope work into ` +
+                      `its own ticket or close this issue manually.`,
+                  })
+                  .catch(() => {});
+              }
+            }
+          } catch (err) {
+            logger.debug(
+              { err, runId: finalizedRun.id, issueId: runIssueId },
+              "scope-diff validation failed; proceeding with auto-close",
+            );
+          }
+
+          if (!skipAutoCloseForScope) {
+            await autoCloseIssueAfterSuccessfulRun(db, {
+              companyId: finalizedRun.companyId,
+              agentId: finalizedRun.agentId,
+              runId: finalizedRun.id,
+              issueId: runIssueId,
+              questionResult,
+              allowAutoClose: false,
+              summary: completion.summary,
+              changedFiles: completion.changedFiles,
+              checks: completion.checks,
+            }).catch((err) => {
+              logger.debug(
+                { err, runId: finalizedRun.id, issueId: runIssueId },
+                "successful-run auto-close failed",
+              );
+            });
+          }
+          await enforceDelegationPolicyAfterSuccessfulRun(db, {
             companyId: finalizedRun.companyId,
             agentId: finalizedRun.agentId,
             runId: finalizedRun.id,
             issueId: runIssueId,
-            questionResult,
-            allowAutoClose: false,
+            currentWakeReason: readNonEmptyString(context.wakeReason),
           }).catch((err) => {
             logger.debug(
               { err, runId: finalizedRun.id, issueId: runIssueId },
-              "successful-run auto-close failed",
+              "successful-run delegation policy check failed",
             );
           });
         }
@@ -3392,6 +5623,11 @@ export function heartbeatService(db: Db) {
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
       });
+      // Issue 4 — a resumed paused run that threw is now terminally failed;
+      // drop any leftover usage-pause window so the poller never revives it.
+      if (usagePauseEnabled()) {
+        await cleanupUsagePauseWindowForRun(run.id).catch(() => {});
+      }
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: new Date(),
         error: message,
@@ -3403,6 +5639,14 @@ export function heartbeatService(db: Db) {
           stream: "system",
           level: "error",
           message,
+        });
+        await markIssueBlockedAfterFailedRun(db, {
+          run: failedRun,
+          agent,
+          message,
+          errorCode,
+        }).catch((handoffErr) => {
+          logger.debug({ err: handoffErr, runId: failedRun.id }, "failed-run issue handoff failed");
         });
         await releaseIssueExecutionAndPromote(failedRun);
 
@@ -3445,6 +5689,9 @@ export function heartbeatService(db: Db) {
         .select({
           id: issues.id,
           companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          startedAt: issues.startedAt,
         })
         .from(issues)
         .where(and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
@@ -3573,15 +5820,20 @@ export function heartbeatService(db: Db) {
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: newRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
-            executionLockedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(issues.id, issue.id));
+        const issuePatch: Partial<typeof issues.$inferInsert> = {
+          executionRunId: newRun.id,
+          executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
+          executionLockedAt: now,
+          updatedAt: now,
+        };
+        if (
+          issue.assigneeAgentId === deferredAgent.id &&
+          (issue.status === "backlog" || issue.status === "todo")
+        ) {
+          issuePatch.status = "in_progress";
+          issuePatch.startedAt = issue.startedAt ?? now;
+        }
+        await tx.update(issues).set(issuePatch).where(eq(issues.id, issue.id));
 
         return newRun;
       }
@@ -3664,6 +5916,68 @@ export function heartbeatService(db: Db) {
       return null;
     }
 
+    // Per-issue PR review hold: while a tracked PR for the target issue (or the child
+    // issue a notification/question references) is awaiting human review, suppress
+    // AUTOMATIC wakeups so review-feedback churn (delegation, parent notifications,
+    // question routing) can't re-ignite work the human is still reviewing. Human/board
+    // actions (requestedByActorType "user") pass through — including the one-shot
+    // "Let agents fix" release, which marks its wake user-originated.
+    if (opts.requestedByActorType !== "user") {
+      const reviewHoldIssueIds = Array.from(
+        new Set(
+          [
+            issueId,
+            readNonEmptyString((payload as Record<string, unknown> | null)?.childIssueId),
+            readNonEmptyString(enrichedContextSnapshot.childIssueId),
+          ].filter((value): value is string => Boolean(value)),
+        ),
+      );
+      // A wake aimed at a specific PR is only frozen by THAT PR's own hold — a sibling PR
+      // held on the same issue must not block it (an issue can have multiple PRs).
+      const targetPullRequestId =
+        readNonEmptyString((payload as Record<string, unknown> | null)?.issuePullRequestId) ??
+        readNonEmptyString(enrichedContextSnapshot.issuePullRequestId);
+
+      let heldPr: { id: string } | null = null;
+      if (reviewHoldIssueIds.length > 0) {
+        const conditions = [
+          eq(issuePullRequests.companyId, agent.companyId),
+          inArray(issuePullRequests.issueId, reviewHoldIssueIds),
+          eq(issuePullRequests.feedbackStatus, "awaiting_human"),
+          ne(issuePullRequests.mergeStatus, "merged"),
+        ];
+        if (targetPullRequestId) conditions.push(eq(issuePullRequests.id, targetPullRequestId));
+        heldPr = await db
+          .select({ id: issuePullRequests.id })
+          .from(issuePullRequests)
+          .where(and(...conditions))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      } else if (source === "timer") {
+        // Timer heartbeats carry no issue scope; freeze the assignee's own proactive
+        // polling while one of their PRs awaits human review so they don't re-touch held
+        // work. Event-driven wakes (assignments, etc.) are unaffected.
+        heldPr = await db
+          .select({ id: issuePullRequests.id })
+          .from(issuePullRequests)
+          .innerJoin(issues, eq(issues.id, issuePullRequests.issueId))
+          .where(
+            and(
+              eq(issuePullRequests.companyId, agent.companyId),
+              eq(issues.assigneeAgentId, agentId),
+              eq(issuePullRequests.feedbackStatus, "awaiting_human"),
+              ne(issuePullRequests.mergeStatus, "merged"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      }
+      if (heldPr) {
+        await writeSkippedRequest("issue.pr_review_hold");
+        return null;
+      }
+    }
+
     const bypassIssueExecutionLock =
       reason === "issue_comment_mentioned" ||
       readNonEmptyString(enrichedContextSnapshot.wakeReason) === "issue_comment_mentioned";
@@ -3681,8 +5995,11 @@ export function heartbeatService(db: Db) {
           .select({
             id: issues.id,
             companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
+            startedAt: issues.startedAt,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
@@ -3713,7 +6030,17 @@ export function heartbeatService(db: Db) {
             .then((rows) => rows[0] ?? null)
           : null;
 
-        if (activeExecutionRun && activeExecutionRun.status !== "queued" && activeExecutionRun.status !== "running") {
+        // Issue 4 LOCK-LIVE: `paused_usage` is a LIVE lock holder. A run parked
+        // on a usage limit keeps its issue lock so a sibling agent can't run
+        // the same issue concurrently. If we treated it as stale here we'd
+        // null the lock and let this wake acquire the issue alongside the
+        // paused run — the exact concurrency bug we must prevent.
+        if (
+          activeExecutionRun &&
+          activeExecutionRun.status !== "queued" &&
+          activeExecutionRun.status !== "running" &&
+          activeExecutionRun.status !== "paused_usage"
+        ) {
           activeExecutionRun = null;
         }
 
@@ -3730,13 +6057,17 @@ export function heartbeatService(db: Db) {
         }
 
         if (!activeExecutionRun) {
+          // Issue 4 LOCK-LIVE: include `paused_usage` so a parked run that
+          // lost its executionRunId pointer is re-adopted as the live lock
+          // holder rather than being ignored (which would let a concurrent run
+          // acquire the issue).
           const legacyRun = await tx
             .select()
             .from(heartbeatRuns)
             .where(
               and(
                 eq(heartbeatRuns.companyId, issue.companyId),
-                inArray(heartbeatRuns.status, ["queued", "running"]),
+                inArray(heartbeatRuns.status, ["queued", "running", "paused_usage"]),
                 sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
               ),
             )
@@ -3919,15 +6250,21 @@ export function heartbeatService(db: Db) {
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: newRun.id,
-            executionAgentNameKey: agentNameKey,
-            executionLockedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(issues.id, issue.id));
+        const now = new Date();
+        const issuePatch: Partial<typeof issues.$inferInsert> = {
+          executionRunId: newRun.id,
+          executionAgentNameKey: agentNameKey,
+          executionLockedAt: now,
+          updatedAt: now,
+        };
+        if (
+          issue.assigneeAgentId === agent.id &&
+          (issue.status === "backlog" || issue.status === "todo")
+        ) {
+          issuePatch.status = "in_progress";
+          issuePatch.startedAt = issue.startedAt ?? now;
+        }
+        await tx.update(issues).set(issuePatch).where(eq(issues.id, issue.id));
 
         return { kind: "queued" as const, run: newRun };
       });
@@ -4196,6 +6533,24 @@ export function heartbeatService(db: Db) {
 
     reapOrphanedRuns,
     reapOrphanedIssueLocks,
+    // Issue 4 — usage-pause engine surface. resumeUsagePausedRuns is the 60s
+    // poller (index.ts) and bootRecoverUsagePausedRuns is the boot recovery
+    // step (ordered BEFORE reapOrphanedRuns at init). Both no-op when the
+    // COMBYNE_USAGE_PAUSE_ENABLED flag is off.
+    resumeUsagePausedRuns,
+    bootRecoverUsagePausedRuns,
+    // Issue 4 — internal usage-pause engine functions exposed ONLY for the
+    // exhaustive engine test suite (heartbeat-usage-pause.test.ts). These let
+    // the tests exercise the REAL pause/resume/fail implementation directly
+    // (rather than reimplementing the decision logic) without driving a live
+    // adapter process. Not part of the public control-plane surface.
+    __usagePauseTestApi: {
+      handleUsageLimitResponse,
+      checkIfQuotaWindowReset,
+      failUsagePausedRun,
+      attemptResumeExecution,
+      cleanupUsagePauseWindowForRun,
+    },
     reopenIssuesAutoClosedAfterTokenPause: (opts?: { limit?: number }) =>
       reopenIssuesAutoClosedAfterTokenPause(db, opts),
     forceUnlockIssue,
@@ -4242,7 +6597,20 @@ export function heartbeatService(db: Db) {
     cancelRun: async (runId: string) => {
       const run = await getRun(runId);
       if (!run) throw notFound("Heartbeat run not found");
-      if (run.status !== "running" && run.status !== "queued") return run;
+      // Issue 4: a `paused_usage` run is cancellable too — an operator may want
+      // to abandon a parked run rather than wait for the window. Cancelling
+      // drops its usage-pause window (below) so the poller never revives it.
+      if (
+        run.status !== "running" &&
+        run.status !== "queued" &&
+        run.status !== "paused_usage"
+      ) {
+        return run;
+      }
+
+      // Drop any usage-pause window first so a concurrent poll can't resume the
+      // run while we're cancelling it.
+      await cleanupUsagePauseWindowForRun(run.id).catch(() => {});
 
       const running = runningProcesses.get(run.id);
       if (running) {
@@ -4283,12 +6651,20 @@ export function heartbeatService(db: Db) {
     },
 
     cancelActiveForAgent: async (agentId: string) => {
+      // Issue 4: include `paused_usage` — pausing the agent must also tear down
+      // any parked usage-pause run, else its held issue lock + window leak.
       const runs = await db
         .select()
         .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, ["queued", "running"])));
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            inArray(heartbeatRuns.status, ["queued", "running", "paused_usage"]),
+          ),
+        );
 
       for (const run of runs) {
+        await cleanupUsagePauseWindowForRun(run.id).catch(() => {});
         await setRunStatus(run.id, "cancelled", {
           finishedAt: new Date(),
           error: "Cancelled due to agent pause",
@@ -4313,12 +6689,21 @@ export function heartbeatService(db: Db) {
 
     cancelActiveForCompany: async (companyId: string, reason = "Cancelled because company is not active") => {
       const now = new Date();
+      // Issue 4: include `paused_usage` — deactivating the company must cancel
+      // parked runs too. A company/budget pause must dominate a usage pause:
+      // we never silently resume across it, and we don't leak the held lock.
       const runs = await db
         .select()
         .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running"])));
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            inArray(heartbeatRuns.status, ["queued", "running", "paused_usage"]),
+          ),
+        );
 
       for (const run of runs) {
+        await cleanupUsagePauseWindowForRun(run.id).catch(() => {});
         await setRunStatus(run.id, "cancelled", {
           finishedAt: now,
           error: reason,

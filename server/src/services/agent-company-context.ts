@@ -9,6 +9,7 @@ export interface CompanyProjectOverviewWorkspace {
   repoUrl: string | null;
   repoRef: string | null;
   isPrimary: boolean;
+  localPathHidden?: boolean;
 }
 
 export interface CompanyProjectOverviewProject {
@@ -27,6 +28,16 @@ export interface CompanyProjectOverviewResult {
   body: string;
 }
 
+export interface CompanyProjectOverviewOptions {
+  limit?: number;
+  /**
+   * Hide primary checkout paths when the current run already has a focused
+   * execution workspace. Exposing shared repo paths in that mode invites
+   * parallel agents to write outside their isolated worktrees.
+   */
+  redactLocalWorkspacePaths?: boolean;
+}
+
 /**
  * Compact view of the Combyne-managed projects + primary workspaces for a
  * company, formatted for injection into agent context preambles. Fixes the
@@ -40,7 +51,7 @@ export interface CompanyProjectOverviewResult {
 export async function loadCompanyProjectOverview(
   db: Db,
   companyId: string,
-  opts: { limit?: number } = {},
+  opts: CompanyProjectOverviewOptions = {},
 ): Promise<CompanyProjectOverviewResult> {
   const limit = Math.min(Math.max(opts.limit ?? 40, 1), 100);
 
@@ -93,10 +104,11 @@ export async function loadCompanyProjectOverview(
     list.push({
       id: ws.id,
       name: ws.name,
-      cwd: ws.cwd,
+      cwd: opts.redactLocalWorkspacePaths ? null : ws.cwd,
       repoUrl: ws.repoUrl,
       repoRef: ws.repoRef,
       isPrimary: ws.isPrimary,
+      localPathHidden: opts.redactLocalWorkspacePaths && Boolean(ws.cwd),
     });
     workspacesByProject.set(ws.projectId, list);
   }
@@ -151,6 +163,10 @@ export async function loadCompanyProjectOverview(
       lines.push(`    - Primary workspace: **${primary.name}**${repoPart}${cwdPart}`);
       if (primary.cwd) {
         lines.push(`    - _Accessible from this session via \`--add-dir\` — you can \`ls ${primary.cwd}\`, read/write files there directly._`);
+      } else if (primary.localPathHidden) {
+        lines.push(
+          "    - _Primary local path hidden for this run; use the focused execution workspace cwd supplied in `combyneWorkspace`._",
+        );
       }
     }
     if (project.workspaces.length > 1) {

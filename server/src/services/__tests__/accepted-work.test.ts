@@ -143,6 +143,26 @@ describe("accepted work service", () => {
     expect(inferred.event.managerAgentId).toBe(emId);
   });
 
+  it("buildBrief omits the live PR URL and points to repo#number for review requests", async () => {
+    const svc = acceptedWorkService(handle.db);
+    const upserted = await svc.upsertMergedPull({
+      companyId,
+      issueId: childIssueId,
+      repo: "combyne",
+      pullNumber: 42,
+      pullUrl: "https://github.com/combyne/combyne/pull/42",
+      title: "feat: implement accepted work memory",
+      detectionSource: "simulation",
+    });
+    const brief = await svc.buildBrief(companyId, [upserted.event]);
+    // The clickable https PR URL must not leak into the brief.
+    expect(brief).not.toContain("https://github.com/combyne/combyne/pull/42");
+    expect(brief).not.toContain("https://");
+    // The header + PR line should reference repo#number and steer toward a review task.
+    expect(brief).toContain("combyne#42");
+    expect(brief).toContain("request a review task if review is needed");
+  });
+
   it("creates workspace memory from accepted work and resolves the event", async () => {
     const svc = acceptedWorkService(handle.db);
     const event = await svc.upsertMergedPull({

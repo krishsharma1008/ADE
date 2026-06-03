@@ -5,7 +5,7 @@ export type IssuePullRequestCiStatus = "unknown" | "pending" | "passed" | "faile
 export type IssuePullRequestReviewStatus = "unknown" | "clean" | "changes_requested";
 export type IssuePullRequestQualityStatus = "not_configured" | "unknown" | "pending" | "passed" | "failed";
 export type IssuePullRequestMergeStatus = "pending" | "ready" | "merged" | "blocked";
-export type IssuePullRequestFeedbackStatus = "idle" | "needs_agent" | "sent";
+export type IssuePullRequestFeedbackStatus = "idle" | "needs_agent" | "sent" | "awaiting_human";
 
 export interface IssuePullRequest {
   id: string;

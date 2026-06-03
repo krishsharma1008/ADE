@@ -145,22 +145,87 @@ export function companyRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const archiveRequested = req.body.status === "archived";
-    const company = archiveRequested ? await svc.archive(companyId) : await svc.update(companyId, req.body);
+    const pauseRequested = req.body.status === "paused";
+    const resumeRequested = req.body.status === "active";
+    let company;
+    if (archiveRequested) {
+      company = await svc.archive(companyId);
+    } else if (pauseRequested) {
+      company = await svc.pause(companyId);
+    } else if (resumeRequested) {
+      company = await svc.resume(companyId);
+    } else {
+      company = await svc.update(companyId, req.body);
+    }
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;
     }
     const shutdown = archiveRequested
       ? await heartbeat.cancelActiveForCompany(companyId, "Cancelled because company was archived")
-      : null;
+      : pauseRequested
+        ? await heartbeat.cancelActiveForCompany(companyId, "Cancelled because company was paused")
+        : null;
+    const action = archiveRequested
+      ? "company.archived"
+      : pauseRequested
+        ? "company.paused"
+        : resumeRequested
+          ? "company.resumed"
+          : "company.updated";
     await logActivity(db, {
       companyId,
       actorType: "user",
       actorId: req.actor.userId ?? "board",
-      action: archiveRequested ? "company.archived" : "company.updated",
+      action,
       entityType: "company",
       entityId: companyId,
       details: shutdown ? { ...req.body, ...shutdown } : req.body,
+    });
+    res.json(company);
+  });
+
+  router.post("/:companyId/pause", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const company = await svc.pause(companyId);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    const shutdown = await heartbeat.cancelActiveForCompany(
+      companyId,
+      "Cancelled because company was paused",
+    );
+    await logActivity(db, {
+      companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "company.paused",
+      entityType: "company",
+      entityId: companyId,
+      details: shutdown,
+    });
+    res.json(company);
+  });
+
+  router.post("/:companyId/resume", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const company = await svc.resume(companyId);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    await logActivity(db, {
+      companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "company.resumed",
+      entityType: "company",
+      entityId: companyId,
     });
     res.json(company);
   });

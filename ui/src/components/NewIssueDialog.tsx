@@ -27,6 +27,7 @@ import {
   ChevronRight,
   ChevronDown,
   CircleDot,
+  Gauge,
   Minus,
   ArrowUp,
   ArrowDown,
@@ -59,6 +60,7 @@ interface IssueDraft {
   title: string;
   description: string;
   status: string;
+  complexity: string;
   priority: string;
   assigneeId: string;
   projectId: string;
@@ -166,6 +168,12 @@ const priorities = [
   { value: "low", label: "Low", icon: ArrowDown, color: priorityColor.low ?? priorityColorDefault },
 ];
 
+const complexities = [
+  { value: "small", label: "S", description: "Small", color: "text-emerald-500" },
+  { value: "medium", label: "M", description: "Medium", color: "text-amber-500" },
+  { value: "large", label: "L", description: "Large", color: "text-rose-500" },
+];
+
 export function NewIssueDialog() {
   const { newIssueOpen, newIssueDefaults, closeNewIssue } = useDialog();
   const { companies, selectedCompanyId, selectedCompany } = useCompany();
@@ -173,6 +181,7 @@ export function NewIssueDialog() {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [status, setStatus] = useState("todo");
+  const [complexity, setComplexity] = useState("small");
   const [priority, setPriority] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
   const [projectId, setProjectId] = useState("");
@@ -190,6 +199,7 @@ export function NewIssueDialog() {
 
   // Popover states
   const [statusOpen, setStatusOpen] = useState(false);
+  const [complexityOpen, setComplexityOpen] = useState(false);
   const [priorityOpen, setPriorityOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [companyOpen, setCompanyOpen] = useState(false);
@@ -294,6 +304,7 @@ export function NewIssueDialog() {
       title,
       description,
       status,
+      complexity,
       priority,
       assigneeId,
       projectId,
@@ -306,6 +317,7 @@ export function NewIssueDialog() {
     title,
     description,
     status,
+    complexity,
     priority,
     assigneeId,
     projectId,
@@ -327,6 +339,7 @@ export function NewIssueDialog() {
       setTitle(newIssueDefaults.title);
       setDescription(newIssueDefaults.description ?? "");
       setStatus(newIssueDefaults.status ?? "todo");
+      setComplexity(newIssueDefaults.complexity ?? "small");
       setPriority(newIssueDefaults.priority ?? "");
       setProjectId(newIssueDefaults.projectId ?? "");
       setAssigneeId(newIssueDefaults.assigneeAgentId ?? "");
@@ -338,6 +351,7 @@ export function NewIssueDialog() {
       setTitle(draft.title);
       setDescription(draft.description);
       setStatus(draft.status || "todo");
+      setComplexity(draft.complexity || "small");
       setPriority(draft.priority);
       setAssigneeId(newIssueDefaults.assigneeAgentId ?? draft.assigneeId);
       setProjectId(newIssueDefaults.projectId ?? draft.projectId);
@@ -347,6 +361,7 @@ export function NewIssueDialog() {
       setAssigneeUseProjectWorkspace(draft.assigneeUseProjectWorkspace ?? true);
     } else {
       setStatus(newIssueDefaults.status ?? "todo");
+      setComplexity(newIssueDefaults.complexity ?? "small");
       setPriority(newIssueDefaults.priority ?? "");
       setProjectId(newIssueDefaults.projectId ?? "");
       setAssigneeId(newIssueDefaults.assigneeAgentId ?? "");
@@ -389,6 +404,7 @@ export function NewIssueDialog() {
     setTitle("");
     setDescription("");
     setStatus("todo");
+    setComplexity("small");
     setPriority("");
     setAssigneeId("");
     setProjectId("");
@@ -433,6 +449,7 @@ export function NewIssueDialog() {
       title: title.trim(),
       description: description.trim() || undefined,
       status,
+      complexity,
       priority: priority || "medium",
       ...(assigneeId ? { assigneeAgentId: assigneeId } : {}),
       ...(projectId ? { projectId } : {}),
@@ -464,6 +481,7 @@ export function NewIssueDialog() {
 
   const hasDraft = title.trim().length > 0 || description.trim().length > 0;
   const currentStatus = statuses.find((s) => s.value === status) ?? statuses[1]!;
+  const currentComplexity = complexities.find((item) => item.value === complexity) ?? complexities[0]!;
   const currentPriority = priorities.find((p) => p.value === priority);
   const currentAssignee = (agents ?? []).find((a) => a.id === assigneeId);
   const currentProject = orderedProjects.find((project) => project.id === projectId);
@@ -861,6 +879,32 @@ export function NewIssueDialog() {
                 >
                   <CircleDot className={cn("h-3 w-3", s.color)} />
                   {s.label}
+                </button>
+              ))}
+            </PopoverContent>
+          </Popover>
+
+          {/* Complexity chip */}
+          <Popover open={complexityOpen} onOpenChange={setComplexityOpen}>
+            <PopoverTrigger asChild>
+              <button className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors">
+                <Gauge className={cn("h-3 w-3", currentComplexity.color)} />
+                {currentComplexity.label}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent className="w-36 p-1" align="start">
+              {complexities.map((item) => (
+                <button
+                  key={item.value}
+                  className={cn(
+                    "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
+                    item.value === complexity && "bg-accent"
+                  )}
+                  onClick={() => { setComplexity(item.value); setComplexityOpen(false); }}
+                >
+                  <Gauge className={cn("h-3 w-3", item.color)} />
+                  <span className="font-medium">{item.label}</span>
+                  <span className="text-muted-foreground">{item.description}</span>
                 </button>
               ))}
             </PopoverContent>

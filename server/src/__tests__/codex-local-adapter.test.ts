@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { isCodexUnknownSessionError, parseCodexJsonl } from "@combyne/adapter-codex-local/server";
+import { isCodexUnknownSessionError, parseCodexJsonl, stripCodexRolloutNoise } from "@combyne/adapter-codex-local/server";
 import { parseCodexStdoutLine } from "@combyne/adapter-codex-local/ui";
 import { printCodexStreamEvent } from "@combyne/adapter-codex-local/cli";
 
@@ -30,6 +30,18 @@ describe("codex_local stale session detection", () => {
       "2026-02-19T19:58:53.281939Z ERROR codex_core::rollout::list: state db missing rollout path for thread 019c775d-967c-7ef1-acc7-e396dc2c87cc";
 
     expect(isCodexUnknownSessionError("", stderr)).toBe(true);
+  });
+});
+
+describe("codex_local stderr noise filtering", () => {
+  it("removes non-fatal rollout/session recorder errors from user-facing logs", () => {
+    const stderr = [
+      "visible warning",
+      "2026-05-15T06:46:52.701700Z ERROR codex_core::session: failed to record rollout items: thread 019e2a62-237a-7552-a998-6f0dbfee5d80 not found",
+      "2026-02-19T19:58:53.281939Z ERROR codex_core::rollout::list: state db missing rollout path for thread 019c775d-967c-7ef1-acc7-e396dc2c87cc",
+    ].join("\n");
+
+    expect(stripCodexRolloutNoise(stderr).trim()).toBe("visible warning");
   });
 });
 

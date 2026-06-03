@@ -156,7 +156,21 @@ export type OpenIssueStatus = (typeof OPEN_ISSUE_STATUSES)[number];
 export const ISSUE_PRIORITIES = ["critical", "high", "medium", "low"] as const;
 export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
 
-export const ISSUE_ORIGIN_KINDS = ["manual", "routine_execution", "terminal_session"] as const;
+export const ISSUE_COMPLEXITIES = ["small", "medium", "large"] as const;
+export type IssueComplexity = (typeof ISSUE_COMPLEXITIES)[number];
+
+export const ISSUE_COMPLEXITY_LABELS: Record<IssueComplexity, string> = {
+  small: "S",
+  medium: "M",
+  large: "L",
+};
+
+export const ISSUE_ORIGIN_KINDS = [
+  "manual",
+  "routine_execution",
+  "terminal_session",
+  "pr_review_requested",
+] as const;
 export type IssueOriginKind = (typeof ISSUE_ORIGIN_KINDS)[number];
 
 export const GOAL_LEVELS = ["company", "team", "agent", "task"] as const;
@@ -328,6 +342,10 @@ export const WAKEUP_REQUEST_STATUSES = [
   "completed",
   "failed",
   "cancelled",
+  // Issue 4: the wakeup was parked because the underlying provider reported a
+  // usage/subscription limit. A separate usage-pause engine resumes it once the
+  // provider window resets. DB column is text-backed; this value is additive.
+  "paused_usage",
 ] as const;
 export type WakeupRequestStatus = (typeof WAKEUP_REQUEST_STATUSES)[number];
 
@@ -339,6 +357,11 @@ export const HEARTBEAT_RUN_STATUSES = [
   "interrupted_recoverable",
   "cancelled",
   "timed_out",
+  // Issue 4: the run was paused (not failed) because Claude reported a usage /
+  // subscription-window limit. The session is preserved and a usage-pause
+  // engine resumes it from `usage_pause_windows` once the provider window
+  // resets. DB column is text-backed; this value is additive.
+  "paused_usage",
 ] as const;
 export type HeartbeatRunStatus = (typeof HEARTBEAT_RUN_STATUSES)[number];
 

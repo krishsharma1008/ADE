@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ISSUE_PRIORITIES, ISSUE_STATUSES } from "../constants.js";
+import { ISSUE_COMPLEXITIES, ISSUE_PRIORITIES, ISSUE_STATUSES } from "../constants.js";
 
 const executionWorkspaceStrategySchema = z
   .object({
@@ -36,6 +36,7 @@ export const createIssueSchema = z.object({
   title: z.string().min(1),
   description: z.string().optional().nullable(),
   status: z.enum(ISSUE_STATUSES).optional().default("backlog"),
+  complexity: z.enum(ISSUE_COMPLEXITIES).optional().default("small"),
   priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
   assigneeAgentId: z.string().uuid().optional().nullable(),
   assigneeUserId: z.string().optional().nullable(),

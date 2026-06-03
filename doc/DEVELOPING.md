@@ -153,6 +153,7 @@ Useful flags:
 - `--bnpl /path/to/fs-bnpl-service`
 - `--brick /path/to/fs-brick-service`
 - `--quality-checks` to run Gradle task discovery in the copied workspaces
+- `--java-home /path/to/jdk` or `COMBYNE_AUDIT_JAVA_HOME=/path/to/jdk` to force a compatible JDK for Gradle checks. If no compatible JDK exists, the audit reports `setup_missing` with install/export guidance instead of marking the repo diff as failed.
 
 The script writes `em-autonomy-audit-report.md` and `.json` in the audit root. It never edits the original Buku repos.
 

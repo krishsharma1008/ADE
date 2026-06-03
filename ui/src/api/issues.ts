@@ -91,6 +91,7 @@ export const issuesApi = {
       toAgentId: string;
       title: string;
       description?: string;
+      complexity?: "small" | "medium" | "large";
       priority?: string;
       labelIds?: string[];
     },
@@ -127,6 +128,11 @@ export const issuesApi = {
       `/issue-pull-requests/${id}/wake-feedback`,
       {},
     ),
+  setPullRequestFeedbackOptIn: (id: string, enabled: boolean) =>
+    api.post<{
+      pullRequest: IssuePullRequest | null;
+      dispatched: { wakeRunId: string | null; held: boolean; holdReason: string | null } | null;
+    }>(`/issue-pull-requests/${id}/feedback-opt-in`, { enabled }),
   mergePullRequest: (
     id: string,
     data: {
