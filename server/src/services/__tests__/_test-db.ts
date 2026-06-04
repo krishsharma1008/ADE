@@ -124,6 +124,16 @@ export async function startTestDb(): Promise<TestDbHandle> {
   return startPromise;
 }
 
+/**
+ * Boot a fresh, independent embedded Postgres (NOT the shared singleton). Used
+ * by tests that need a SECOND physical database in the same process — e.g. the
+ * separate dedicated context DB. The caller owns the returned handle and must
+ * call `handle.stop()` itself; `stopTestDb()` only tears down the singleton.
+ */
+export async function startIsolatedTestDb(): Promise<TestDbHandle> {
+  return bootEmbeddedPostgres();
+}
+
 export async function stopTestDb() {
   const handle = sharedHandle;
   sharedHandle = null;

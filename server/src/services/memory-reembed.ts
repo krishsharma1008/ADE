@@ -14,6 +14,7 @@ import { sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { memoryEntries } from "@combyne/db";
 import type { MemoryEmbedder } from "./memory-embedder.js";
+import { resolveContextDb } from "./context-db.js";
 
 export interface ReembedOptions {
   companyId?: string;
@@ -62,6 +63,8 @@ export async function reembedBackfill(
   // Nothing to backfill on the hash-64 path; the local fallback is the oracle.
   if (!embedder.enabled) return { scanned: 0, reembedded: 0 };
 
+  // memory_entries physically lives in the context DB when configured.
+  const cdb = resolveContextDb(db);
   const batchSize = Math.min(Math.max(opts.batchSize ?? DEFAULT_BATCH, 1), 2048);
   const sleep = opts.sleep ?? defaultSleep;
   const current = embedder.version;
@@ -73,7 +76,7 @@ export async function reembedBackfill(
   // pgvector it does not. The selection predicate and the UPDATE adapt so the
   // backfill is correct in both worlds (the jsonb embedding + version are always
   // updated; the vector column only when present).
-  const hasVectorColumn = await columnPresent(db);
+  const hasVectorColumn = await columnPresent(cdb);
 
   // Resumable cursor: page by id ascending. Because re-embedded rows leave the
   // stale set, we keep selecting "the next stale page" until empty — but we also
@@ -90,7 +93,7 @@ export async function reembedBackfill(
     const conds = [staleCond, sql`status = 'active'`, sql`id > ${lastId}`];
     if (opts.companyId) conds.push(sql`company_id = ${opts.companyId}`);
     const whereSql = sql.join(conds, sql` AND `);
-    const page = (await db.execute(sql`
+    const page = (await cdb.execute(sql`
       SELECT id, subject, body FROM ${memoryEntries}
       WHERE ${whereSql}
       ORDER BY id ASC
@@ -120,7 +123,7 @@ export async function reembedBackfill(
         continue;
       }
       // Always update the jsonb embedding (oracle/fallback) + version + bookkeeping.
-      await db.execute(sql`
+      await cdb.execute(sql`
         UPDATE ${memoryEntries}
         SET embedding = ${JSON.stringify(result.vector)}::jsonb,
             embedding_version = ${result.version},
@@ -132,7 +135,7 @@ export async function reembedBackfill(
       // The vector column only when it exists (real pgvector deployment).
       if (hasVectorColumn) {
         const literal = `[${result.vector.join(",")}]`;
-        await db
+        await cdb
           .execute(sql`UPDATE ${memoryEntries} SET embedding_vec = ${literal}::vector WHERE id = ${row.id}`)
           .catch(() => {});
       }

@@ -365,6 +365,13 @@
       "when": 1780405305000,
       "tag": "0052_pgvector_embeddings",
       "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1780405305100,
+      "tag": "0053_memory_decouple_fks",
+      "breakpoints": true
     }
   ]
 }

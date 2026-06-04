@@ -16,6 +16,7 @@ import {
   type Db,
 } from "@combyne/db";
 import { and, eq, sql as dsql } from "drizzle-orm";
+import { resolveContextDb } from "./context-db.js";
 
 export const MEMORY_EXPORT_VERSION = 1 as const;
 
@@ -143,6 +144,8 @@ export async function importBundle(
   bundle: ImportBundle,
   opts: { companyId: string; ownerRemap: Map<string, string>; dryRun?: boolean },
 ): Promise<ImportResult> {
+  // All memory tables physically live in the context DB when configured.
+  const cdb = resolveContextDb(db);
   const entries = asArray(bundle.memory_entries);
   // ---- THE HARD GATE ----
   if (entries.length === 0) {
@@ -187,7 +190,7 @@ export async function importBundle(
         ? dsql`${memoryEntries.source} IS NULL`
         : eq(memoryEntries.source, source),
     ];
-    const [existing] = await db
+    const [existing] = await cdb
       .select({ id: memoryEntries.id })
       .from(memoryEntries)
       .where(and(...dedup))
@@ -203,7 +206,7 @@ export async function importBundle(
       continue;
     }
 
-    const [inserted] = await db
+    const [inserted] = await cdb
       .insert(memoryEntries)
       .values({
         companyId: opts.companyId,
@@ -249,7 +252,7 @@ export async function importBundle(
       const newId = idMap.get(oldId);
       const newSup = idMap.get(oldSup);
       if (newId && newSup) {
-        await db
+        await cdb
           .update(memoryEntries)
           .set({ supersededById: newSup })
           .where(eq(memoryEntries.id, newId));
@@ -265,7 +268,7 @@ export async function importBundle(
     const newSource = oldSource ? idMap.get(oldSource) : null;
     if (!newSource) continue; // orphaned promotion (source not imported)
     const proposedSubject = str(row.proposedSubject) ?? "";
-    const [exists] = await db
+    const [exists] = await cdb
       .select({ id: memoryPromotions.id })
       .from(memoryPromotions)
       .where(
@@ -278,7 +281,7 @@ export async function importBundle(
       .limit(1);
     if (exists) continue;
     const oldPromoted = str(row.promotedEntryId);
-    await db.insert(memoryPromotions).values({
+    await cdb.insert(memoryPromotions).values({
       companyId: opts.companyId,
       sourceEntryId: newSource,
       proposedSubject,
@@ -303,7 +306,7 @@ export async function importBundle(
     if (!newEntry) continue;
     const usedAt = toDate(row.usedAt);
     const actorId = str(row.actorId);
-    const [exists] = await db
+    const [exists] = await cdb
       .select({ id: memoryUsage.id })
       .from(memoryUsage)
       .where(
@@ -317,7 +320,7 @@ export async function importBundle(
       )
       .limit(1);
     if (exists) continue;
-    await db.insert(memoryUsage).values({
+    await cdb.insert(memoryUsage).values({
       entryId: newEntry,
       companyId: opts.companyId,
       issueId: str(row.issueId),
@@ -334,7 +337,7 @@ export async function importBundle(
     const scope = str(row.scope) ?? "company";
     const kind = str(row.kind) ?? "summary";
     const body = str(row.body) ?? "";
-    const [exists] = await db
+    const [exists] = await cdb
       .select({ id: agentMemory.id })
       .from(agentMemory)
       .where(
@@ -347,7 +350,7 @@ export async function importBundle(
       )
       .limit(1);
     if (exists) continue;
-    await db.insert(agentMemory).values({
+    await cdb.insert(agentMemory).values({
       companyId: opts.companyId,
       // agentId/issueId/sourceRunId reference rows NOT carried by the ETL —
       // drop the FKs rather than dangle them (they are set-null columns).

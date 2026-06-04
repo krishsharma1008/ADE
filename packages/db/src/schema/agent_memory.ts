@@ -1,8 +1,4 @@
 import { pgTable, uuid, text, timestamp, index, real } from "drizzle-orm/pg-core";
-import { companies } from "./companies.js";
-import { agents } from "./agents.js";
-import { issues } from "./issues.js";
-import { heartbeatRuns } from "./heartbeat_runs.js";
 
 /**
  * Durable agent memory: rolling summaries, facts, preferences, and artifact
@@ -14,14 +10,13 @@ export const agentMemory = pgTable(
   "agent_memory",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    companyId: uuid("company_id")
-      .notNull()
-      .references(() => companies.id),
-    agentId: uuid("agent_id").references(() => agents.id, { onDelete: "set null" }),
-    issueId: uuid("issue_id").references(() => issues.id, { onDelete: "set null" }),
-    sourceRunId: uuid("source_run_id").references(() => heartbeatRuns.id, {
-      onDelete: "set null",
-    }),
+    // Logical references into the MAIN DB (companies/agents/issues/heartbeat_runs).
+    // Cross-entity FKs dropped in 0053 so agent_memory can live in a separate
+    // context DB; the columns keep their values but are not enforced.
+    companyId: uuid("company_id").notNull(),
+    agentId: uuid("agent_id"),
+    issueId: uuid("issue_id"),
+    sourceRunId: uuid("source_run_id"),
     scope: text("scope").notNull(),
     kind: text("kind").notNull(),
     title: text("title"),

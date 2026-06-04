@@ -44,6 +44,12 @@ export interface Config {
   authDisableSignUp: boolean;
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
+  /**
+   * Optional separate Postgres for the memory/context layer. When set (and
+   * distinct from databaseUrl) the memory tables physically live here; unset
+   * (default '') means single-DB mode = today's behavior, fully backward-compatible.
+   */
+  contextDatabaseUrl: string;
   embeddedPostgresDataDir: string;
   embeddedPostgresPort: number;
   databaseBackupEnabled: boolean;
@@ -304,6 +310,9 @@ export function loadConfig(): Config {
     authDisableSignUp,
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
+    // Separate dedicated context DB. Mirrors the envVar pattern: '' when unset →
+    // resolveContextDb() falls back to the main db (single-DB mode, zero change).
+    contextDatabaseUrl: envVar("CONTEXT_DATABASE_URL") ?? "",
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),

@@ -427,7 +427,19 @@ export async function startServer(): Promise<StartedServer> {
     activeDatabaseConnectionString = embeddedConnectionString;
     startupDbInfo = { mode: "embedded-postgres", dataDir, port };
   }
-  
+
+  // ---- Separate dedicated context DB (CONTEXT_DATABASE_URL) ----
+  // When a distinct context DB is configured the memory layer physically lives
+  // there, so its tables must exist. Migrate it too. Guarded so single-DB mode
+  // (unset, or equal to the main URL) is entirely unchanged.
+  // NOTE: the context DB receives the FULL migration set today; the extra
+  // operational tables go unused. A context-only migration subset is a future
+  // optimization.
+  if (config.contextDatabaseUrl && config.contextDatabaseUrl !== activeDatabaseConnectionString) {
+    logger.info("Configured separate context DB (CONTEXT_DATABASE_URL); ensuring memory-layer schema");
+    await ensureMigrations(config.contextDatabaseUrl, "Context PostgreSQL", { autoApply: true });
+  }
+
   if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
     logger.warn(
       `local_trusted mode is binding to ${config.host} (non-loopback). ` +

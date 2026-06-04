@@ -9,7 +9,6 @@ import {
   real,
   customType,
 } from "drizzle-orm/pg-core";
-import { companies } from "./companies.js";
 
 /**
  * pgvector `vector(N)` custom type (PR-11). drizzle-orm ^0.38.4 has no native
@@ -62,9 +61,9 @@ export const memoryEntries = pgTable(
   "memory_entries",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    companyId: uuid("company_id")
-      .notNull()
-      .references(() => companies.id, { onDelete: "cascade" }),
+    // Logical reference to companies.id in the MAIN DB (FK dropped in 0053 so the
+    // memory layer can live in a separate context DB). Keeps its value, not enforced.
+    companyId: uuid("company_id").notNull(),
     layer: text("layer").notNull(), // 'workspace' | 'personal' | 'shared'
     ownerType: text("owner_type"), // 'user' | 'agent' | null (workspace/shared)
     ownerId: text("owner_id"), // principal id; not always a uuid (e.g. 'local-board')
@@ -134,9 +133,9 @@ export const memoryPromotions = pgTable(
   "memory_promotions",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    companyId: uuid("company_id")
-      .notNull()
-      .references(() => companies.id, { onDelete: "cascade" }),
+    // Logical reference to companies.id in the MAIN DB (FK dropped in 0053). The
+    // within-memory sourceEntryId FK below is intentionally kept.
+    companyId: uuid("company_id").notNull(),
     sourceEntryId: uuid("source_entry_id")
       .notNull()
       .references(() => memoryEntries.id, { onDelete: "cascade" }),

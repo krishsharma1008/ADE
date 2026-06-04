@@ -28,6 +28,7 @@ import {
   getEmbedderTelemetry,
   HASH_EMBEDDING_VERSION,
 } from "./memory-embedder.js";
+import { resolveContextDb } from "./context-db.js";
 
 type MemoryEntryRow = typeof memoryEntries.$inferSelect;
 
@@ -413,6 +414,11 @@ function provenanceRank(provenance: string | null): number {
 }
 
 export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedder()) {
+  // The memory tables (memory_entries/promotions/usage) physically live in the
+  // context DB when CONTEXT_DATABASE_URL is configured; otherwise `cdb === db`
+  // (single-DB mode, default). Non-memory reads (issues/agents/heartbeat_runs)
+  // intentionally keep using `db` (the main DB) below.
+  const cdb = resolveContextDb(db);
   /**
    * Best-effort vector write (PR-11). Writes the pgvector `embedding_vec` column
    * + bookkeeping ONLY when the embedder is enabled (real pgvector deployment).
@@ -427,7 +433,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
   async function hasVectorColumn(): Promise<boolean> {
     if (vectorColumnPresent !== null) return vectorColumnPresent;
     try {
-      const rows = (await db.execute(sql`
+      const rows = (await cdb.execute(sql`
         SELECT 1 FROM information_schema.columns
         WHERE table_schema = 'public'
           AND table_name = 'memory_entries'
@@ -451,7 +457,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     // composite 'provider:model:dim' stays in embedding_version. Storing the
     // bare model keeps the column useful for per-model analytics / HNSW gating
     // instead of duplicating embedding_version.
-    await db
+    await cdb
       .execute(sql`
         UPDATE ${memoryEntries}
         SET embedding_model = ${storage.model},
@@ -463,7 +469,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     // The pgvector column only when it exists.
     if (await hasVectorColumn()) {
       const literal = `[${storage.vector.join(",")}]`;
-      await db
+      await cdb
         .execute(
           sql`UPDATE ${memoryEntries} SET embedding_vec = ${literal}::vector WHERE id = ${id}`,
         )
@@ -547,7 +553,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     // upsert: a re-fire inserts zero rows, then we re-select the existing one.
     // Un-sourced entries (source IS NULL) are never deduped here.
     if (input.source) {
-      const [inserted] = await db
+      const [inserted] = await cdb
         .insert(memoryEntries)
         .values(insertValues)
         .onConflictDoNothing({
@@ -567,7 +573,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
         });
         return rowToEntry(inserted);
       }
-      const [existing] = await db
+      const [existing] = await cdb
         .select()
         .from(memoryEntries)
         .where(
@@ -580,7 +586,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       return rowToEntry(existing);
     }
 
-    const [row] = await db.insert(memoryEntries).values(insertValues).returning();
+    const [row] = await cdb.insert(memoryEntries).values(insertValues).returning();
     await writeVectorColumns(row.id, {
       vector: embedding,
       version: embedResult.version,
@@ -591,7 +597,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
   }
 
   async function getEntry(id: string): Promise<MemoryEntry | null> {
-    const rows = await db.select().from(memoryEntries).where(eq(memoryEntries.id, id)).limit(1);
+    const rows = await cdb.select().from(memoryEntries).where(eq(memoryEntries.id, id)).limit(1);
     return rows[0] ? rowToEntry(rows[0]) : null;
   }
 
@@ -629,7 +635,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       if (embedResult.redactedFindings.length > 0) updates.verificationState = "needs_review";
     }
     if (input.subject !== undefined) updates.subjectKey = computeSubjectKey(input.subject);
-    const [row] = await db
+    const [row] = await cdb
       .update(memoryEntries)
       .set(updates)
       .where(eq(memoryEntries.id, id))
@@ -681,7 +687,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       const cutoff = new Date(Date.now() - opts.ageDays * 24 * 60 * 60 * 1000);
       filters.push(gte(memoryEntries.updatedAt, cutoff));
     }
-    const rows = await db
+    const rows = await cdb
       .select()
       .from(memoryEntries)
       .where(and(...filters))
@@ -746,7 +752,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       if (annRows && annRows.length > 0) return filterPersonal(annRows, opts);
     }
 
-    const rows = await db
+    const rows = await cdb
       .select()
       .from(memoryEntries)
       .where(and(...filters))
@@ -797,7 +803,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     if (opts.minConfidence !== undefined) conds.push(sql`confidence >= ${opts.minConfidence}`);
     if (opts.excludeSuperseded !== false) conds.push(sql`superseded_by_id IS NULL`);
     const whereSql = sql.join(conds, sql` AND `);
-    const idRows = (await db.execute(sql`
+    const idRows = (await cdb.execute(sql`
       SELECT id FROM ${memoryEntries}
       WHERE ${whereSql}
       ORDER BY embedding_vec <=> ${literal}::vector
@@ -805,7 +811,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     `)) as unknown as Array<{ id: string }>;
     const ids = idRows.map((r) => r.id);
     if (ids.length === 0) return [];
-    const hydrated = await db
+    const hydrated = await cdb
       .select()
       .from(memoryEntries)
       .where(inArray(memoryEntries.id, ids));
@@ -965,7 +971,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     actorId?: string | null;
     score?: number | null;
   }): Promise<void> {
-    await db.insert(memoryUsage).values({
+    await cdb.insert(memoryUsage).values({
       entryId: input.entryId,
       companyId: input.companyId,
       issueId: input.issueId ?? null,
@@ -973,7 +979,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       actorId: input.actorId ?? null,
       score: input.score ?? null,
     });
-    await db
+    await cdb
       .update(memoryEntries)
       .set({
         usageCount: sql`${memoryEntries.usageCount} + 1`,
@@ -1089,7 +1095,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     const source = await getEntry(input.sourceEntryId);
     if (!source || source.companyId !== input.companyId) return null;
     if (source.layer === "shared") return null;
-    const [row] = await db
+    const [row] = await cdb
       .insert(memoryPromotions)
       .values({
         companyId: input.companyId,
@@ -1111,7 +1117,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
   ): Promise<MemoryPromotion[]> {
     const filters = [eq(memoryPromotions.companyId, companyId)];
     if (state) filters.push(eq(memoryPromotions.state, state));
-    const rows = await db
+    const rows = await cdb
       .select()
       .from(memoryPromotions)
       .where(and(...filters))
@@ -1128,7 +1134,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       reviewNotes?: string | null;
     },
   ): Promise<MemoryPromotion | null> {
-    const [existing] = await db
+    const [existing] = await cdb
       .select()
       .from(memoryPromotions)
       .where(eq(memoryPromotions.id, promotionId))
@@ -1141,7 +1147,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       const promoted = await createSharedFromPromotion(existing);
       promotedEntryId = promoted.id;
     }
-    const [row] = await db
+    const [row] = await cdb
       .update(memoryPromotions)
       .set({
         state: input.decision,
@@ -1168,7 +1174,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     // detected in the promoted body still quarantines to needs_review.
     const verificationState: MemoryVerificationState =
       embedResult.redactedFindings.length > 0 ? "needs_review" : "verified";
-    const [row] = await db
+    const [row] = await cdb
       .insert(memoryEntries)
       .values({
         companyId: promotion.companyId,
@@ -1208,7 +1214,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
    */
   async function runDecayPass(companyId: string, now: Date = new Date()): Promise<number> {
     const COLD_DAYS = 90;
-    const rows = await db
+    const rows = await cdb
       .select()
       .from(memoryEntries)
       .where(
@@ -1227,7 +1233,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       }
     }
     if (toArchive.length === 0) return 0;
-    await db
+    await cdb
       .update(memoryEntries)
       .set({ status: "archived", updatedAt: now })
       .where(inArray(memoryEntries.id, toArchive));
@@ -1245,7 +1251,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
   ): Promise<MemoryPromotion[]> {
     const minUsage = opts.minUsage ?? 3;
     const max = Math.min(opts.max ?? 20, 100);
-    const candidates = await db
+    const candidates = await cdb
       .select()
       .from(memoryEntries)
       .where(
@@ -1262,7 +1268,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     const proposals: MemoryPromotion[] = [];
     for (const c of eligible) {
       if (proposals.length >= max) break;
-      const existing = await db
+      const existing = await cdb
         .select()
         .from(memoryPromotions)
         .where(
@@ -1296,7 +1302,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     const currentVersion = embedder.version;
     // One pass over active rows: total, current-version coverage, hash count,
     // distinct version breakdown. embedding_version is a real drizzle column.
-    const rows = (await db.execute(sql`
+    const rows = (await cdb.execute(sql`
       SELECT COALESCE(embedding_version, 'null') AS version, COUNT(*)::int AS n
       FROM ${memoryEntries}
       WHERE company_id = ${companyId} AND status = 'active'
@@ -1320,7 +1326,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     const backlogPredicate = hasVec
       ? sql`(embedding_version IS DISTINCT FROM ${currentVersion} OR embedding_vec IS NULL)`
       : sql`embedding_version IS DISTINCT FROM ${currentVersion}`;
-    const backlogRows = (await db.execute(sql`
+    const backlogRows = (await cdb.execute(sql`
       SELECT COUNT(*)::int AS n FROM ${memoryEntries}
       WHERE company_id = ${companyId} AND status = 'active' AND ${backlogPredicate}
     `)) as unknown as Array<{ n: number }>;
@@ -1328,7 +1334,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
 
     // Redaction-blocked = the needs_review quarantine (createEntry forces this
     // when the body scan found+redacted a secret before egress).
-    const redactRows = (await db.execute(sql`
+    const redactRows = (await cdb.execute(sql`
       SELECT COUNT(*)::int AS n FROM ${memoryEntries}
       WHERE company_id = ${companyId} AND status = 'active'
         AND verification_state = 'needs_review'
@@ -1339,7 +1345,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     // documented later step; without it the pushdown is brute-force KNN).
     let hnswIndexPresent = false;
     if (hasVec) {
-      const idxRows = (await db
+      const idxRows = (await cdb
         .execute(sql`
           SELECT 1 FROM pg_indexes
           WHERE tablename = 'memory_entries' AND indexdef ILIKE '%hnsw%'

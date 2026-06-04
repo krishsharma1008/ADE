@@ -2,6 +2,7 @@ import { and, desc, eq } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { agentMemory, agentTranscripts } from "@combyne/db";
 import { logger } from "../middleware/logger.js";
+import { resolveContextDb } from "./context-db.js";
 
 export type MemoryScope = "agent" | "company" | "issue";
 export type MemoryKind = "summary" | "fact" | "preference" | "artifact_ref";
@@ -18,7 +19,9 @@ export interface UpsertMemoryInput {
 }
 
 export async function upsertMemory(db: Db, input: UpsertMemoryInput) {
-  await db.insert(agentMemory).values({
+  // agent_memory physically lives in the context DB when configured.
+  const cdb = resolveContextDb(db);
+  await cdb.insert(agentMemory).values({
     companyId: input.companyId,
     agentId: input.agentId ?? null,
     issueId: input.issueId ?? null,
@@ -39,12 +42,13 @@ export interface LoadMemoryOptions {
 }
 
 export async function loadRecentMemory(db: Db, opts: LoadMemoryOptions) {
+  const cdb = resolveContextDb(db);
   const limit = Math.min(Math.max(opts.limit ?? 10, 1), 50);
   const filters = [eq(agentMemory.companyId, opts.companyId)];
   if (opts.agentId) filters.push(eq(agentMemory.agentId, opts.agentId));
   if (opts.issueId) filters.push(eq(agentMemory.issueId, opts.issueId));
   if (opts.scope) filters.push(eq(agentMemory.scope, opts.scope));
-  const rows = await db
+  const rows = await cdb
     .select()
     .from(agentMemory)
     .where(and(...filters))
