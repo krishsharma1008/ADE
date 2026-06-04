@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createServer } from "node:net";
 import { createDb, migratePostgresIfEmpty, type Db } from "@combyne/db";
 
 type EmbeddedPostgresInstance = {
@@ -27,17 +28,35 @@ let sharedHandle: TestDbHandle | null = null;
 let startPromise: Promise<TestDbHandle> | null = null;
 
 /**
- * Pick a random port in the ephemeral range. Tests create their own
- * isolated embedded Postgres instance so they never collide with a
- * running dev server on :54329.
+ * Ask the OS for a currently-free TCP port on the loopback interface.
+ *
+ * Each test file boots its own isolated embedded Postgres, and vitest runs
+ * files concurrently across workers. The previous `55_000 + random(5_000)`
+ * scheme collided (birthday paradox) under that concurrency, surfacing as a
+ * suite-level "Unknown Error: undefined" when two instances raced for the same
+ * port. Binding port 0 and reading back the assigned port eliminates collisions
+ * at selection time; the small TOCTOU window between close() and Postgres
+ * binding is covered by the retry loop in bootEmbeddedPostgres().
  */
-function randomPort() {
-  return 55_000 + Math.floor(Math.random() * 5_000);
+async function findFreePort(): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const srv = createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      srv.close((err) => {
+        if (err) reject(err);
+        else if (port) resolve(port);
+        else reject(new Error("could not determine a free port"));
+      });
+    });
+  });
 }
 
-async function bootEmbeddedPostgres(): Promise<TestDbHandle> {
+async function bootOnce(): Promise<TestDbHandle> {
   const dir = await mkdtemp(path.join(tmpdir(), "combyne-test-pg-"));
-  const port = randomPort();
+  const port = await findFreePort();
 
   const mod = await import("embedded-postgres");
   const Ctor = (mod.default ?? mod) as unknown as EmbeddedPostgresCtor;
@@ -49,24 +68,50 @@ async function bootEmbeddedPostgres(): Promise<TestDbHandle> {
     persistent: false,
   });
 
-  await pg.initialise();
-  await pg.start();
-
-  const connectionString = `postgres://combyne:combyne@127.0.0.1:${port}/postgres`;
-  await migratePostgresIfEmpty(connectionString);
-  const db = createDb(connectionString);
-
-  return {
-    db,
-    connectionString,
-    stop: async () => {
-      try {
-        await pg.stop();
-      } finally {
-        await rm(dir, { recursive: true, force: true }).catch(() => {});
-      }
-    },
+  const cleanup = async () => {
+    await pg.stop().catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
   };
+
+  try {
+    await pg.initialise();
+    await pg.start();
+    const connectionString = `postgres://combyne:combyne@127.0.0.1:${port}/postgres`;
+    await migratePostgresIfEmpty(connectionString);
+    const db = createDb(connectionString);
+    return {
+      db,
+      connectionString,
+      stop: async () => {
+        try {
+          await pg.stop();
+        } finally {
+          await rm(dir, { recursive: true, force: true }).catch(() => {});
+        }
+      },
+    };
+  } catch (err) {
+    // Clean up the half-booted instance before the caller retries on a fresh
+    // port/dir, so a transient boot failure or port race never leaks resources.
+    await cleanup();
+    throw err;
+  }
+}
+
+async function bootEmbeddedPostgres(): Promise<TestDbHandle> {
+  const maxAttempts = 5;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await bootOnce();
+    } catch (err) {
+      lastErr = err;
+      // Backoff with jitter, then retry on a freshly probed port + temp dir.
+      await new Promise((r) => setTimeout(r, 100 * attempt + Math.floor(Math.random() * 100)));
+    }
+  }
+  const message = lastErr instanceof Error ? lastErr.message : String(lastErr);
+  throw new Error(`embedded Postgres failed to boot after ${maxAttempts} attempts: ${message}`);
 }
 
 export async function startTestDb(): Promise<TestDbHandle> {
