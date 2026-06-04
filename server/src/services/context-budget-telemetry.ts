@@ -402,6 +402,28 @@ export function buildPreambleSectionsFromContext(
     });
   }
 
+  // PR-9 §5.3 — the vetted EM passdown packet. priority-1 cacheStable so it
+  // shares the prompt-cache prefix with the handoff. The cap is TIER-AWARE per
+  // §5.2 (small=1_500, medium=4_000, large=10_000) — a flat cap would silently
+  // discard the medium/large tier budgets that em-passdown built. 1_500 is also
+  // the governed floor that survives the focused_small 12k budget: the packet is
+  // injected EVEN for small tickets.
+  const passdown = readObject(context.combynePassdownContext);
+  const passdownBody = readString(passdown?.body);
+  if (passdownBody) {
+    const passdownComplexity = readString(passdown?.complexity);
+    const passdownMaxTokens =
+      passdownComplexity === "large" ? 10_000 : passdownComplexity === "medium" ? 4_000 : 1_500;
+    out.push({
+      name: "passdown",
+      content: passdownBody,
+      priority: 1,
+      cacheStable: true,
+      truncationStrategy: "tail",
+      maxTokens: passdownMaxTokens,
+    });
+  }
+
   const memory = readObject(context.combyneMemoryPreamble);
   const memoryBody = readString(memory?.body);
   if (memoryBody) {
@@ -683,6 +705,10 @@ function writeSectionBackToContext(
     case "handoff":
       if (section.dropped) delete context.combyneHandoffBrief;
       else patch("combyneHandoffBrief", ["brief"], section.content);
+      break;
+    case "passdown":
+      if (section.dropped) delete context.combynePassdownContext;
+      else patch("combynePassdownContext", ["body"], section.content);
       break;
     case "memory":
       if (section.dropped) delete context.combyneMemoryPreamble;

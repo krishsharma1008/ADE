@@ -19,6 +19,7 @@ export type SectionName =
   | "toolResults"
   | "bootstrap"
   | "handoff"
+  | "passdown"
   | "workspace"
   | "standing"
   | "working";
@@ -159,6 +160,10 @@ export function composeBudgetedPreamble(
     "system",
     "bootstrap",
     "handoff",
+    // PR-9 §5.3 — the vetted EM passdown packet sits immediately after the
+    // handoff brief (priority-1, cacheStable) so it shares the prompt-cache
+    // prefix and is read right after the work context it accompanies.
+    "passdown",
     "skills",
     "projects",
     "memory",

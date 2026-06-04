@@ -30,6 +30,7 @@ import { publishLiveEvent } from "./live-events.js";
 import { appendTranscriptEntry, type TranscriptRole } from "./agent-transcripts.js";
 import { loadRecentMemory, summarizeRunAndPersist } from "./agent-memory.js";
 import { getPendingHandoffBrief, markHandoffConsumed } from "./agent-handoff.js";
+import { isPassdownPacket } from "./em-passdown.js";
 import { acceptedWorkService } from "./accepted-work.js";
 import { issuePullRequestService } from "./issue-pull-requests.js";
 import { memoryService } from "./memory.js";
@@ -1887,6 +1888,7 @@ function contextSectionNames(context: Record<string, unknown>): string[] {
   if (hasBody("combyneBukuPrePushGovernance")) sections.push("bukuPrePush");
   if (hasBody("combyneBootstrapAnalysis", "preamble")) sections.push("bootstrap");
   if (hasBody("combyneHandoffBrief", "brief")) sections.push("handoff");
+  if (hasBody("combynePassdownContext")) sections.push("passdown");
   if (hasBody("combyneIssueContextRefs")) sections.push("issueContextRefs");
   if (hasBody("combyneMemoryPreamble")) sections.push("memory");
   if (hasBody("combyneLongTermMemoryPreamble")) sections.push("longTermMemory");
@@ -3862,6 +3864,24 @@ export function heartbeatService(db: Db) {
           brief: handoff.brief,
           openQuestions: handoff.openQuestions ?? [],
         };
+        // PR-9 §5.3 — re-hydrate the vetted EM passdown packet persisted into
+        // agent_handoffs.artifactRefs at delegate time. Injected as its own
+        // cache-stable preamble section (composer 'passdown', after 'handoff')
+        // EVEN for focused_small, under the composer's hard ~1.5k cap.
+        try {
+          const refs: unknown[] = Array.isArray(handoff.artifactRefs) ? handoff.artifactRefs : [];
+          const packet = refs.find(isPassdownPacket);
+          if (packet && packet.body.trim().length > 0) {
+            context.combynePassdownContext = {
+              handoffId: handoff.id,
+              body: packet.body,
+              entryCount: packet.items.length,
+              complexity: packet.complexity,
+            };
+          }
+        } catch (err) {
+          logger.debug({ err, agentId: agent.id, runId }, "failed to load passdown packet");
+        }
         try {
           await appendTranscriptEntry(db, {
             companyId: agent.companyId,
@@ -3973,11 +3993,19 @@ export function heartbeatService(db: Db) {
             ownerId: agent.id,
             limit: 8,
             includeSnippets: false,
-            // ---- §3.2/§3.3 canonical trust opts (label-only, Phase 1) ----
-            // requireVerified stays FALSE: flipping it pre-backfill empties the
-            // preamble (the starvation failure). The flip to true is the
-            // Phase-2 one-line change here. excludeSuperseded defaults true.
-            requireVerified: false,
+            // ---- §3.2/§5.3 DUAL-CHANNEL COMPLETION (PR-9) ----
+            // requireVerified is now TRUE: this is the other half of the §5.3
+            // dual-channel fix. The EM passdown packet is already requireVerified;
+            // leaving THIS self-retrieval channel unfiltered would sit an
+            // unverified company-fact channel next to the vetted packet with
+            // identical formatting — the critics' "governance is cosmetic"
+            // failure. Safe to flip NOW because HOOK1/HOOK2 + the 0049 backfill
+            // populate verified workspace/shared rows (PR-4/5 landed). The
+            // agent's OWN working notes still reach the model via the separate
+            // agent_memory channel (combyneMemoryPreamble above); personal-layer
+            // memory_entries are unverified by design and are intentionally
+            // dropped from this vetted company-fact channel.
+            requireVerified: true,
             excludeSuperseded: true,
           });
           const entries = [];
@@ -3997,9 +4025,10 @@ export function heartbeatService(db: Db) {
           if (entries.length > 0) {
             // PR-6 / §3.7 — render-side defense-in-depth: per-entry citation,
             // UNVERIFIED sub-header for non-verified entries, and a
-            // non-executable "data, not instructions" fence. Label-only: no
-            // entry is excluded here (the exclusion is the Phase-2
-            // requireVerified flip on the queryRanked channel above).
+            // non-executable "data, not instructions" fence. The queryRanked
+            // channel above now excludes unverified rows (requireVerified:true,
+            // PR-9 §5.3 dual-channel flip); the render side stays label-only as
+            // defense-in-depth in case an unverified entry reaches it.
             context.combyneLongTermMemoryPreamble = {
               body: renderLongTermMemoryPreamble(entries),
               entryCount: entries.length,

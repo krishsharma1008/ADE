@@ -43,6 +43,32 @@ describe("buildPreambleSectionsFromContext", () => {
     expect(buildPreambleSectionsFromContext({})).toEqual([]);
   });
 
+  it("caps the passdown section tier-aware: small=1.5k, medium=4k, large=10k (PR-9 §5.2)", () => {
+    const sectionFor = (complexity: string) =>
+      buildPreambleSectionsFromContext({
+        combynePassdownContext: { handoffId: "h1", body: "VETTED", entryCount: 5, complexity },
+      }).find((s) => s.name === "passdown");
+
+    // a flat 1_500 cap would discard the medium/large tier budgets em-passdown built
+    expect(sectionFor("small")?.maxTokens).toBe(1_500);
+    expect(sectionFor("medium")?.maxTokens).toBe(4_000);
+    expect(sectionFor("large")?.maxTokens).toBe(10_000);
+    // unknown/missing complexity falls back to the 1_500 floor (focused_small-safe)
+    expect(sectionFor("weird")?.maxTokens).toBe(1_500);
+    // the passdown section ships immediately after handoff, cache-stable, priority 1
+    const large = sectionFor("large");
+    expect(large?.cacheStable).toBe(true);
+    expect(large?.priority).toBe(1);
+  });
+
+  it("orders the passdown section right after handoff (PR-9)", () => {
+    const names = buildPreambleSectionsFromContext({
+      combyneHandoffBrief: { brief: "HANDOFF" },
+      combynePassdownContext: { handoffId: "h1", body: "VETTED", entryCount: 2, complexity: "small" },
+    }).map((s) => s.name);
+    expect(names.indexOf("passdown")).toBe(names.indexOf("handoff") + 1);
+  });
+
   it("prefers digestBody over legacy body", () => {
     const sections = buildPreambleSectionsFromContext({
       combyneAssignedIssues: { digestBody: "NEW_DIGEST", body: "OLD" },

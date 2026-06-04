@@ -73,6 +73,52 @@ describe("composeBudgetedPreamble: cache-prefix stability", () => {
   });
 });
 
+describe("composeBudgetedPreamble: PR-9 passdown ordering", () => {
+  it("places 'passdown' immediately after 'handoff' in the stable tier", () => {
+    const handoff = section({
+      name: "handoff",
+      content: "HANDOFFMARK",
+      cacheStable: true,
+      priority: 1,
+    });
+    const passdown = section({
+      name: "passdown",
+      content: "PASSDOWNMARK",
+      cacheStable: true,
+      priority: 1,
+    });
+    const memory = section({
+      name: "memory",
+      content: "MEMORYMARK",
+      cacheStable: true,
+      priority: 3,
+    });
+    // Pass them out of order to prove the stableOrder list (not input order) wins.
+    const out = composeBudgetedPreamble([memory, passdown, handoff], {
+      budget: 2000,
+      model: MODEL,
+    });
+    const handoffIdx = out.body.indexOf("HANDOFFMARK");
+    const passdownIdx = out.body.indexOf("PASSDOWNMARK");
+    const memoryIdx = out.body.indexOf("MEMORYMARK");
+    expect(handoffIdx).toBeGreaterThanOrEqual(0);
+    expect(passdownIdx).toBeGreaterThan(handoffIdx);
+    expect(memoryIdx).toBeGreaterThan(passdownIdx);
+  });
+
+  it("passdown is cacheStable — it shares the prompt-cache prefix", () => {
+    const passdown = section({
+      name: "passdown",
+      content: "VETTED_PACKET_BODY",
+      cacheStable: true,
+      priority: 1,
+    });
+    const focus = section({ name: "focus", content: "VARY", priority: 0 });
+    const out = composeBudgetedPreamble([passdown, focus], { budget: 2000, model: MODEL });
+    expect(out.cachePrefix).toContain("VETTED_PACKET_BODY");
+  });
+});
+
 describe("composeBudgetedPreamble: priority-based dropping", () => {
   it("drops lowest-priority vary section first when over budget", () => {
     const long = "word ".repeat(2000);

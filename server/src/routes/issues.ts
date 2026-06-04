@@ -1227,6 +1227,17 @@ export function issueRoutes(db: Db, storage: StorageService) {
     const labelIds = Array.isArray(req.body?.labelIds)
       ? (req.body.labelIds as unknown[]).filter((v): v is string => typeof v === "string")
       : undefined;
+    // PR-9: EM-pinned curated memory ids + explicit service scope drive the
+    // vetted passdown packet assembled in createHandoff.
+    const serviceScope =
+      typeof req.body?.serviceScope === "string" && req.body.serviceScope.trim()
+        ? req.body.serviceScope.trim()
+        : null;
+    const curatedMemoryEntryIds = Array.isArray(req.body?.curatedMemoryEntryIds)
+      ? (req.body.curatedMemoryEntryIds as unknown[]).filter(
+          (v): v is string => typeof v === "string",
+        )
+      : undefined;
 
     if (!toAgentId || !title) {
       res.status(400).json({ error: "toAgentId and title are required" });
@@ -1251,6 +1262,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       status: "in_progress",
       priority,
       complexity,
+      serviceScope: serviceScope ?? undefined,
       parentId: parent.id,
       assigneeAgentId: toAgentId,
       createdByAgentId: actor.actorType === "agent" ? actor.agentId ?? null : null,
@@ -1267,6 +1279,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
       issueId: created.id,
       fromAgentId: fromAgentId ?? null,
       toAgentId,
+      complexity,
+      serviceScope,
+      curatedMemoryEntryIds,
     });
 
     await safeCaptureIssueContextRefs({

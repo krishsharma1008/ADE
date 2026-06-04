@@ -409,6 +409,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (handoffBrief.length > 0) {
     preambleSegments.push(`# Handoff brief from prior agent\n\n${handoffBrief}`);
   }
+  // PR-9 §5.3 — vetted EM passdown packet, immediately after the handoff brief.
+  const passdown = parseObject(context.combynePassdownContext);
+  const passdownBody = asString(passdown.body, "").trim();
+  if (passdownBody.length > 0) {
+    preambleSegments.push(passdownBody);
+  }
   const memory = parseObject(context.combyneMemoryPreamble);
   const memoryBody = asString(memory.body, "").trim();
   if (memoryBody.length > 0) {

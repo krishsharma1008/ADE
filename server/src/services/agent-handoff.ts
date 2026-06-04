@@ -1,9 +1,11 @@
 import { and, desc, eq, isNull } from "drizzle-orm";
 import type { Db } from "@combyne/db";
+import type { IssueComplexity } from "@combyne/shared";
 import { agentHandoffs, agents, issueComments, issues } from "@combyne/db";
 import { logger } from "../middleware/logger.js";
 import { loadRecentMemory } from "./agent-memory.js";
 import { loadRecentTranscript } from "./agent-transcripts.js";
+import { passdownService, type PassdownPacket } from "./em-passdown.js";
 
 export interface CreateHandoffInput {
   companyId: string;
@@ -12,6 +14,12 @@ export interface CreateHandoffInput {
   toAgentId: string;
   fromRunId?: string | null;
   openQuestions?: string[];
+  /** PR-9: ticket complexity tier driving the passdown packet size budget. */
+  complexity?: IssueComplexity | null;
+  /** PR-9: explicit retrieval target (issues.service_scope) for the passdown packet. */
+  serviceScope?: string | null;
+  /** PR-9: EM-pinned escape-hatch memory entry ids unioned into the packet. */
+  curatedMemoryEntryIds?: string[];
 }
 
 interface BuildBriefInput {
@@ -19,7 +27,14 @@ interface BuildBriefInput {
   issueId: string;
   fromAgentId: string | null;
   toAgentId: string;
+  /** PR-9: pre-built vetted passdown packet embedded into the brief markdown. */
+  passdown?: PassdownPacket | null;
 }
+
+// Adapter types whose execute.ts reads context.combynePassdownContext directly
+// (and thus get the vetted packet via the tier-capped composer section). The
+// brief-fallback adapters NOT in this set receive the packet embedded in the brief.
+const PASSDOWN_SECTION_ADAPTERS = new Set<string>(["claude_local", "codex_local"]);
 
 async function buildBriefMarkdown(db: Db, input: BuildBriefInput): Promise<{
   brief: string;
@@ -86,6 +101,18 @@ async function buildBriefMarkdown(db: Db, input: BuildBriefInput): Promise<{
     }
   }
 
+  // PR-9 §5.3 brief-fallback: adapters that read context.combynePassdownContext
+  // directly (claude_local/codex_local) get the packet via the composer section
+  // — which also enforces the tier cap — so embedding it in the brief too would
+  // double-inject AND let the full untruncated copy escape the cap in the
+  // cache-stable prefix. Embed in the brief ONLY for the brief-fallback adapters
+  // (cursor/gemini/opencode/pi/process) that never see the section.
+  const targetReadsPassdownSection = PASSDOWN_SECTION_ADAPTERS.has(toAgentRow?.adapterType ?? "");
+  if (input.passdown && input.passdown.body.trim().length > 0 && !targetReadsPassdownSection) {
+    lines.push("");
+    lines.push(input.passdown.body.trim());
+  }
+
   const openQuestions: string[] = [];
   if (memory.length > 0) {
     lines.push("");
@@ -142,12 +169,51 @@ async function buildBriefMarkdown(db: Db, input: BuildBriefInput): Promise<{
 
 export async function createHandoff(db: Db, input: CreateHandoffInput) {
   try {
+    // PR-9 §5.1: assemble the vetted passdown packet at delegate time. The
+    // packet retrieves [shared,workspace] requireVerified entries keyed on the
+    // child ticket and unions the EM-pinned curated ids, budgeted by complexity.
+    // It is persisted into the (previously always-[]) artifactRefs jsonb and is
+    // ALSO embedded into the brief markdown for the brief-fallback adapters.
+    let passdown: PassdownPacket | null = null;
+    try {
+      const [child] = await db
+        .select({ title: issues.title, description: issues.description, serviceScope: issues.serviceScope })
+        .from(issues)
+        .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+        .limit(1);
+      if (child) {
+        const serviceScope = input.serviceScope ?? child.serviceScope ?? null;
+        passdown = await passdownService(db).buildPassdownPacket({
+          companyId: input.companyId,
+          childIssueId: input.issueId,
+          title: child.title,
+          description: child.description,
+          serviceScope,
+          complexity: input.complexity ?? "small",
+          curatedMemoryEntryIds: input.curatedMemoryEntryIds,
+        });
+      }
+    } catch (err) {
+      // A passdown failure must never block the handoff itself.
+      logger.warn({ err, issueId: input.issueId }, "buildPassdownPacket failed");
+      passdown = null;
+    }
+
     const { brief, openQuestions } = await buildBriefMarkdown(db, {
       companyId: input.companyId,
       issueId: input.issueId,
       fromAgentId: input.fromAgentId ?? null,
       toAgentId: input.toAgentId,
+      passdown,
     });
+
+    // Persist the typed packet into the existing-but-unused artifactRefs jsonb
+    // (zero schema migration). Empty packets are stored as [] so downstream
+    // re-hydration stays a simple "first artifactRef of kind passdown" lookup.
+    const artifactRefs: Record<string, unknown>[] =
+      passdown && passdown.items.length > 0
+        ? [passdown as unknown as Record<string, unknown>]
+        : [];
 
     const [row] = await db
       .insert(agentHandoffs)
@@ -159,7 +225,7 @@ export async function createHandoff(db: Db, input: CreateHandoffInput) {
         fromRunId: input.fromRunId ?? null,
         brief,
         openQuestions: input.openQuestions ?? openQuestions,
-        artifactRefs: [],
+        artifactRefs,
       })
       .returning();
     return row ?? null;
