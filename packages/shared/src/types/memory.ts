@@ -140,3 +140,50 @@ export interface MemoryPromotion {
   createdAt: string;
   decidedAt: string | null;
 }
+
+/**
+ * PR-14 — a single capture-inbox row: a freshly-captured human-answer /
+ * pr-approval entry awaiting human Confirm/Edit/Dismiss. `citation` is the
+ * source-ref the capture hook stamped (issue#/PR#/comment#) so the reviewer can
+ * trace it back to where the answer was given.
+ */
+export interface MemoryCaptureItem {
+  entry: MemoryEntry;
+  /** Human-readable source citation, e.g. "issue #ABC-12" / "PR #42" / "comment-9". */
+  citation: string | null;
+}
+
+/**
+ * PR-14 — a single verify-queue row. Either an agent-claim entry (with its
+ * distinct-issue reuse count — the §3 hybrid-SLA signal) or a pending promotion
+ * proposal. The discriminant is `kind`.
+ */
+export type MemoryVerifyItem =
+  | {
+      kind: "agent-claim";
+      entry: MemoryEntry;
+      /** Number of DISTINCT issues this entry has been reused across (reuse evidence). */
+      distinctIssueReuse: number;
+    }
+  | {
+      kind: "promotion";
+      promotion: MemoryPromotion;
+    };
+
+/**
+ * PR-14 — the first-class conflict surface (decision #5). A group of >1 distinct
+ * human-answer entries that share a `subjectKey`. `entries` are the conflicting
+ * (non-superseded) rows; `newestByThatUserId` is the id the resolver
+ * pre-highlights (the user's exact ask: default-surface the newest entry that
+ * user pushed, NOT silent newest-wins).
+ */
+export interface MemoryConflictGroup {
+  subjectKey: string;
+  subject: string;
+  entries: MemoryEntry[];
+  /** Id of the entry pre-highlighted in the resolver (newest, broken by recency). */
+  newestByThatUserId: string;
+}
+
+export const MEMORY_CONFLICT_ACTIONS = ["override", "merge", "edit"] as const;
+export type MemoryConflictAction = (typeof MEMORY_CONFLICT_ACTIONS)[number];

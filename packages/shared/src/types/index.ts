@@ -227,6 +227,7 @@ export {
   MEMORY_AUTHOR_TYPES,
   MEMORY_SOURCE_REF_TYPES,
   MEMORY_PROMOTION_STATES,
+  MEMORY_CONFLICT_ACTIONS,
 } from "./memory.js";
 export type {
   MemoryLayer,
@@ -244,6 +245,10 @@ export type {
   MemoryManifest,
   MemoryCoreContext,
   MemoryPromotion,
+  MemoryCaptureItem,
+  MemoryVerifyItem,
+  MemoryConflictGroup,
+  MemoryConflictAction,
 } from "./memory.js";
 export {
   ACCEPTED_WORK_MEMORY_STATUSES,

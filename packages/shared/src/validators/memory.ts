@@ -110,3 +110,21 @@ export const memoryDecidePromotionSchema = z.object({
   reviewNotes: z.string().max(2048).optional().nullable(),
 });
 export type MemoryDecidePromotion = z.infer<typeof memoryDecidePromotionSchema>;
+
+/**
+ * PR-14 conflict resolution (the first-class merge/override ask, decision #5).
+ *  - override: `canonicalEntryId` wins, every other entry in the group is
+ *    superseded to it.
+ *  - merge: a NEW canonical entry is written from `body`; ALL originals in the
+ *    group are superseded to it (losers preserved for audit).
+ *  - edit: `canonicalEntryId`'s body is rewritten to `body` and the rest are
+ *    superseded to it.
+ * canonicalEntryId is required for override/edit; body is required for
+ * merge/edit. The service re-validates this cross-field shape.
+ */
+export const memoryResolveConflictSchema = z.object({
+  action: z.enum(["override", "merge", "edit"]),
+  canonicalEntryId: z.string().uuid().optional(),
+  body: z.string().min(1).max(20_000).optional(),
+});
+export type MemoryResolveConflict = z.infer<typeof memoryResolveConflictSchema>;

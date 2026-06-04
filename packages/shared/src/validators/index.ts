@@ -342,6 +342,7 @@ export {
   memoryRecordUsageSchema,
   memoryProposePromotionSchema,
   memoryDecidePromotionSchema,
+  memoryResolveConflictSchema,
   type CreateMemoryEntry,
   type UpdateMemoryEntry,
   type MemoryQuery,
@@ -350,6 +351,7 @@ export {
   type MemoryRecordUsage,
   type MemoryProposePromotion,
   type MemoryDecidePromotion,
+  type MemoryResolveConflict,
 } from "./memory.js";
 export {
   acceptedWorkSimulateMergeSchema,

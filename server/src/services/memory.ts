@@ -21,6 +21,8 @@ import type {
   MemoryManifestItem,
   MemoryCoreContext,
   MemoryPromotion,
+  MemoryVerifyItem,
+  MemoryConflictGroup,
 } from "@combyne/shared";
 import type { MemoryEmbedder, EmbedForStorageResult } from "./memory-embedder.js";
 import {
@@ -315,6 +317,25 @@ function rowToEntry(row: MemoryEntryRow): MemoryEntry {
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
+}
+
+/**
+ * Human-readable source citation for the Capture inbox (§3.3). Prefers the
+ * structured source-ref the capture hook stamped (e.g. issue/PR/comment), then
+ * falls back to the free-text `source` string. Returns null when neither exists.
+ */
+function formatCitation(entry: MemoryEntry): string | null {
+  if (entry.sourceRefType && entry.sourceRefId) {
+    const label =
+      entry.sourceRefType === "issue"
+        ? "issue"
+        : entry.sourceRefType === "pr"
+          ? "PR"
+          : entry.sourceRefType;
+    return `${label} #${entry.sourceRefId}`;
+  }
+  if (entry.source) return entry.source;
+  return null;
 }
 
 export interface CreateEntryInput {
@@ -1204,6 +1225,295 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     return rowToEntry(row);
   }
 
+  // ---------- PR-14: Capture / Verify / Conflicts ----------
+
+  /**
+   * Capture inbox (§3.3): freshly-captured human-tier entries awaiting a human
+   * Confirm/Edit/Dismiss. These are the rows the capture hooks stamped with a
+   * human-answer / pr-approval provenance. We surface a readable `citation`
+   * from the source-ref the hook recorded so the reviewer can trace it back.
+   */
+  async function captureInbox(companyId: string): Promise<
+    Array<{ entry: MemoryEntry; citation: string | null }>
+  > {
+    const rows = await cdb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.status, "active"),
+          inArray(memoryEntries.provenance, ["human-answer", "pr-approval"]),
+          isNull(memoryEntries.supersededById),
+          // Captured entries are born verified (verifiedBy is null until a human
+          // acts). The inbox shows only the not-yet-human-acknowledged ones; the
+          // Confirm action calls verifyEntry, which stamps verifiedBy and drains it.
+          isNull(memoryEntries.verifiedBy),
+        ),
+      )
+      .orderBy(desc(memoryEntries.createdAt))
+      .limit(100);
+    return rows.map((row) => {
+      const entry = rowToEntry(row);
+      return { entry, citation: formatCitation(entry) };
+    });
+  }
+
+  /**
+   * Verify queue (§3.4 hybrid SLA, decision #3): two streams folded into one
+   * list — (a) agent-claim entries with their DISTINCT-issue reuse count (the
+   * §3 hybrid reuse signal a board user weighs before verifying), and (b) the
+   * pending promotion proposals (decided via the existing decidePromotion).
+   */
+  async function verifyQueue(companyId: string): Promise<MemoryVerifyItem[]> {
+    const claimRows = await cdb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.status, "active"),
+          eq(memoryEntries.provenance, "agent-claim"),
+          eq(memoryEntries.verificationState, "unverified"),
+          isNull(memoryEntries.supersededById),
+        ),
+      )
+      .orderBy(desc(memoryEntries.usageCount), desc(memoryEntries.updatedAt))
+      .limit(100);
+
+    // Distinct-issue reuse per entry, counted from memory_usage. A NULL issueId
+    // (usage not tied to an issue) does not contribute to the distinct count.
+    const reuseByEntry = new Map<string, number>();
+    if (claimRows.length > 0) {
+      const reuseRows = (await cdb
+        .select({
+          entryId: memoryUsage.entryId,
+          distinctIssues: sql<number>`count(distinct ${memoryUsage.issueId})`,
+        })
+        .from(memoryUsage)
+        .where(
+          and(
+            eq(memoryUsage.companyId, companyId),
+            inArray(
+              memoryUsage.entryId,
+              claimRows.map((r) => r.id),
+            ),
+          ),
+        )
+        .groupBy(memoryUsage.entryId)) as Array<{ entryId: string; distinctIssues: number }>;
+      for (const r of reuseRows) {
+        reuseByEntry.set(r.entryId, Number(r.distinctIssues));
+      }
+    }
+
+    const claimItems: MemoryVerifyItem[] = claimRows.map((row) => ({
+      kind: "agent-claim" as const,
+      entry: rowToEntry(row),
+      distinctIssueReuse: reuseByEntry.get(row.id) ?? 0,
+    }));
+    const promotions = await listPromotions(companyId, "pending");
+    const promotionItems: MemoryVerifyItem[] = promotions.map((promotion) => ({
+      kind: "promotion" as const,
+      promotion,
+    }));
+    return [...claimItems, ...promotionItems];
+  }
+
+  /**
+   * Board verify action (§3.4): stamp an entry verified. assertBoard is enforced
+   * at the route — here we only mutate. Mirrors the createSharedFromPromotion
+   * trust stamp: verificationState='verified', verifiedBy/verifiedAt set. A
+   * needs_review (redaction-quarantined) entry is NOT verifiable through here.
+   */
+  async function verifyEntry(
+    id: string,
+    verifiedBy: string,
+  ): Promise<MemoryEntry | null> {
+    const existing = await getEntry(id);
+    if (!existing) return null;
+    if (existing.verificationState === "needs_review") {
+      throw new Error("needs_review entries must clear redaction before verification");
+    }
+    const [row] = await cdb
+      .update(memoryEntries)
+      .set({
+        verificationState: "verified",
+        verifiedBy,
+        verifiedAt: new Date(),
+        confidence: Math.max(existing.confidence, 0.7),
+        updatedAt: new Date(),
+      })
+      .where(eq(memoryEntries.id, id))
+      .returning();
+    return row ? rowToEntry(row) : null;
+  }
+
+  /**
+   * Detected conflicts (§3.5, decision #5 — THE first-class ask). Groups active,
+   * non-superseded human-answer entries by subjectKey, keeping only the groups
+   * with >1 DISTINCT body (a real disagreement, not an idempotent duplicate).
+   * Each group pre-computes `newestByThatUserId` — the newest entry by updatedAt
+   * — which the resolver pre-highlights (default-surface, NOT silent newest-wins).
+   *
+   * Labeled "Detected conflicts" because subjectKey normalization is conservative
+   * (tokenize() only) and under-reports paraphrases (CENTRAL_CONTEXT_DB_PLAN §3.6).
+   */
+  async function listConflicts(companyId: string): Promise<MemoryConflictGroup[]> {
+    const rows = await cdb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.status, "active"),
+          eq(memoryEntries.provenance, "human-answer"),
+          isNull(memoryEntries.supersededById),
+        ),
+      )
+      .orderBy(desc(memoryEntries.updatedAt));
+
+    const byKey = new Map<string, MemoryEntryRow[]>();
+    for (const row of rows) {
+      if (!row.subjectKey) continue;
+      const list = byKey.get(row.subjectKey) ?? [];
+      list.push(row);
+      byKey.set(row.subjectKey, list);
+    }
+
+    const groups: MemoryConflictGroup[] = [];
+    for (const [subjectKey, group] of byKey) {
+      const distinctBodies = new Set(group.map((r) => r.body.trim()));
+      if (distinctBodies.size < 2) continue; // not a real conflict — duplicate bodies
+      const entries = group.map(rowToEntry);
+      // Newest by updatedAt (rows already desc-ordered, so [0] is newest).
+      const newest = group.reduce((a, b) =>
+        b.updatedAt.getTime() > a.updatedAt.getTime() ? b : a,
+      );
+      groups.push({
+        subjectKey,
+        subject: newest.subject,
+        entries,
+        newestByThatUserId: newest.id,
+      });
+    }
+    return groups;
+  }
+
+  /**
+   * Resolve a detected conflict (§3.5). assertBoard is enforced at the route.
+   *  - override: canonicalEntryId wins; every other group member is superseded to it.
+   *  - merge: write a BRAND-NEW canonical shared-tier-equivalent workspace entry
+   *    from `body`, then supersede ALL originals to it (losers preserved for audit).
+   *  - edit: rewrite canonicalEntryId's body to `body`; supersede the rest to it.
+   * Returns the canonical (winning) entry, or null if the group/canonical is invalid.
+   */
+  async function resolveConflict(input: {
+    companyId: string;
+    subjectKey: string;
+    action: "override" | "merge" | "edit";
+    canonicalEntryId?: string;
+    body?: string;
+    resolvedBy: string;
+  }): Promise<MemoryEntry | null> {
+    // Re-derive the live conflict group so a stale client can't supersede rows
+    // outside the group it saw.
+    const groupRows = await cdb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, input.companyId),
+          eq(memoryEntries.status, "active"),
+          eq(memoryEntries.subjectKey, input.subjectKey),
+          eq(memoryEntries.provenance, "human-answer"),
+          isNull(memoryEntries.supersededById),
+        ),
+      );
+    if (groupRows.length === 0) return null;
+    const originalIds = groupRows.map((r) => r.id);
+    const sample = groupRows[0];
+
+    if (input.action === "merge") {
+      if (!input.body) throw new Error("merge requires a body");
+      // Brand-new canonical row carrying the merged body. Human-tier provenance
+      // is legitimate here because a board principal authored the merge.
+      const embedResult = await embedder.embedForStorage(sample.subject, input.body);
+      const verificationState: MemoryVerificationState =
+        embedResult.redactedFindings.length > 0 ? "needs_review" : "verified";
+      const [canonical] = await cdb
+        .insert(memoryEntries)
+        .values({
+          companyId: input.companyId,
+          layer: sample.layer,
+          subject: sample.subject,
+          body: input.body,
+          kind: sample.kind,
+          tags: sample.tags as string[],
+          serviceScope: sample.serviceScope,
+          embedding: embedResult.vector,
+          embeddingVersion: embedResult.version,
+          provenance: "human-answer",
+          verificationState,
+          confidence: 0.9,
+          authorType: "user",
+          authorId: input.resolvedBy,
+          subjectKey: input.subjectKey,
+          verifiedBy: input.resolvedBy,
+          verifiedAt: new Date(),
+          createdBy: input.resolvedBy,
+        })
+        .returning();
+      await writeVectorColumns(canonical.id, {
+        vector: embedResult.vector,
+        version: embedResult.version,
+        model: embedResult.model,
+        contentHash: embedResult.contentHash,
+      });
+      // Supersede BOTH (all) originals to the new canonical — preserved for audit.
+      await cdb
+        .update(memoryEntries)
+        .set({ supersededById: canonical.id, updatedAt: new Date() })
+        .where(inArray(memoryEntries.id, originalIds));
+      return rowToEntry(canonical);
+    }
+
+    // override / edit both need a canonical that lives in this group.
+    if (!input.canonicalEntryId || !originalIds.includes(input.canonicalEntryId)) {
+      throw new Error("canonicalEntryId must be one of the conflicting entries");
+    }
+    const canonicalId = input.canonicalEntryId;
+
+    if (input.action === "edit") {
+      if (!input.body) throw new Error("edit requires a body");
+      await updateEntry(canonicalId, { body: input.body });
+      // updateEntry re-runs the redact-before-embed scan and may quarantine the
+      // entry to needs_review if the new body trips it. Never force-verify over a
+      // redaction quarantine — only stamp verified when the edited entry is clean.
+      const edited = await getEntry(canonicalId);
+      if (edited && edited.verificationState !== "needs_review") {
+        await cdb
+          .update(memoryEntries)
+          .set({
+            verificationState: "verified",
+            verifiedBy: input.resolvedBy,
+            verifiedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(memoryEntries.id, canonicalId));
+      }
+    }
+
+    // Supersede every OTHER group member to the canonical (losers kept for audit).
+    const loserIds = originalIds.filter((id) => id !== canonicalId);
+    if (loserIds.length > 0) {
+      await cdb
+        .update(memoryEntries)
+        .set({ supersededById: canonicalId, updatedAt: new Date() })
+        .where(inArray(memoryEntries.id, loserIds));
+    }
+    return getEntry(canonicalId);
+  }
+
   // ---------- Decay ----------
 
   /**
@@ -1387,6 +1697,11 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     proposePromotion,
     listPromotions,
     decidePromotion,
+    captureInbox,
+    verifyQueue,
+    verifyEntry,
+    listConflicts,
+    resolveConflict,
     runDecayPass,
     runAutoDistill,
     embeddingStatus,

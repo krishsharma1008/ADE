@@ -9,6 +9,7 @@ import {
   memoryRecordUsageSchema,
   memoryProposePromotionSchema,
   memoryDecidePromotionSchema,
+  memoryResolveConflictSchema,
   MEMORY_PROVENANCES,
   MEMORY_VERIFICATION_STATES,
   type MemoryOwnerType,
@@ -413,6 +414,107 @@ export function memoryRoutes(db: Db) {
         details: { reviewNotes: body.reviewNotes ?? null },
       });
       res.json(promotion);
+    },
+  );
+
+  // ---------- PR-14: Capture / Verify / Conflicts ----------
+
+  // Capture inbox (§3.3): human-tier entries awaiting Confirm/Edit/Dismiss.
+  router.get("/companies/:companyId/memory/capture-inbox", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const items = await svc.captureInbox(companyId);
+    res.json(items);
+  });
+
+  // Verify queue (§3.4 hybrid SLA): agent-claims + reuse evidence + promotions.
+  router.get("/companies/:companyId/memory/verify-queue", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const items = await svc.verifyQueue(companyId);
+    res.json(items);
+  });
+
+  // Board verify action (§3.4): stamp an entry verified. Board-only.
+  router.post("/memory/entries/:id/verify", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getEntry(id);
+    if (!existing) {
+      res.status(404).json({ error: "Memory entry not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+    assertBoard(req);
+    const actor = getActorInfo(req);
+    const verified = await svc.verifyEntry(id, actor.actorId);
+    if (!verified) {
+      res.status(404).json({ error: "Memory entry not found" });
+      return;
+    }
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      action: "memory.entry.verified",
+      entityType: "memory_entry",
+      entityId: id,
+    });
+    res.json(verified);
+  });
+
+  // Detected conflicts (§3.5, the first-class ask): subjectKey groups with >1
+  // distinct human-answer body.
+  router.get("/companies/:companyId/memory/conflicts", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const groups = await svc.listConflicts(companyId);
+    res.json(groups);
+  });
+
+  // Resolve a detected conflict (§3.5): override / merge / edit. Board-only.
+  // MERGE writes a NEW canonical and supersedes BOTH originals (audit-preserving).
+  router.post(
+    "/companies/:companyId/memory/conflicts/:subjectKey/resolve",
+    validate(memoryResolveConflictSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      assertBoard(req);
+      const subjectKey = req.params.subjectKey as string;
+      const actor = getActorInfo(req);
+      const body = req.body as ReturnType<typeof memoryResolveConflictSchema.parse>;
+      let canonical;
+      try {
+        canonical = await svc.resolveConflict({
+          companyId,
+          subjectKey,
+          action: body.action,
+          canonicalEntryId: body.canonicalEntryId,
+          body: body.body,
+          resolvedBy: actor.actorId,
+        });
+      } catch (err) {
+        res.status(400).json({
+          error: err instanceof Error ? err.message : "Failed to resolve conflict",
+        });
+        return;
+      }
+      if (!canonical) {
+        res.status(404).json({ error: "No active conflict for that subject" });
+        return;
+      }
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: `memory.conflict.${body.action}`,
+        entityType: "memory_entry",
+        entityId: canonical.id,
+        details: { subjectKey },
+      });
+      res.json(canonical);
     },
   );
 

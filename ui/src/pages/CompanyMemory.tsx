@@ -12,16 +12,19 @@ import { memoryApi } from "../api/memory";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
 import { MemoryBrowse } from "./memory/MemoryBrowse";
+import { MemoryCaptureReview } from "./memory/MemoryCaptureReview";
+import { MemoryVerifyQueue } from "./memory/MemoryVerifyQueue";
+import { MemoryConflicts } from "./memory/MemoryConflicts";
 
 function formatDate(value: string | null) {
   if (!value) return "Never";
   return new Date(value).toLocaleString();
 }
 
-// Path-driven tabs (mirrors Approvals.tsx). PR-13 ships only the Browse tab;
-// later slices (PR-14..16) add capture/verify/conflicts/setup/redaction/
-// questions/passdown alongside it.
-const TABS = ["browse"] as const;
+// Path-driven tabs (mirrors Approvals.tsx). PR-13 shipped Browse; PR-14 adds the
+// capture/verify/conflicts queues. Later slices (PR-15..16) add setup/redaction/
+// questions/passdown alongside them.
+const TABS = ["browse", "capture", "verify", "conflicts"] as const;
 type MemoryTab = (typeof TABS)[number];
 
 function resolveTab(segment: string | undefined): MemoryTab {
@@ -92,11 +95,22 @@ export function CompanyMemory() {
       </div>
 
       <Tabs value={tab} onValueChange={(v) => navigate(`/memory/${v}`)}>
-        <PageTabBar items={[{ value: "browse", label: "Browse" }]} />
+        <PageTabBar
+          items={[
+            { value: "browse", label: "Browse" },
+            { value: "capture", label: "Capture" },
+            { value: "verify", label: "Verify" },
+            { value: "conflicts", label: "Conflicts" },
+          ]}
+        />
       </Tabs>
 
       {tab === "browse" && <MemoryBrowse />}
+      {tab === "capture" && <MemoryCaptureReview />}
+      {tab === "verify" && <MemoryVerifyQueue />}
+      {tab === "conflicts" && <MemoryConflicts />}
 
+      {tab === "browse" && (
       <section>
         <div className="mb-2 flex items-center gap-2">
           <GitPullRequest className="h-4 w-4 text-muted-foreground" />
@@ -137,6 +151,7 @@ export function CompanyMemory() {
           )}
         </div>
       </section>
+      )}
     </div>
   );
 }

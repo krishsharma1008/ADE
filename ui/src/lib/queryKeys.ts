@@ -86,6 +86,9 @@ export const queryKeys = {
     browse: (companyId: string, filters?: object) =>
       ["memory", companyId, "browse", filters ?? {}] as const,
     acceptedWork: (companyId: string) => ["memory", companyId, "accepted-work"] as const,
+    captureInbox: (companyId: string) => ["memory", companyId, "capture-inbox"] as const,
+    verifyQueue: (companyId: string) => ["memory", companyId, "verify-queue"] as const,
+    conflicts: (companyId: string) => ["memory", companyId, "conflicts"] as const,
   },
   qa: {
     summary: (companyId: string) => ["qa", companyId, "summary"] as const,

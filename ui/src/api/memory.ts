@@ -1,10 +1,14 @@
 import type {
   AcceptedWorkEvent,
   CreateMemoryEntry,
+  MemoryCaptureItem,
+  MemoryConflictAction,
+  MemoryConflictGroup,
   MemoryEntry,
   MemoryLayer,
   MemoryProvenance,
   MemoryVerificationState,
+  MemoryVerifyItem,
   UpdateMemoryEntry,
 } from "@combyne/shared";
 import { api } from "./client";
@@ -58,4 +62,25 @@ export const memoryApi = {
       mergedAt?: string | null;
     },
   ) => api.post<AcceptedWorkEvent>(`/companies/${companyId}/accepted-work/simulate-merge`, data),
+
+  // ---------- PR-14: Capture / Verify / Conflicts ----------
+  listCaptureInbox: (companyId: string) =>
+    api.get<MemoryCaptureItem[]>(`/companies/${companyId}/memory/capture-inbox`),
+  listVerifyQueue: (companyId: string) =>
+    api.get<MemoryVerifyItem[]>(`/companies/${companyId}/memory/verify-queue`),
+  verifyEntry: (entryId: string) =>
+    api.post<MemoryEntry>(`/memory/entries/${entryId}/verify`, {}),
+  decidePromotion: (promotionId: string, decision: "approved" | "rejected") =>
+    api.post(`/memory/promotions/${promotionId}/decide`, { decision }),
+  listConflicts: (companyId: string) =>
+    api.get<MemoryConflictGroup[]>(`/companies/${companyId}/memory/conflicts`),
+  resolveConflict: (
+    companyId: string,
+    subjectKey: string,
+    payload: { action: MemoryConflictAction; canonicalEntryId?: string; body?: string },
+  ) =>
+    api.post<MemoryEntry>(
+      `/companies/${companyId}/memory/conflicts/${encodeURIComponent(subjectKey)}/resolve`,
+      payload,
+    ),
 };
