@@ -18,7 +18,7 @@ export const createMemoryEntrySchema = z
     serviceScope: z.string().max(128).optional().nullable(),
     source: z.string().max(512).optional().nullable(),
     ownerType: z.enum(MEMORY_OWNER_TYPES).optional().nullable(),
-    ownerId: z.string().uuid().optional().nullable(),
+    ownerId: z.string().min(1).max(128).optional().nullable(),
     ttlDays: z.number().int().positive().max(3650).optional().nullable(),
   })
   .refine(
@@ -54,7 +54,7 @@ export const memoryQuerySchema = z.object({
   query: z.string().min(1).max(2048),
   layers: z.array(z.enum(MEMORY_LAYERS)).optional(),
   serviceScope: z.string().max(128).optional(),
-  ownerId: z.string().uuid().optional(),
+  ownerId: z.string().min(1).max(128).optional(),
   ownerType: z.enum(MEMORY_OWNER_TYPES).optional(),
   limit: z.number().int().positive().max(50).optional().default(10),
   includeSnippets: z.boolean().optional().default(true),
@@ -63,7 +63,7 @@ export type MemoryQuery = z.infer<typeof memoryQuerySchema>;
 
 export const memoryManifestQuerySchema = z.object({
   taskId: z.string().uuid().optional(),
-  ownerId: z.string().uuid().optional(),
+  ownerId: z.string().min(1).max(128).optional(),
   ownerType: z.enum(MEMORY_OWNER_TYPES).optional(),
   serviceScope: z.string().max(128).optional(),
   limit: z.number().int().positive().max(50).optional().default(15),

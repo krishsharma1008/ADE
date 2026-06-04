@@ -286,6 +286,40 @@ describe("memory service (4-layer)", () => {
     expect(personalForBob.every((e) => e.ownerId === agentBId)).toBe(true);
   });
 
+  it("accepts a non-uuid ownerId for personal entries and owner-fences it", async () => {
+    const svc = memoryService(handle.db);
+    // owner_id is now text: a non-uuid principal like the local board must work.
+    const boardEntry = await svc.createEntry({
+      companyId,
+      layer: "personal",
+      ownerType: "user",
+      ownerId: "local-board",
+      subject: "local board private note nonUuidOwnerSentinel",
+      body: "nonUuidOwnerSentinel only the local-board principal should see this",
+      tags: ["board"],
+    });
+    expect(boardEntry.layer).toBe("personal");
+    expect(boardEntry.ownerId).toBe("local-board");
+
+    // The local-board principal sees its own personal entry.
+    const asBoard = await svc.queryRanked(companyId, "nonUuidOwnerSentinel", {
+      ownerType: "user",
+      ownerId: "local-board",
+      limit: 10,
+    });
+    expect(asBoard.items.some((i) => i.id === boardEntry.id)).toBe(true);
+
+    // Owner-fence isolation: a different principal (agent A) must NOT see it.
+    // The personal fence is an exact string match on r.ownerId === opts.ownerId,
+    // so 'local-board' is excluded for the agent owner.
+    const asOtherPrincipal = await svc.queryRanked(companyId, "nonUuidOwnerSentinel", {
+      ownerType: "agent",
+      ownerId: agentId,
+      limit: 10,
+    });
+    expect(asOtherPrincipal.items.some((i) => i.id === boardEntry.id)).toBe(false);
+  });
+
   it("queryRanked excludes archived entries", async () => {
     const svc = memoryService(handle.db);
     const e = await svc.createEntry({

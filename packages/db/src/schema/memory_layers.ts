@@ -34,7 +34,7 @@ export const memoryEntries = pgTable(
       .references(() => companies.id, { onDelete: "cascade" }),
     layer: text("layer").notNull(), // 'workspace' | 'personal' | 'shared'
     ownerType: text("owner_type"), // 'user' | 'agent' | null (workspace/shared)
-    ownerId: uuid("owner_id"),
+    ownerId: text("owner_id"), // principal id; not always a uuid (e.g. 'local-board')
     subject: text("subject").notNull(),
     body: text("body").notNull(),
     kind: text("kind").notNull().default("fact"), // fact | runbook | convention | pointer | note
