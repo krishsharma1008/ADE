@@ -18,6 +18,26 @@ describe("memory ranker (pure)", () => {
     expect(cosineSimilarity(q, close)).toBeGreaterThan(cosineSimilarity(q, far));
   });
 
+  it("weights semantic-dominant for a real query embedding, lexical-primary for hash", () => {
+    const qVec = [1, 0, 0, 0];
+    const updatedAt = new Date("2026-01-01T00:00:00Z");
+    // entry "lex": full lexical overlap with the query, embedding far from it.
+    // entry "sem": zero lexical overlap, embedding identical to the query vector.
+    const mk = (version: string) => [
+      { id: "lex", layer: "workspace" as const, subject: "budget pause policy", body: "", tags: [], embedding: [0, 1, 0, 0], embeddingVersion: version, lastUsedAt: null, updatedAt },
+      { id: "sem", layer: "workspace" as const, subject: "zzz qqq www", body: "", tags: [], embedding: [1, 0, 0, 0], embeddingVersion: version, lastUsedAt: null, updatedAt },
+    ];
+    // Real (non-hash) version → semantic dominates → the cosine match wins despite zero lexical overlap.
+    const real = rankEntries("budget pause policy", mk("openai:test:4"), {}, { vector: qVec, version: "openai:test:4" });
+    expect(real[0].id).toBe("sem");
+    // Hash version → lexical stays primary → the keyword match wins (hash-era behavior; test rig unchanged).
+    const hash = rankEntries("budget pause policy", mk("hash-64:64"), {}, { vector: qVec, version: "hash-64:64" });
+    expect(hash[0].id).toBe("lex");
+    // Explicit weights always override the embedding-aware default.
+    const forced = rankEntries("budget pause policy", mk("openai:test:4"), { lexical: 0.9, semantic: 0.05 }, { vector: qVec, version: "openai:test:4" });
+    expect(forced[0].id).toBe("lex");
+  });
+
   it("rankEntries gives lexical hits in subject the top spot", () => {
     const entries = [
       {

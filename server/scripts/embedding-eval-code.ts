@@ -10,7 +10,7 @@
  *   cd server && COMBYNE_EVAL_LIVE_EMBEDDINGS=1 OPENAI_API_KEY=… \
  *       pnpm exec tsx scripts/embedding-eval-code.ts                          # + live
  */
-import { embedText } from "../src/services/memory.js";
+import { embedText, rankEntries } from "../src/services/memory.js";
 import { makeEmbeddingDriver } from "../src/services/embedding-driver.js";
 
 interface Entry { id: string; subject: string; body: string; kind: string }
@@ -99,6 +99,26 @@ async function main() {
     const liveRanks = QUERIES.map((q, i) => rankOf(qRes.vectors[i], liveVecs, q.expected));
     const live = metrics(liveRanks);
     console.log(`  oai-1536    ${pct(live.r1).padEnd(9)}  ${pct(live.r3).padEnd(9)}  ${pct(live.r5).padEnd(9)}  ${live.mrr.toFixed(3)}`);
+
+    // Through the ACTUAL production rankEntries (lexical + semantic + recency),
+    // same real embeddings, OLD weights (0.5/0.35/0.15) vs NEW embedding-aware
+    // weights (auto 0.30/0.55/0.15 when the query version is real). Proves the
+    // re-tune lets the production ranker realize the embedder lift, not just cosine.
+    const ua = new Date("2026-01-01T00:00:00Z");
+    const through = (weights: { lexical?: number; semantic?: number; recency?: number }) => {
+      const ranks = QUERIES.map((qq, i) => {
+        const rin = ENTRIES.map((e) => ({ id: e.id, layer: "workspace" as const, subject: e.subject, body: e.body, tags: [] as string[], embedding: liveVecs.get(e.id)!, embeddingVersion: eRes.version, lastUsedAt: null, updatedAt: ua }));
+        const order = rankEntries(qq.q, rin, weights, { vector: qRes.vectors[i], version: eRes.version }).map((x) => x.id);
+        for (let k = 0; k < order.length; k++) if (qq.expected.includes(order[k])) return k + 1;
+        return Infinity;
+      });
+      return metrics(ranks);
+    };
+    const prodOld = through({ lexical: 0.5, semantic: 0.35, recency: 0.15 });
+    const prodNew = through({});
+    console.log(`\n  THROUGH production rankEntries (real embeddings):`);
+    console.log(`    OLD weights 0.5/0.35/0.15:  recall@1 ${pct(prodOld.r1)}  recall@5 ${pct(prodOld.r5)}  MRR ${prodOld.mrr.toFixed(3)}`);
+    console.log(`    NEW weights 0.30/0.55/0.15: recall@1 ${pct(prodNew.r1)}  recall@5 ${pct(prodNew.r5)}  MRR ${prodNew.mrr.toFixed(3)}`);
     // break out the human-answer + EM/CEO subset specifically
     const subset = (ids: string[]) => {
       const idx = QUERIES.map((q, i) => ({ q, i })).filter((x) => x.q.expected.some((e) => ids.includes(e)));

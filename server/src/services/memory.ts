@@ -251,13 +251,23 @@ export function rankEntries(
   weights: { lexical?: number; semantic?: number; recency?: number } = {},
   queryEmbedding?: QueryEmbedding,
 ): RankedEntry[] {
-  const wLex = weights.lexical ?? 0.5;
-  const wSem = weights.semantic ?? 0.35;
-  const wRec = weights.recency ?? 0.15;
   // Fall back to the synchronous hash embedding when no precomputed query
   // embedding is supplied (the pure-ranker oracle path).
   const queryEmb = queryEmbedding?.vector ?? embedText(query);
   const queryVersion = queryEmbedding?.version;
+  // Embedding-aware default weights. The hash-64 era weights (0.5/0.35/0.15) were
+  // tuned when the semantic channel was near-noise, so lexical dominated. With a
+  // REAL model the cosine signal is strong (eval: MRR 0.94 vs hash 0.38 on
+  // paraphrased queries), but at 0.35 it is diluted below lexical — which is ~0 on
+  // exactly the paraphrased/conceptual queries where semantic shines — and can be
+  // outvoted by recency. So when the query was embedded by a real model, let
+  // semantic dominate (lexical still rewards exact-keyword hits; recency stays a
+  // light tiebreaker). Hash-64 / oracle path keeps the original weights, so the
+  // test rig and every existing test are unaffected. Explicit weights always win.
+  const semanticStrong = queryVersion != null && queryVersion !== HASH_EMBEDDING_VERSION;
+  const wLex = weights.lexical ?? (semanticStrong ? 0.3 : 0.5);
+  const wSem = weights.semantic ?? (semanticStrong ? 0.55 : 0.35);
+  const wRec = weights.recency ?? 0.15;
   return entries
     .map((entry) => {
       const lex = lexicalScore(query, entry.subject, entry.body, entry.tags);
