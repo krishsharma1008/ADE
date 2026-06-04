@@ -36,6 +36,33 @@ export function memoryRoutes(db: Db) {
           throw forbidden("personal entries can only be created by their owner");
         }
       }
+
+      // Trust spine (§3.2): authorType is derived from the ACTOR, never from the
+      // request body. An agent principal can NEVER author a verified row or a
+      // human-tier provenance — the service write-gate also enforces this, and
+      // here we reject the attempt outright (defense-in-depth + clearer error)
+      // so an agent can't even request it. Only a board principal may stamp a
+      // verified state or a human-answer/pr-approval provenance.
+      const isBoard = req.actor.type === "board";
+      const authorType = actor.actorType === "agent" ? "agent" : "user";
+      let provenance = body.provenance ?? null;
+      let verificationState = body.verificationState ?? undefined;
+      let confidence = body.confidence ?? undefined;
+      const wantsTrustedProvenance =
+        provenance === "human-answer" || provenance === "pr-approval";
+      const wantsVerified = verificationState === "verified";
+      if (!isBoard && (wantsTrustedProvenance || wantsVerified)) {
+        throw forbidden(
+          "only a board principal can set a verified state or a human-tier provenance",
+        );
+      }
+      if (authorType === "agent") {
+        // Belt-and-braces: strip any trust override before it reaches the service.
+        provenance = provenance && wantsTrustedProvenance ? null : provenance;
+        verificationState = undefined;
+        confidence = undefined;
+      }
+
       const entry = await svc.createEntry({
         companyId,
         layer: body.layer,
@@ -49,6 +76,13 @@ export function memoryRoutes(db: Db) {
         ownerId: body.ownerId ?? null,
         ttlDays: body.ttlDays ?? null,
         createdBy: actor.actorId,
+        provenance,
+        verificationState,
+        confidence,
+        authorType,
+        authorId: body.authorId ?? actor.actorId,
+        sourceRefType: body.sourceRefType ?? null,
+        sourceRefId: body.sourceRefId ?? null,
       });
       await logActivity(db, {
         companyId,

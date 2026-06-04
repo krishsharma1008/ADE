@@ -12,6 +12,10 @@ import type {
   MemoryLayer,
   MemoryOwnerType,
   MemoryEntry,
+  MemoryProvenance,
+  MemoryVerificationState,
+  MemoryAuthorType,
+  MemorySourceRefType,
   MemoryQueryResult,
   MemoryManifest,
   MemoryManifestItem,
@@ -58,6 +62,22 @@ function tokenize(text: string): string[] {
     .replace(/[^a-z0-9_\s-]/g, " ")
     .split(/\s+/)
     .filter((t) => t.length >= 2 && t.length <= 32);
+}
+
+/**
+ * Normalized dedup / conflict key for an entry. Conservative by design — it
+ * reuses `tokenize()` (lowercase, punctuation-strip) over the SUBJECT only,
+ * dedupes tokens, and sorts them so word-order variation collapses to the same
+ * key. Because it is purely lexical it UNDER-MERGES: paraphrases, synonyms, and
+ * other languages produce different keys, so conflict-detection / supersession
+ * silently no-op for those. This is intentional — it never falsely merges two
+ * distinct facts. Semantic near-dup detection is deferred until real embeddings
+ * land (see CENTRAL_CONTEXT_DB_PLAN §3.6). Returns null for an empty subject.
+ */
+export function computeSubjectKey(subject: string): string | null {
+  const tokens = Array.from(new Set(tokenize(subject))).sort();
+  if (tokens.length === 0) return null;
+  return tokens.join(" ");
 }
 
 function l2Normalize(v: number[]): number[] {
@@ -179,6 +199,18 @@ function rowToEntry(row: MemoryEntryRow): MemoryEntry {
     serviceScope: row.serviceScope ?? null,
     source: row.source ?? null,
     embedding: (row.embedding as number[] | null) ?? null,
+    provenance: (row.provenance as MemoryProvenance | null) ?? null,
+    verificationState: (row.verificationState as MemoryVerificationState) ?? "unverified",
+    confidence: row.confidence ?? 0.5,
+    authorType: (row.authorType as MemoryAuthorType | null) ?? null,
+    authorId: row.authorId ?? null,
+    sourceRefType: (row.sourceRefType as MemorySourceRefType | null) ?? null,
+    sourceRefId: row.sourceRefId ?? null,
+    subjectKey: row.subjectKey ?? null,
+    supersededById: row.supersededById ?? null,
+    verifiedBy: row.verifiedBy ?? null,
+    verifiedAt: row.verifiedAt ? row.verifiedAt.toISOString() : null,
+    embeddingVersion: row.embeddingVersion ?? null,
     status: row.status as MemoryEntry["status"],
     usageCount: row.usageCount,
     lastUsedAt: row.lastUsedAt ? row.lastUsedAt.toISOString() : null,
@@ -202,7 +234,30 @@ export interface CreateEntryInput {
   ownerId?: string | null;
   ttlDays?: number | null;
   createdBy?: string | null;
+  // Trust spine (0049).
+  provenance?: MemoryProvenance | null;
+  verificationState?: MemoryVerificationState;
+  confidence?: number;
+  authorType?: MemoryAuthorType | null;
+  authorId?: string | null;
+  sourceRefType?: MemorySourceRefType | null;
+  sourceRefId?: string | null;
 }
+
+/**
+ * Provenances an AGENT author is allowed to carry. Anything else from an agent
+ * is force-quarantined to unverified/low-confidence by the write-gate, so an
+ * agent can never self-assert a trusted row (the primary trust amplifier).
+ * 'human-answer' / 'pr-approval' are the human capture hooks; an agent actor
+ * cannot reach those provenances (the route + hooks set authorType correctly).
+ */
+const AGENT_TRUSTED_PROVENANCES: ReadonlySet<MemoryProvenance> = new Set([
+  "human-answer",
+  "pr-approval",
+]);
+
+/** Max confidence an agent-authored, non-trusted-provenance entry may hold. */
+const AGENT_QUARANTINE_MAX_CONFIDENCE = 0.4;
 
 export interface UpdateEntryInput {
   subject?: string;
@@ -233,24 +288,86 @@ export function memoryService(db: Db) {
       throw new Error("personal entries require ownerType and ownerId");
     }
     const embedding = embedText(`${input.subject}\n${input.body}`);
-    const [row] = await db
-      .insert(memoryEntries)
-      .values({
-        companyId: input.companyId,
-        layer: input.layer,
-        ownerType: input.layer === "personal" ? input.ownerType ?? null : null,
-        ownerId: input.layer === "personal" ? input.ownerId ?? null : null,
-        subject: input.subject,
-        body: input.body,
-        kind: input.kind ?? "fact",
-        tags: input.tags ?? [],
-        serviceScope: input.serviceScope ?? null,
-        source: input.source ?? null,
-        embedding,
-        ttlDays: input.ttlDays ?? null,
-        createdBy: input.createdBy ?? null,
-      })
-      .returning();
+    const subjectKey = computeSubjectKey(input.subject);
+
+    // ---- WRITE-side trust gate (§3.2) ----
+    // The default verification state is 'unverified' / confidence 0.5. A caller
+    // may request a higher trust tier, but when the AUTHOR is an agent and the
+    // provenance is not one of the human capture hooks we FORCE the entry back
+    // to unverified and clamp confidence — regardless of what the caller asked
+    // for. This is the single chokepoint that stops an agent self-asserting a
+    // 'verified' workspace fact. authorType is set by the caller from the actor
+    // (route / capture hooks), never from a raw request body.
+    let provenance = input.provenance ?? null;
+    let verificationState: MemoryVerificationState = input.verificationState ?? "unverified";
+    let confidence = input.confidence ?? 0.5;
+    const authorType = input.authorType ?? null;
+    if (
+      authorType === "agent" &&
+      (provenance === null || !AGENT_TRUSTED_PROVENANCES.has(provenance))
+    ) {
+      provenance = provenance ?? "agent-claim";
+      verificationState = "unverified";
+      confidence = Math.min(confidence, AGENT_QUARANTINE_MAX_CONFIDENCE);
+    }
+
+    const insertValues = {
+      companyId: input.companyId,
+      layer: input.layer,
+      ownerType: input.layer === "personal" ? input.ownerType ?? null : null,
+      ownerId: input.layer === "personal" ? input.ownerId ?? null : null,
+      subject: input.subject,
+      body: input.body,
+      kind: input.kind ?? "fact",
+      tags: input.tags ?? [],
+      serviceScope: input.serviceScope ?? null,
+      source: input.source ?? null,
+      embedding,
+      provenance,
+      verificationState,
+      confidence,
+      authorType,
+      authorId: input.authorId ?? null,
+      sourceRefType: input.sourceRefType ?? null,
+      sourceRefId: input.sourceRefId ?? null,
+      subjectKey,
+      ttlDays: input.ttlDays ?? null,
+      createdBy: input.createdBy ?? null,
+    };
+
+    // ---- Idempotent capture (§4.3) ----
+    // (companyId, source) is the natural key for sourced captures (human-answer
+    // retries, reconcile-twice, accepted-work replays). The unique partial index
+    // on (company_id, source) WHERE source IS NOT NULL backs an onConflictDoNothing
+    // upsert: a re-fire inserts zero rows, then we re-select the existing one.
+    // Un-sourced entries (source IS NULL) are never deduped here.
+    if (input.source) {
+      const [inserted] = await db
+        .insert(memoryEntries)
+        .values(insertValues)
+        .onConflictDoNothing({
+          target: [memoryEntries.companyId, memoryEntries.source],
+          // Match the PARTIAL unique index (WHERE source IS NOT NULL); without
+          // this predicate Postgres rejects the ON CONFLICT target as unmatched.
+          // For onConflictDoNothing, `where` is the target index predicate.
+          where: sql`${memoryEntries.source} IS NOT NULL`,
+        })
+        .returning();
+      if (inserted) return rowToEntry(inserted);
+      const [existing] = await db
+        .select()
+        .from(memoryEntries)
+        .where(
+          and(
+            eq(memoryEntries.companyId, input.companyId),
+            eq(memoryEntries.source, input.source),
+          ),
+        )
+        .limit(1);
+      return rowToEntry(existing);
+    }
+
+    const [row] = await db.insert(memoryEntries).values(insertValues).returning();
     return rowToEntry(row);
   }
 
@@ -280,6 +397,7 @@ export function memoryService(db: Db) {
     if (input.status !== undefined) updates.status = input.status;
     if (input.ttlDays !== undefined) updates.ttlDays = input.ttlDays;
     if (embedding !== undefined) updates.embedding = embedding;
+    if (input.subject !== undefined) updates.subjectKey = computeSubjectKey(input.subject);
     const [row] = await db
       .update(memoryEntries)
       .set(updates)
@@ -645,6 +763,8 @@ export function memoryService(db: Db) {
     promotion: typeof memoryPromotions.$inferSelect,
   ): Promise<MemoryEntry> {
     const embedding = embedText(`${promotion.proposedSubject}\n${promotion.proposedBody}`);
+    // Board-promoted lineage is trusted: verified-summary / verified / 0.9.
+    // Mirrors the 0049 backfill for pre-existing promotion:% rows.
     const [row] = await db
       .insert(memoryEntries)
       .values({
@@ -656,6 +776,13 @@ export function memoryService(db: Db) {
         tags: promotion.proposedTags as string[],
         embedding,
         source: `promotion:${promotion.id}`,
+        provenance: "verified-summary",
+        verificationState: "verified",
+        confidence: 0.9,
+        authorType: "system",
+        sourceRefType: "promotion",
+        sourceRefId: promotion.id,
+        subjectKey: computeSubjectKey(promotion.proposedSubject),
       })
       .returning();
     return rowToEntry(row);

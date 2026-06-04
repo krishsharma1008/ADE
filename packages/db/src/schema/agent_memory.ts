@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, index, real } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { issues } from "./issues.js";
@@ -26,6 +26,12 @@ export const agentMemory = pgTable(
     kind: text("kind").notNull(),
     title: text("title"),
     body: text("body").notNull(),
+    // Trust spine subset (migration 0049) so the legacy "# Recent memory"
+    // channel is governable with the same vocabulary as memory_entries.
+    provenance: text("provenance"),
+    authorType: text("author_type"),
+    confidence: real("confidence").notNull().default(0.5),
+    verificationState: text("verification_state").notNull().default("unverified"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

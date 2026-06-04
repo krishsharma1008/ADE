@@ -42,6 +42,22 @@ export const memoryEntries = pgTable(
     serviceScope: text("service_scope"),
     source: text("source"),
     embedding: jsonb("embedding").$type<number[] | null>(),
+    // Trust spine (migration 0049). Canonical vocabulary is
+    // provenance + verificationState + confidence. Only human-sourced content
+    // (human-answer / pr-approval / promotion lineage) is authoritative; agent
+    // claims are written but forced unverified at the service write-gate.
+    provenance: text("provenance"), // human-answer|pr-approval|verified-summary|agent-claim|system|null
+    verificationState: text("verification_state").notNull().default("unverified"), // verified|unverified|needs_review
+    confidence: real("confidence").notNull().default(0.5),
+    authorType: text("author_type"), // user|agent|system
+    authorId: text("author_id"),
+    sourceRefType: text("source_ref_type"), // issue|pr|comment|approval|run|promotion
+    sourceRefId: uuid("source_ref_id"),
+    subjectKey: text("subject_key"), // conservative tokenize()-derived dedup/conflict key
+    supersededById: uuid("superseded_by_id"),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    embeddingVersion: text("embedding_version"),
     status: text("status").notNull().default("active"), // active | archived | deprecated
     usageCount: integer("usage_count").notNull().default(0),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
@@ -59,6 +75,13 @@ export const memoryEntries = pgTable(
     ),
     statusIdx: index("memory_entries_status_idx").on(table.companyId, table.status),
     serviceIdx: index("memory_entries_service_idx").on(table.companyId, table.serviceScope),
+    trustIdx: index("memory_entries_trust_idx").on(
+      table.companyId,
+      table.layer,
+      table.verificationState,
+      table.confidence,
+    ),
+    subjectKeyIdx: index("memory_entries_subjectkey_idx").on(table.companyId, table.subjectKey),
   }),
 );
 

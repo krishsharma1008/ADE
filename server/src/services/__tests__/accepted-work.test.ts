@@ -192,4 +192,60 @@ describe("accepted work service", () => {
       .where(eq(memoryEntries.id, result!.memory.id));
     expect(rows[0]?.tags).toContain("accepted-work");
   });
+
+  it("accepted-work memory is tagged agent-claim/unverified (no laundering)", async () => {
+    const svc = acceptedWorkService(handle.db);
+    const event = await svc.upsertMergedPull({
+      companyId,
+      issueId: parentIssueId,
+      repo: "combyne",
+      pullNumber: 45,
+      title: "feat: agent-authored capture",
+      detectionSource: "simulation",
+    });
+    const result = await svc.createMemoryFromEvent({
+      eventId: event.event.id,
+      subject: "Agent-authored accepted-work memory",
+      body: "This is agent-derived and must NOT be treated as a verified fact.",
+      kind: "note",
+      createdBy: emId,
+    });
+    // The write-gate forces agent-authored captures to the quarantine tier.
+    expect(result?.memory.provenance).toBe("agent-claim");
+    expect(result?.memory.authorType).toBe("agent");
+    expect(result?.memory.verificationState).toBe("unverified");
+    expect(result?.memory.confidence).toBeLessThanOrEqual(0.4);
+  });
+
+  it("re-firing createMemoryFromEvent for the same event is idempotent (one row)", async () => {
+    const svc = acceptedWorkService(handle.db);
+    const event = await svc.upsertMergedPull({
+      companyId,
+      issueId: parentIssueId,
+      repo: "combyne",
+      pullNumber: 46,
+      title: "feat: idempotent accepted-work capture",
+      detectionSource: "simulation",
+    });
+    const first = await svc.createMemoryFromEvent({
+      eventId: event.event.id,
+      subject: "Idempotent accepted-work capture",
+      body: "first capture body",
+      kind: "note",
+      createdBy: emId,
+    });
+    const second = await svc.createMemoryFromEvent({
+      eventId: event.event.id,
+      subject: "Idempotent accepted-work capture",
+      body: "replayed capture body (must be ignored)",
+      kind: "note",
+      createdBy: emId,
+    });
+    expect(second?.memory.id).toBe(first?.memory.id);
+    const rows = await handle.db
+      .select()
+      .from(memoryEntries)
+      .where(eq(memoryEntries.source, `accepted_work:${event.event.id}`));
+    expect(rows).toHaveLength(1);
+  });
 });

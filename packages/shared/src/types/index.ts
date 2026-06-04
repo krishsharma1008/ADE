@@ -222,6 +222,10 @@ export {
   MEMORY_KINDS,
   MEMORY_STATUSES,
   MEMORY_OWNER_TYPES,
+  MEMORY_PROVENANCES,
+  MEMORY_VERIFICATION_STATES,
+  MEMORY_AUTHOR_TYPES,
+  MEMORY_SOURCE_REF_TYPES,
   MEMORY_PROMOTION_STATES,
 } from "./memory.js";
 export type {
@@ -229,6 +233,10 @@ export type {
   MemoryKind,
   MemoryStatus,
   MemoryOwnerType,
+  MemoryProvenance,
+  MemoryVerificationState,
+  MemoryAuthorType,
+  MemorySourceRefType,
   MemoryPromotionState,
   MemoryEntry,
   MemoryManifestItem,

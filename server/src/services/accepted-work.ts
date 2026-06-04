@@ -379,6 +379,13 @@ export function acceptedWorkService(db: Db) {
       serviceScope: input.serviceScope ?? event.repo,
       source: `accepted_work:${event.id}`,
       createdBy: input.createdBy ?? null,
+      // Accepted-work memory is AGENT-authored (the agent decides what to store
+      // from a merged PR). It must stay an agent-claim / unverified row — never
+      // laundered into a human/approval tier. The EM PR-approval hook (PR-5) is
+      // the only path that writes a verified pr-approval row for a merge.
+      provenance: "agent-claim",
+      authorType: "agent",
+      verificationState: "unverified",
     });
     const [updated] = await db
       .update(acceptedWorkEvents)

@@ -10,6 +10,31 @@ export type MemoryStatus = (typeof MEMORY_STATUSES)[number];
 export const MEMORY_OWNER_TYPES = ["user", "agent"] as const;
 export type MemoryOwnerType = (typeof MEMORY_OWNER_TYPES)[number];
 
+export const MEMORY_PROVENANCES = [
+  "human-answer",
+  "pr-approval",
+  "verified-summary",
+  "agent-claim",
+  "system",
+] as const;
+export type MemoryProvenance = (typeof MEMORY_PROVENANCES)[number];
+
+export const MEMORY_VERIFICATION_STATES = ["verified", "unverified", "needs_review"] as const;
+export type MemoryVerificationState = (typeof MEMORY_VERIFICATION_STATES)[number];
+
+export const MEMORY_AUTHOR_TYPES = ["user", "agent", "system"] as const;
+export type MemoryAuthorType = (typeof MEMORY_AUTHOR_TYPES)[number];
+
+export const MEMORY_SOURCE_REF_TYPES = [
+  "issue",
+  "pr",
+  "comment",
+  "approval",
+  "run",
+  "promotion",
+] as const;
+export type MemorySourceRefType = (typeof MEMORY_SOURCE_REF_TYPES)[number];
+
 export const MEMORY_PROMOTION_STATES = ["pending", "approved", "rejected"] as const;
 export type MemoryPromotionState = (typeof MEMORY_PROMOTION_STATES)[number];
 
@@ -26,6 +51,18 @@ export interface MemoryEntry {
   serviceScope: string | null;
   source: string | null;
   embedding: number[] | null;
+  provenance: MemoryProvenance | null;
+  verificationState: MemoryVerificationState;
+  confidence: number;
+  authorType: MemoryAuthorType | null;
+  authorId: string | null;
+  sourceRefType: MemorySourceRefType | null;
+  sourceRefId: string | null;
+  subjectKey: string | null;
+  supersededById: string | null;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  embeddingVersion: string | null;
   status: MemoryStatus;
   usageCount: number;
   lastUsedAt: string | null;

@@ -4,6 +4,10 @@ import {
   MEMORY_KINDS,
   MEMORY_OWNER_TYPES,
   MEMORY_STATUSES,
+  MEMORY_PROVENANCES,
+  MEMORY_VERIFICATION_STATES,
+  MEMORY_AUTHOR_TYPES,
+  MEMORY_SOURCE_REF_TYPES,
 } from "../types/memory.js";
 
 const tagsSchema = z.array(z.string().min(1).max(64)).max(32).optional().default([]);
@@ -20,6 +24,17 @@ export const createMemoryEntrySchema = z
     ownerType: z.enum(MEMORY_OWNER_TYPES).optional().nullable(),
     ownerId: z.string().min(1).max(128).optional().nullable(),
     ttlDays: z.number().int().positive().max(3650).optional().nullable(),
+    // Trust spine (0049). These are advisory on the request: the route layer
+    // derives authorType from the ACTOR and force-quarantines agent actors,
+    // so a caller cannot self-assert 'verified' through the body. Accepting
+    // them here only lets trusted callers (board) stamp a verified capture.
+    provenance: z.enum(MEMORY_PROVENANCES).optional().nullable(),
+    verificationState: z.enum(MEMORY_VERIFICATION_STATES).optional(),
+    confidence: z.number().min(0).max(1).optional(),
+    authorType: z.enum(MEMORY_AUTHOR_TYPES).optional().nullable(),
+    authorId: z.string().min(1).max(128).optional().nullable(),
+    sourceRefType: z.enum(MEMORY_SOURCE_REF_TYPES).optional().nullable(),
+    sourceRefId: z.string().uuid().optional().nullable(),
   })
   .refine(
     (v) =>
