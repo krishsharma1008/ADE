@@ -28,6 +28,7 @@ export const issues = pgTable(
     description: text("description"),
     status: text("status").notNull().default("backlog"),
     complexity: text("complexity"),
+    serviceScope: text("service_scope"),
     priority: text("priority").notNull().default("medium"),
     assigneeAgentId: uuid("assignee_agent_id").references(() => agents.id),
     assigneeUserId: text("assignee_user_id"),

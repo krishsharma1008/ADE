@@ -114,6 +114,7 @@ export interface Issue {
   description: string | null;
   status: IssueStatus;
   complexity?: IssueComplexity | null;
+  serviceScope?: string | null;
   priority: IssuePriority;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;

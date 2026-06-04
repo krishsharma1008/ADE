@@ -69,5 +69,28 @@ describe("issue medium/large delegation policy", () => {
     const updated = await svc.update(parent.id, { status: "done" });
     expect(updated?.status).toBe("done");
   });
+
+  it("round-trips the additive service_scope column through create/read (PR-8)", async () => {
+    const svc = issueService(handle.db);
+
+    // Created without a service scope: column is nullable/additive, defaults to null.
+    const created = await svc.create(companyId, {
+      title: "Issue without service scope",
+      assigneeAgentId: engineerId,
+    });
+    expect(created?.serviceScope ?? null).toBeNull();
+
+    // Created with an explicit service scope: value is persisted and surfaced.
+    const scoped = await svc.create(companyId, {
+      title: "Issue scoped to a service",
+      assigneeAgentId: engineerId,
+      serviceScope: "payments-api",
+    });
+    expect(scoped?.serviceScope).toBe("payments-api");
+
+    // Re-reading the row exposes serviceScope on the typed Issue (retrieval target).
+    const reread = await svc.getById(scoped!.id);
+    expect(reread?.serviceScope).toBe("payments-api");
+  });
 });
 
