@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, agentWakeupRequests, approvals, companies, companyIntegrations, heartbeatRuns, issueComments, issuePullRequests, issues } from "@combyne/db";
+import { agents, agentWakeupRequests, approvals, companies, companyIntegrations, heartbeatRuns, issueComments, issuePullRequests, issues, memoryEntries } from "@combyne/db";
 import { issuePullRequestService } from "../issue-pull-requests.js";
+import { acceptedWorkService } from "../accepted-work.js";
+import { memoryService } from "../memory.js";
 import { heartbeatService } from "../heartbeat.js";
 import { startTestDb, stopTestDb, type TestDbHandle } from "./_test-db.js";
 
@@ -407,5 +409,297 @@ describe("issue pull request service", () => {
     });
     expect(timerWake).toBeNull();
     expect(await skipCount("issue.pr_review_hold")).toBe(3);
+  });
+});
+
+describe("HOOK 2 — EM PR-approval capture (deterministic, no LLM)", () => {
+  let handle: TestDbHandle;
+  let companyId: string;
+  let agentId: string;
+  let pullSeq = 5000;
+
+  beforeAll(async () => {
+    handle = await startTestDb();
+    const [company] = await handle.db
+      .insert(companies)
+      .values({ name: "PR Approval Capture Co", issuePrefix: "PAC" })
+      .returning();
+    companyId = company.id;
+    const [agent] = await handle.db
+      .insert(agents)
+      .values({ companyId, name: "Engineer", adapterType: "process" })
+      .returning();
+    agentId = agent.id;
+    await handle.db
+      .insert(companyIntegrations)
+      .values({
+        companyId,
+        provider: "github",
+        enabled: "true",
+        config: {
+          baseUrl: "https://api.github.test",
+          owner: "combyne",
+          token: "test-token",
+          defaultRepo: "ade",
+        },
+      })
+      .onConflictDoNothing();
+  }, 60_000);
+
+  afterAll(async () => {
+    if (handle) await stopTestDb();
+  });
+
+  // Stateful mock of a fully-mergeable PR: passing check, an APPROVED review (no
+  // CHANGES_REQUESTED blocker), and a merge PUT that flips the PR to merged so the
+  // post-merge GET reports the merged state.
+  function mockMergeableGitHub(pullNumber: number, headSha: string) {
+    let merged = false;
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      const method = String((init as RequestInit | undefined)?.method ?? "GET").toUpperCase();
+      if (href.includes(`/pulls/${pullNumber}/reviews`)) {
+        return new Response(JSON.stringify([
+          {
+            id: 1,
+            user: { login: "lead-reviewer" },
+            state: "APPROVED",
+            body: "LGTM",
+            submitted_at: "2026-05-06T00:00:00Z",
+          },
+        ]), { status: 200 });
+      }
+      if (href.includes(`/commits/${headSha}/check-runs`)) {
+        return new Response(JSON.stringify({
+          check_runs: [
+            { id: 1, name: "ci", status: "completed", conclusion: "success" },
+          ],
+        }), { status: 200 });
+      }
+      if (href.includes(`/pulls/${pullNumber}/merge`) && method === "PUT") {
+        merged = true;
+        return new Response(JSON.stringify({ merged: true, message: "Merged", sha: "merge-sha" }), {
+          status: 200,
+        });
+      }
+      if (href.includes(`/pulls/${pullNumber}`)) {
+        return new Response(JSON.stringify({
+          id: pullNumber,
+          number: pullNumber,
+          title: `feat: durable change ${pullNumber}`,
+          body: null,
+          state: merged ? "closed" : "open",
+          draft: false,
+          user: { login: "engineer" },
+          head: { ref: "feat/durable", sha: headSha },
+          base: { ref: "development" },
+          merged,
+          mergeable: true,
+          merge_commit_sha: merged ? "merge-sha" : null,
+          merged_at: merged ? "2026-05-06T01:00:00Z" : null,
+          created_at: "2026-05-06T00:00:00Z",
+          updated_at: "2026-05-06T00:00:00Z",
+          html_url: `https://github.com/combyne/ade/pull/${pullNumber}`,
+        }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    return spy;
+  }
+
+  async function trackPr(svc: ReturnType<typeof issuePullRequestService>, pullNumber: number, headSha: string) {
+    const [issue] = await handle.db
+      .insert(issues)
+      .values({ companyId, title: `Issue for PR ${pullNumber}`, status: "in_progress", assigneeAgentId: agentId })
+      .returning();
+    const tracked = await svc.upsertForIssue({
+      companyId,
+      issueId: issue.id,
+      requestedByAgentId: agentId,
+      repo: "ade",
+      pullNumber,
+      pullUrl: `https://github.com/combyne/ade/pull/${pullNumber}`,
+      title: `feat: durable change ${pullNumber}`,
+      baseBranch: "development",
+      headBranch: "feat/durable",
+      headSha,
+      mergeMethod: "squash",
+    });
+    return { issue, tracked };
+  }
+
+  it("captures one verified pr-approval/convention row when merging with a decisionNote", async () => {
+    const svc = issuePullRequestService(handle.db);
+    const pullNumber = pullSeq++;
+    const headSha = `sha${pullNumber}`;
+    const { tracked } = await trackPr(svc, pullNumber, headSha);
+    const fetchSpy = mockMergeableGitHub(pullNumber, headSha);
+    try {
+      const result = await svc.merge(tracked.id, {
+        approvalId: tracked.approvalId,
+        decidedByUserId: "em-user-1",
+        decisionNote: "Always validate webhook signatures before processing.",
+      });
+      expect(result.pullRequest.mergeStatus).toBe("merged");
+
+      const rows = await handle.db
+        .select()
+        .from(memoryEntries)
+        .where(eq(memoryEntries.source, `pr-approval:${tracked.approvalId}`));
+      expect(rows).toHaveLength(1);
+      const entry = rows[0];
+      expect(entry.provenance).toBe("pr-approval");
+      expect(entry.verificationState).toBe("verified");
+      expect(entry.kind).toBe("convention");
+      expect(entry.confidence).toBe(0.8);
+      expect(entry.authorType).toBe("user");
+      expect(entry.createdBy).toBe("em-user-1");
+      expect(entry.sourceRefType).toBe("approval");
+      expect(entry.sourceRefId).toBe(tracked.approvalId);
+      expect(entry.subject).toBe(`EM approved PR ade#${pullNumber}: feat: durable change ${pullNumber}`);
+      // Body is the literal human note (no LLM summarization) plus deterministic context.
+      expect(entry.body).toContain("Always validate webhook signatures before processing.");
+      expect(entry.body).toContain("approved by lead-reviewer");
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("writes kind='note' (still pr-approval/verified) when merging without a decisionNote", async () => {
+    const svc = issuePullRequestService(handle.db);
+    const pullNumber = pullSeq++;
+    const headSha = `sha${pullNumber}`;
+    const { tracked } = await trackPr(svc, pullNumber, headSha);
+    const fetchSpy = mockMergeableGitHub(pullNumber, headSha);
+    try {
+      const result = await svc.merge(tracked.id, {
+        approvalId: tracked.approvalId,
+        decidedByUserId: "em-user-2",
+        // no decisionNote
+      });
+      expect(result.pullRequest.mergeStatus).toBe("merged");
+
+      const rows = await handle.db
+        .select()
+        .from(memoryEntries)
+        .where(eq(memoryEntries.source, `pr-approval:${tracked.approvalId}`));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].kind).toBe("note");
+      expect(rows[0].provenance).toBe("pr-approval");
+      expect(rows[0].verificationState).toBe("verified");
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("is idempotent: re-firing the capture for the same approval yields one row", async () => {
+    const svc = issuePullRequestService(handle.db);
+    const pullNumber = pullSeq++;
+    const headSha = `sha${pullNumber}`;
+    const { tracked } = await trackPr(svc, pullNumber, headSha);
+    const fetchSpy = mockMergeableGitHub(pullNumber, headSha);
+    try {
+      await svc.merge(tracked.id, {
+        approvalId: tracked.approvalId,
+        decidedByUserId: "em-user-3",
+        decisionNote: "Prefer squash merges on feature branches.",
+      });
+      // Re-fire the deterministic capture directly with the same source key (mirrors a
+      // reconcile-twice / retried merge replay) — the (companyId, source) upsert dedups.
+      const memorySvc = memoryService(handle.db);
+      await memorySvc.createEntry({
+        companyId,
+        layer: "workspace",
+        subject: `EM approved PR ade#${pullNumber}: feat: durable change ${pullNumber}`,
+        body: "Prefer squash merges on feature branches.",
+        kind: "convention",
+        source: `pr-approval:${tracked.approvalId}`,
+        provenance: "pr-approval",
+        authorType: "user",
+        verificationState: "verified",
+        confidence: 0.8,
+        createdBy: "em-user-3",
+        sourceRefType: "approval",
+        sourceRefId: tracked.approvalId,
+      });
+
+      const rows = await handle.db
+        .select()
+        .from(memoryEntries)
+        .where(eq(memoryEntries.source, `pr-approval:${tracked.approvalId}`));
+      expect(rows).toHaveLength(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("keeps the agent-driven (poller/out-of-band) path at agent-claim/unverified — no laundering, distinct source key", async () => {
+    const acceptedWork = acceptedWorkService(handle.db);
+    const [issue] = await handle.db
+      .insert(issues)
+      .values({ companyId, title: "Out-of-band merge issue", status: "in_progress", assigneeAgentId: agentId })
+      .returning();
+    // Simulate the poller detecting a GitHub-direct merge (no human decisionNote).
+    const accepted = await acceptedWork.upsertMergedPull({
+      companyId,
+      issueId: issue.id,
+      repo: "ade",
+      pullNumber: 9999,
+      pullUrl: "https://github.com/combyne/ade/pull/9999",
+      title: "feat: out-of-band",
+      body: "merged directly on github",
+      headBranch: "feat/oob",
+      mergedSha: "oob-sha",
+      mergedAt: "2026-05-06T00:00:00Z",
+      detectionSource: "github_reconcile",
+      metadata: {},
+    });
+    const written = await acceptedWork.createMemoryFromEvent({
+      eventId: accepted.event.id,
+      subject: "Out-of-band merged work",
+      body: "An agent-authored claim from a github-direct merge.",
+      kind: "note",
+    });
+    expect(written).not.toBeNull();
+    const agentEntry = written!.memory;
+    expect(agentEntry.provenance).toBe("agent-claim");
+    expect(agentEntry.verificationState).toBe("unverified");
+    // Distinct source namespace from the pr-approval hook — no collision/double-capture.
+    expect(agentEntry.source).toBe(`accepted_work:${accepted.event.id}`);
+    expect(agentEntry.source?.startsWith("pr-approval:")).toBe(false);
+  });
+
+  it("completes the merge even if the approval-memory capture throws (best-effort)", async () => {
+    const svc = issuePullRequestService(handle.db);
+    const pullNumber = pullSeq++;
+    const headSha = `sha${pullNumber}`;
+    const { issue, tracked } = await trackPr(svc, pullNumber, headSha);
+    const fetchSpy = mockMergeableGitHub(pullNumber, headSha);
+    // Force the deterministic capture's createEntry to throw.
+    const insertSpy = vi.spyOn(handle.db, "insert").mockImplementationOnce(() => {
+      throw new Error("simulated memory write failure");
+    });
+    try {
+      const result = await svc.merge(tracked.id, {
+        approvalId: tracked.approvalId,
+        decidedByUserId: "em-user-4",
+        decisionNote: "This note never persists because the write throws.",
+      });
+      // Merge still succeeds.
+      expect(result.pullRequest.mergeStatus).toBe("merged");
+      expect(result.approvalMemoryEntryId).toBeNull();
+      // Issue still advanced to done.
+      const [after] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(after.status).toBe("done");
+      // No pr-approval row was written.
+      const rows = await handle.db
+        .select()
+        .from(memoryEntries)
+        .where(eq(memoryEntries.source, `pr-approval:${tracked.approvalId}`));
+      expect(rows).toHaveLength(0);
+    } finally {
+      insertSpy.mockRestore();
+      fetchSpy.mockRestore();
+    }
   });
 });

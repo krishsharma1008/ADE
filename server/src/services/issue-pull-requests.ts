@@ -17,6 +17,8 @@ import { createSonarQubeClient } from "./sonarqube.js";
 import { issueService } from "./issues.js";
 import { approvalService } from "./approvals.js";
 import { heartbeatService } from "./heartbeat.js";
+import { memoryService } from "./memory.js";
+import { logger } from "../middleware/logger.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
 const DEFAULT_MERGE_BASE_BRANCHES = ["main", "master", "development", "develop"];
@@ -612,8 +614,86 @@ export function issuePullRequestService(db: Db) {
       .returning()
       .then((rows) => rows[0] ?? row);
     await approvalsSvc.approve(row.approvalId, input.decidedByUserId, input.decisionNote ?? "Merged from PR panel");
+    // ---- HOOK 2: EM PR-approval capture (CENTRAL_CONTEXT_DB_PLAN §4.2, §5.2) ----
+    // Deterministic, never agent-summarized: an EM board merge carrying a human
+    // decisionNote + decidedByUserId is the one path that writes a VERIFIED
+    // pr-approval row. The body is the literal human note + the reconcile feedback
+    // + an accepted-pattern summary — no LLM. The out-of-band GitHub-direct/poller
+    // merge path (no decisionNote) keeps the agent-driven createMemoryFromEvent at
+    // agent-claim/unverified (source key accepted_work:<eventId>, distinct from
+    // pr-approval:<approvalId> — no collision, no double-capture). Idempotent via
+    // (companyId, source). Best-effort: a capture failure MUST NOT fail the merge.
+    const approvalMemoryEntryId = await captureApprovalMemory({
+      row,
+      status,
+      approvalId: row.approvalId,
+      decisionNote: input.decisionNote ?? null,
+      decidedByUserId: input.decidedByUserId,
+    });
     await issuesSvc.update(row.issueId, { status: "done" });
-    return { pullRequest: updated, mergeResult: result, githubPullRequest: pr };
+    return { pullRequest: updated, mergeResult: result, githubPullRequest: pr, approvalMemoryEntryId };
+  }
+
+  // Deterministic EM PR-approval memory capture (§4.2 HOOK 2). Only the human
+  // decisionNote drives kind/body — no LLM. Best-effort try/catch.
+  async function captureApprovalMemory(input: {
+    row: typeof issuePullRequests.$inferSelect;
+    status: IssuePullRequestStatus;
+    approvalId: string;
+    decisionNote: string | null;
+    decidedByUserId: string;
+  }): Promise<string | null> {
+    try {
+      const { row, status } = input;
+      const note = readNonEmptyString(input.decisionNote);
+      const reviewFeedback = readNonEmptyString(status.feedback);
+      // Accepted-pattern summary: which reviewers approved the merged work (the
+      // pattern the EM is endorsing by merging). Deterministic, derived from the
+      // reconciled reviews — never agent-authored prose.
+      const approvedReviewers = Array.from(
+        new Set(
+          status.reviews
+            .filter((review) => review.state.toUpperCase() === "APPROVED")
+            .map((review) => review.user),
+        ),
+      );
+      const acceptedPattern = approvedReviewers.length > 0
+        ? `Accepted pattern: approved by ${approvedReviewers.join(", ")}.`
+        : "Accepted pattern: merged from the PR panel.";
+
+      const bodyParts: string[] = [];
+      if (note) bodyParts.push(note);
+      if (reviewFeedback) bodyParts.push(reviewFeedback);
+      bodyParts.push(acceptedPattern);
+      const body = bodyParts.join("\n\n");
+
+      const memorySvc = memoryService(db);
+      const entry = await memorySvc.createEntry({
+        companyId: row.companyId,
+        layer: "workspace",
+        subject: `EM approved PR ${row.repo}#${row.pullNumber}: ${row.title}`.slice(0, 480),
+        body,
+        // The human decisionNote is what makes this a durable CONVENTION; a
+        // note-less merge is captured as a lighter 'note'.
+        kind: note ? "convention" : "note",
+        serviceScope: row.repo,
+        source: `pr-approval:${input.approvalId}`,
+        provenance: "pr-approval",
+        authorType: "user",
+        verificationState: "verified",
+        confidence: 0.8,
+        createdBy: input.decidedByUserId,
+        sourceRefType: "approval",
+        sourceRefId: input.approvalId,
+      });
+      return entry.id;
+    } catch (err) {
+      logger.warn(
+        { err, issuePullRequestId: input.row.id, approvalId: input.approvalId },
+        "HOOK 2 EM PR-approval capture failed (best-effort)",
+      );
+      return null;
+    }
   }
 
   return {

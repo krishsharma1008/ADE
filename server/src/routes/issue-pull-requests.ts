@@ -1,12 +1,12 @@
 import { Router } from "express";
 import type { Db } from "@combyne/db";
-import { issues } from "@combyne/db";
+import { acceptedWorkEvents, issues } from "@combyne/db";
 import {
   issuePullRequestFeedbackOptInSchema,
   issuePullRequestMergeSchema,
   issuePullRequestUpsertSchema,
 } from "@combyne/shared";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { validate } from "../middleware/validate.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { acceptedWorkService, heartbeatService, issuePullRequestService, logActivity } from "../services/index.js";
@@ -201,6 +201,22 @@ export function issuePullRequestRoutes(db: Db) {
       metadata: { githubUser: pr.user, baseBranch: pr.baseBranch, issuePullRequestId: row.id },
     });
     if (accepted.shouldWakeManager) await wakeAcceptedWorkManager(accepted.event);
+    // HOOK 2 link-back (§4.2): if the EM merge captured a verified pr-approval memory
+    // entry, link it onto the accepted-work event when nothing else has claimed it
+    // yet. Leaves memoryStatus 'pending' so the agent-driven createMemoryFromEvent
+    // path still runs (and may later overwrite with its own agent-claim entry); the
+    // isNull guard keeps this idempotent on re-fire.
+    if (result.approvalMemoryEntryId) {
+      await db
+        .update(acceptedWorkEvents)
+        .set({ memoryEntryId: result.approvalMemoryEntryId, updatedAt: new Date() })
+        .where(
+          and(
+            eq(acceptedWorkEvents.id, accepted.event.id),
+            isNull(acceptedWorkEvents.memoryEntryId),
+          ),
+        );
+    }
     await logActivity(db, {
       companyId: row.companyId,
       actorType: actor.actorType,
