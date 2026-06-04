@@ -32,6 +32,7 @@ import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
+import { contextDatabaseRoutes } from "./routes/context-database.js";
 import { fileOpsRoutes } from "./routes/file-ops.js";
 import { terminalRoutes } from "./routes/terminal.js";
 import { memoryRoutes } from "./routes/memory.js";
@@ -155,6 +156,7 @@ export async function createApp(
   api.use(companySkillRoutes(db));
   api.use(pluginRoutes(db));
   api.use(instanceSettingsRoutes(db));
+  api.use(contextDatabaseRoutes(db));
   api.use(fileOpsRoutes());
   api.use(terminalRoutes(db));
   api.use(memoryRoutes(db));
