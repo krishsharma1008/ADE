@@ -26,9 +26,61 @@ import { loadConfig } from "../config.js";
 /** The version string written when the hash-64 oracle is used (no/failed embed). */
 export const HASH_EMBEDDING_VERSION = "hash-64:64";
 
+/**
+ * Long-body truncation guard (retrieval-strategy critique — silent worst-tier
+ * fallback). text-embedding-3-* accept ~8192 tokens; an over-limit input makes
+ * the provider return HTTP 400, which the catch below demotes to the hash-64
+ * oracle (MRR 0.375) PERMANENTLY (the version-guard then makes that entry
+ * lexical-only forever) with no signal. Rather than let a long RFC/design doc —
+ * the highest-value long-form memory — silently fall into the worst tier, we
+ * HEAD-truncate the egressed text to a safe char budget (subject always kept).
+ * Estimate ~4 chars/token; cap at ~7800 tokens of headroom => 31200 chars.
+ * Truncation is a degradation (tail of a long doc is dropped), so we surface it
+ * via the truncation counter for the /memory/embedding-status surface; the
+ * stored `body` is never altered, only the text that egresses to the provider.
+ */
+export const MAX_EMBED_CHARS = 31_200;
+
+/** Module-level telemetry counters (process-local) for the embedding-status surface. */
+const telemetry = {
+  /** Times a storage/query embed text was head-truncated before egress. */
+  truncations: 0,
+  /** Times an embed (storage or query) fell back to the hash-64 oracle. */
+  hashFallbacks: 0,
+};
+
+/** Snapshot of the process-local embedder telemetry (read-only). */
+export function getEmbedderTelemetry(): { truncations: number; hashFallbacks: number } {
+  return { ...telemetry };
+}
+
+/** Test seam: zero the telemetry counters. */
+export function resetEmbedderTelemetry(): void {
+  telemetry.truncations = 0;
+  telemetry.hashFallbacks = 0;
+}
+
+/**
+ * Head-truncate `text` to MAX_EMBED_CHARS, incrementing the truncation counter
+ * when it actually cuts. Keeps the head (subject + the start of the body) since
+ * the subject leads the string and is the highest-signal span.
+ */
+function truncateForEmbed(text: string): string {
+  if (text.length <= MAX_EMBED_CHARS) return text;
+  telemetry.truncations++;
+  return text.slice(0, MAX_EMBED_CHARS);
+}
+
 export interface EmbedForStorageResult {
   vector: number[];
   version: string;
+  /**
+   * The BARE model (e.g. 'text-embedding-3-small'), distinct from the composite
+   * `version` ('provider:model:dim'). Persisted to the embedding_model column so
+   * per-model analytics / HNSW-build gating have a clean key. On the hash-64
+   * fallback this is HASH_EMBEDDING_VERSION (no bare model exists).
+   */
+  model: string;
   /** Findings from the body scan; non-empty → caller marks the entry needs_review. */
   redactedFindings: Finding[];
   /** sha256 of the redacted text — persisted as content_hash for cache/change-detect. */
@@ -119,22 +171,26 @@ export function makeMemoryEmbedder(deps: MakeEmbedderDeps = {}): MemoryEmbedder 
     async embedForStorage(subject: string, body: string): Promise<EmbedForStorageResult> {
       const raw = `${subject}\n${body}`;
       if (!enabled || !driver) {
+        telemetry.hashFallbacks++;
         return {
           vector: hashVector(raw),
           version: HASH_EMBEDDING_VERSION,
+          model: HASH_EMBEDDING_VERSION,
           redactedFindings: [],
           contentHash: contentHash(raw),
         };
       }
-      // REDACT-BEFORE-EMBED — runs before any provider call.
+      // REDACT-BEFORE-EMBED — runs before any provider call. Then head-truncate
+      // so an over-limit body never throws into the silent hash-64 worst tier.
       const scan = scanBody(raw);
-      const text = scan.clean;
+      const text = truncateForEmbed(scan.clean);
       const hash = contentHash(text);
       const cached = cache.get(hash, driver.version);
       if (cached) {
         return {
           vector: cached.vector,
           version: cached.version,
+          model: cached.model ?? cfg.embeddingModel,
           redactedFindings: scan.findings,
           contentHash: hash,
         };
@@ -142,13 +198,21 @@ export function makeMemoryEmbedder(deps: MakeEmbedderDeps = {}): MemoryEmbedder 
       try {
         const r = await driver.embed([text]);
         const vector = r.vectors[0];
-        cache.set(hash, { vector, version: r.version });
-        return { vector, version: r.version, redactedFindings: scan.findings, contentHash: hash };
+        cache.set(hash, { vector, version: r.version, model: r.model });
+        return {
+          vector,
+          version: r.version,
+          model: r.model,
+          redactedFindings: scan.findings,
+          contentHash: hash,
+        };
       } catch {
         // ANY error → hash fallback, NEVER throw. Capture hooks must not fail.
+        telemetry.hashFallbacks++;
         return {
           vector: hashVector(raw),
           version: HASH_EMBEDDING_VERSION,
+          model: HASH_EMBEDDING_VERSION,
           redactedFindings: scan.findings,
           contentHash: hash,
         };
@@ -157,15 +221,17 @@ export function makeMemoryEmbedder(deps: MakeEmbedderDeps = {}): MemoryEmbedder 
 
     async embedQuery(text: string): Promise<EmbedQueryResult> {
       if (!enabled || !driver) {
+        telemetry.hashFallbacks++;
         return { vector: hashVector(text), version: HASH_EMBEDDING_VERSION, redactedFindings: [] };
       }
       // The QUERY text is egressed too (issue identifier+title+description),
       // which can also carry secrets — scan it on this path as well (§1.4.2).
       const scan = scanBody(text);
       try {
-        const r = await driver.embed([scan.clean]);
+        const r = await driver.embed([truncateForEmbed(scan.clean)]);
         return { vector: r.vectors[0], version: r.version, redactedFindings: scan.findings };
       } catch {
+        telemetry.hashFallbacks++;
         return { vector: hashVector(text), version: HASH_EMBEDDING_VERSION, redactedFindings: scan.findings };
       }
     },

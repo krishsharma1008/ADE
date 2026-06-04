@@ -401,5 +401,19 @@ export function memoryRoutes(db: Db) {
     res.json({ proposals });
   });
 
+  // Ops visibility for the embedding stack (§1.9): version coverage %,
+  // hash-fallback rate, re-embed backlog, redaction-blocked count, HNSW index
+  // presence, and config-vs-reality echoes. Read-only; board-scoped because it
+  // exposes corpus-wide operational counts. This is the surface an operator
+  // checks BEFORE flipping vectorSearchEnabled (backlog must be 0 first) and
+  // mid-backfill to watch progress so "recall silently dropped" becomes visible.
+  router.get("/companies/:companyId/memory/embedding-status", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const status = await svc.embeddingStatus(companyId);
+    res.json(status);
+  });
+
   return router;
 }

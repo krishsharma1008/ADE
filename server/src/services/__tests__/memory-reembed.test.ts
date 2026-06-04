@@ -13,6 +13,8 @@ import type { EmbeddingDriver } from "../embedding-driver.js";
 import { startTestDb, stopTestDb, type TestDbHandle } from "./_test-db.js";
 
 const API_VERSION = "openai:text-embedding-3-small:1536";
+// PR-12: embedding_model stores the BARE model, NOT the composite version.
+const API_MODEL = "text-embedding-3-small";
 
 function makeMockDriver(): EmbeddingDriver & { calls: string[][] } {
   const calls: string[][] = [];
@@ -108,7 +110,7 @@ describe("PR-11 memory-reembed backfill", () => {
       .where(eq(memoryEntries.companyId, companyId));
     expect(rows.length).toBe(5);
     expect(rows.every((r) => r.embeddingVersion === API_VERSION)).toBe(true);
-    expect(rows.every((r) => r.embeddingModel === API_VERSION)).toBe(true);
+    expect(rows.every((r) => r.embeddingModel === API_MODEL)).toBe(true);
     expect(rows.every((r) => r.embeddingDim === 1536)).toBe(true);
     expect(rows.every((r) => r.contentHash && r.contentHash.length > 0)).toBe(true);
 

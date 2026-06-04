@@ -12,6 +12,28 @@
 // All the load-bearing logic lives in reembedBackfill() so it is unit-testable
 // against the embedded rig with a mocked/disabled embedder.
 //
+// ┌─ SAFE ENABLE ORDER (correctness-transition critique — READ THIS) ───────────┐
+// │ The embedder's `enabled` flag (COMBYNE_VECTOR_SEARCH_ENABLED + a key) drives │
+// │ BOTH this backfill AND the SERVER's live query egress. If you flip the flag  │
+// │ on the running server BEFORE the corpus is re-embedded, the live query embeds│
+// │ at the API version while every entry still carries 'hash-64:64' — the version│
+// │ guard then scores semantic=0 for the whole corpus (jsonb path) or returns 0  │
+// │ candidates (pgvector ANN path, now fixed to fall through). Recall silently   │
+// │ collapses. So sequence the TWO flags independently:                          │
+// │                                                                              │
+// │   1. Apply migration 0052 (adds the columns; builds NO index).               │
+// │   2. Run THIS script with the flag set IN THE CLI ENV ONLY, while the         │
+// │      SERVER process keeps COMBYNE_VECTOR_SEARCH_ENABLED=false:                │
+// │        COMBYNE_VECTOR_SEARCH_ENABLED=true COMBYNE_EMBEDDING_API_KEY=sk-… \    │
+// │          DATABASE_URL=… pnpm db:memory-reembed                                │
+// │   3. Confirm backlog == 0 via GET /companies/:id/memory/embedding-status      │
+// │      (reembedBacklog: 0, versionCoveragePct: 1.0) for EVERY company.          │
+// │   4. (pgvector only) Build the HNSW index CONCURRENTLY once coverage is 100%. │
+// │   5. ONLY NOW flip COMBYNE_VECTOR_SEARCH_ENABLED=true on the SERVER and       │
+// │      restart it, so the live query path turns on against a fully migrated     │
+// │      corpus.                                                                  │
+// └──────────────────────────────────────────────────────────────────────────────┘
+//
 // Usage:
 //   DATABASE_URL=postgres://… COMBYNE_VECTOR_SEARCH_ENABLED=true \
 //     COMBYNE_EMBEDDING_API_KEY=sk-… node server/scripts/memory-reembed.ts

@@ -124,7 +124,7 @@ export async function reembedBackfill(
         UPDATE ${memoryEntries}
         SET embedding = ${JSON.stringify(result.vector)}::jsonb,
             embedding_version = ${result.version},
-            embedding_model = ${result.version},
+            embedding_model = ${result.model},
             embedding_dim = ${result.vector.length},
             content_hash = ${result.contentHash}
         WHERE id = ${row.id}

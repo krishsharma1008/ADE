@@ -33,6 +33,7 @@ const ALLOWLIST = [
   "server/src/services/__tests__/embedding-driver.test.ts",
   "server/src/services/__tests__/embedding-version.test.ts",
   "server/src/services/__tests__/memory-reembed.test.ts",
+  "server/src/services/__tests__/embedding-status.test.ts",
 ];
 
 function listSourceFiles() {
@@ -40,14 +41,24 @@ function listSourceFiles() {
   if (argvFiles.length > 0) {
     return argvFiles.map((f) => (f.startsWith("/") ? f : resolve(repoRoot, f)));
   }
-  const out = execSync("git ls-files -- 'server/src/**/*.ts'", {
+  // De-vacuum (correctness-transition critique): enumerate TRACKED files PLUS
+  // UNTRACKED-but-not-ignored files, so a developer adding an un-committed
+  // direct-importer bypass cannot pass green simply by leaving it uncommitted.
+  const tracked = execSync("git ls-files -- 'server/src/**/*.ts'", {
     encoding: "utf8",
     cwd: repoRoot,
   });
-  return out
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const untracked = execSync(
+    "git ls-files --others --exclude-standard -- 'server/src/**/*.ts'",
+    { encoding: "utf8", cwd: repoRoot },
+  );
+  const files = new Set(
+    `${tracked}\n${untracked}`
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean),
+  );
+  return Array.from(files);
 }
 
 // Matches: import … from "…/embedding-driver(.js)?"  and  import("…/embedding-driver")

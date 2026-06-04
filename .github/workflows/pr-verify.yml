@@ -35,6 +35,17 @@ jobs:
       - name: Typecheck
         run: pnpm -r typecheck
 
+      # Redact-before-embed boundary + queryRanked trust-filter + forbidden
+      # tokens. These were previously orphaned scripts that ran NOWHERE in CI;
+      # the embedding-driver lint also now enumerates untracked files so a
+      # new direct-importer bypass cannot pass green by staying uncommitted.
+      # (The same gates are additionally enforced in-process via test:run.)
+      - name: Lint gates
+        run: |
+          pnpm lint:embedding-driver
+          pnpm lint:queryranked
+          pnpm check:tokens
+
       - name: Run tests
         run: pnpm test:run
 

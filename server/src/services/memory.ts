@@ -23,7 +23,11 @@ import type {
   MemoryPromotion,
 } from "@combyne/shared";
 import type { MemoryEmbedder, EmbedForStorageResult } from "./memory-embedder.js";
-import { getMemoryEmbedder } from "./memory-embedder.js";
+import {
+  getMemoryEmbedder,
+  getEmbedderTelemetry,
+  HASH_EMBEDDING_VERSION,
+} from "./memory-embedder.js";
 
 type MemoryEntryRow = typeof memoryEntries.$inferSelect;
 
@@ -191,6 +195,34 @@ export interface RankInputEntry {
 export interface QueryEmbedding {
   vector: number[];
   version: string;
+}
+
+/** Read-only ops snapshot of the embedding stack for GET /memory/embedding-status. */
+export interface EmbeddingStatus {
+  /** True only when a real embedder will be called (flag on AND key present). */
+  embedderEnabled: boolean;
+  /** The embedding_version a successful embed currently writes. */
+  currentVersion: string;
+  /** Count of active entries in the company. */
+  activeEntries: number;
+  /** Fraction of active entries on currentVersion (1 when empty). 1.0 == fully migrated. */
+  versionCoveragePct: number;
+  /** Fraction of active entries stuck on the hash-64 oracle (0 when empty). */
+  hashFallbackPct: number;
+  /** Count of active entries per embedding_version value present. */
+  versionBreakdown: Record<string, number>;
+  /** Active entries off currentVersion (or missing embedding_vec) — the backfill backlog. */
+  reembedBacklog: number;
+  /** Active entries quarantined to needs_review (includes redact-before-embed blocks). */
+  redactionBlocked: number;
+  /** Whether an HNSW index exists on embedding_vec (else the pushdown is brute-force KNN). */
+  hnswIndexPresent: boolean;
+  /** Whether the pgvector embedding_vec column exists on this deployment. */
+  pgvectorPresent: boolean;
+  /** Process-local count of embeds that fell back to hash-64 (resets on restart). */
+  queryHashFallbacks: number;
+  /** Process-local count of long-body truncations before egress (resets on restart). */
+  truncations: number;
 }
 
 export interface RankedEntry {
@@ -401,14 +433,18 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
 
   async function writeVectorColumns(
     id: string,
-    storage: { vector: number[]; version: string; contentHash: string },
+    storage: { vector: number[]; version: string; model: string; contentHash: string },
   ): Promise<void> {
     if (!embedder.enabled || storage.version === "hash-64:64") return;
     // Always persist the bookkeeping columns (created unconditionally by 0052).
+    // embedding_model holds the BARE model (e.g. 'text-embedding-3-small'); the
+    // composite 'provider:model:dim' stays in embedding_version. Storing the
+    // bare model keeps the column useful for per-model analytics / HNSW gating
+    // instead of duplicating embedding_version.
     await db
       .execute(sql`
         UPDATE ${memoryEntries}
-        SET embedding_model = ${storage.version},
+        SET embedding_model = ${storage.model},
             embedding_dim = ${storage.vector.length},
             content_hash = ${storage.contentHash}
         WHERE id = ${id}
@@ -516,6 +552,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
         await writeVectorColumns(inserted.id, {
           vector: embedding,
           version: embedResult.version,
+          model: embedResult.model,
           contentHash: embedResult.contentHash,
         });
         return rowToEntry(inserted);
@@ -537,6 +574,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     await writeVectorColumns(row.id, {
       vector: embedding,
       version: embedResult.version,
+      model: embedResult.model,
       contentHash: embedResult.contentHash,
     });
     return rowToEntry(row);
@@ -590,6 +628,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       await writeVectorColumns(row.id, {
         vector: embedResult.vector,
         version: embedResult.version,
+        model: embedResult.model,
         contentHash: embedResult.contentHash,
       });
     }
@@ -666,7 +705,16 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       const annRows = await loadCandidatesByVector(companyId, opts, queryEmbedding).catch(
         () => null,
       );
-      if (annRows) return filterPersonal(annRows, opts);
+      // CRITICAL (correctness-transition critique): the ANN query filters
+      // `embedding_version = <current>`, so on a not-yet-reembedded corpus it
+      // returns `[]` — and `[]` is TRUTHY. The old `if (annRows)` therefore
+      // short-circuited and returned ZERO candidates for EVERY query during the
+      // pre-backfill window (a silent dark-retrieval blackout, the worst failure
+      // for a memory system). We now fall through to the jsonb/lexical window
+      // when the ANN result is EMPTY so a partially/never-backfilled corpus
+      // still surfaces context (lexical + any reembedded rows). A genuinely
+      // empty corpus pays one cheap jsonb scan, which is harmless.
+      if (annRows && annRows.length > 0) return filterPersonal(annRows, opts);
     }
 
     const rows = await db
@@ -1115,6 +1163,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     await writeVectorColumns(row.id, {
       vector: embedResult.vector,
       version: embedResult.version,
+      model: embedResult.model,
       contentHash: embedResult.contentHash,
     });
     return rowToEntry(row);
@@ -1206,6 +1255,89 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     return proposals;
   }
 
+  /**
+   * Ops visibility for the embedding stack (ops-cost + correctness-transition
+   * critiques §1.9). Read-only — every field maps to a query/signal already on
+   * disk. Surfaces, for the operator, whether the corpus is on the current
+   * model, how big the re-embed backlog is (so a flipped flag's blackout window
+   * is visible), the hash-fallback / truncation telemetry, the redaction
+   * quarantine count, and config-vs-reality (HNSW index present? cap/rpm echoes).
+   */
+  async function embeddingStatus(companyId: string): Promise<EmbeddingStatus> {
+    const currentVersion = embedder.version;
+    // One pass over active rows: total, current-version coverage, hash count,
+    // distinct version breakdown. embedding_version is a real drizzle column.
+    const rows = (await db.execute(sql`
+      SELECT COALESCE(embedding_version, 'null') AS version, COUNT(*)::int AS n
+      FROM ${memoryEntries}
+      WHERE company_id = ${companyId} AND status = 'active'
+      GROUP BY embedding_version
+    `)) as unknown as Array<{ version: string; n: number }>;
+    let total = 0;
+    let onCurrent = 0;
+    let hashCount = 0;
+    const byVersion: Record<string, number> = {};
+    for (const r of rows) {
+      const n = Number(r.n) || 0;
+      total += n;
+      byVersion[r.version] = n;
+      if (r.version === currentVersion) onCurrent += n;
+      if (r.version === HASH_EMBEDDING_VERSION) hashCount += n;
+    }
+
+    // Re-embed backlog = the EXACT predicate reembedBackfill uses, restricted to
+    // this company. embedding_vec may be absent (no pgvector), so guard it.
+    const hasVec = await hasVectorColumn();
+    const backlogPredicate = hasVec
+      ? sql`(embedding_version IS DISTINCT FROM ${currentVersion} OR embedding_vec IS NULL)`
+      : sql`embedding_version IS DISTINCT FROM ${currentVersion}`;
+    const backlogRows = (await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM ${memoryEntries}
+      WHERE company_id = ${companyId} AND status = 'active' AND ${backlogPredicate}
+    `)) as unknown as Array<{ n: number }>;
+    const reembedBacklog = embedder.enabled ? Number(backlogRows[0]?.n ?? 0) : 0;
+
+    // Redaction-blocked = the needs_review quarantine (createEntry forces this
+    // when the body scan found+redacted a secret before egress).
+    const redactRows = (await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM ${memoryEntries}
+      WHERE company_id = ${companyId} AND status = 'active'
+        AND verification_state = 'needs_review'
+    `)) as unknown as Array<{ n: number }>;
+    const redactionBlocked = Number(redactRows[0]?.n ?? 0);
+
+    // HNSW index present? config-vs-reality for the "ANN" label (the index is a
+    // documented later step; without it the pushdown is brute-force KNN).
+    let hnswIndexPresent = false;
+    if (hasVec) {
+      const idxRows = (await db
+        .execute(sql`
+          SELECT 1 FROM pg_indexes
+          WHERE tablename = 'memory_entries' AND indexdef ILIKE '%hnsw%'
+          LIMIT 1
+        `)
+        .catch(() => [] as unknown[])) as unknown as unknown[];
+      hnswIndexPresent = idxRows.length > 0;
+    }
+
+    const tel = getEmbedderTelemetry();
+    return {
+      embedderEnabled: embedder.enabled,
+      currentVersion,
+      activeEntries: total,
+      versionCoveragePct: total > 0 ? onCurrent / total : 1,
+      hashFallbackPct: total > 0 ? hashCount / total : 0,
+      versionBreakdown: byVersion,
+      reembedBacklog,
+      redactionBlocked,
+      hnswIndexPresent,
+      pgvectorPresent: hasVec,
+      // Process-local telemetry (resets on restart — multi-worker is per-worker).
+      queryHashFallbacks: tel.hashFallbacks,
+      truncations: tel.truncations,
+    };
+  }
+
   return {
     createEntry,
     getEntry,
@@ -1222,6 +1354,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     decidePromotion,
     runDecayPass,
     runAutoDistill,
+    embeddingStatus,
   };
 }
 
