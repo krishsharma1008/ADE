@@ -70,6 +70,19 @@ export interface Config {
   licenseSupabaseAnonKey: string;
   licenseHeartbeatIntervalMinutes: number;
   licenseGracePeriodHours: number;
+  // ---- Sufficiency gate (PR-10, MEMORY_UI_AND_QUALITY_PLAN §2) ----
+  /**
+   * Master flag for the ask-don't-hallucinate sufficiency gate. DEFAULT OFF.
+   * While off the heartbeat emits a `sufficiency_verdict` telemetry event only
+   * and NEVER withholds context or posts a question (§2.8 — the gate is a true
+   * no-op until 0049 + HOOK 1 calibrate it). The ask-mode flip is a later
+   * (Phase 3) config change after threshold calibration.
+   */
+  sufficiencyGateEnabled: boolean;
+  /** Hash-64 calibrated minimum top score below which context is sub-threshold (§2.3). */
+  sufficiencyMinScore: number;
+  /** Hash-64 calibrated minimum requirement-coverage fraction (§2.3). */
+  sufficiencyReqCoverMin: number;
 }
 
 export function loadConfig(): Config {
@@ -228,6 +241,17 @@ export function loadConfig(): Config {
     Number(envVar("LICENSE_GRACE_PERIOD_HOURS")) || fileLicense?.gracePeriodHours || 24,
   );
 
+  // ---- Sufficiency gate (PR-10) — default OFF; thresholds are hash-64 calibrated. ----
+  const sufficiencyGateEnabled = envVar("SUFFICIENCY_GATE_ENABLED") === "true";
+  const sufficiencyMinScoreRaw = Number(envVar("SUFFICIENCY_MIN_SCORE"));
+  const sufficiencyMinScore = Number.isFinite(sufficiencyMinScoreRaw)
+    ? sufficiencyMinScoreRaw
+    : 0.22;
+  const sufficiencyReqCoverRaw = Number(envVar("REQ_COVER_MIN"));
+  const sufficiencyReqCoverMin = Number.isFinite(sufficiencyReqCoverRaw)
+    ? sufficiencyReqCoverRaw
+    : 0.34;
+
   return {
     deploymentMode,
     deploymentExposure,
@@ -278,5 +302,8 @@ export function loadConfig(): Config {
     licenseSupabaseAnonKey,
     licenseHeartbeatIntervalMinutes,
     licenseGracePeriodHours,
+    sufficiencyGateEnabled,
+    sufficiencyMinScore,
+    sufficiencyReqCoverMin,
   };
 }

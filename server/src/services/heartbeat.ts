@@ -34,7 +34,15 @@ import { isPassdownPacket } from "./em-passdown.js";
 import { acceptedWorkService } from "./accepted-work.js";
 import { issuePullRequestService } from "./issue-pull-requests.js";
 import { memoryService } from "./memory.js";
-import type { MemoryEntry } from "@combyne/shared";
+import {
+  evaluateSufficiency,
+  extractRequirementTokens,
+  type SufficiencyItem,
+  type SufficiencyResult,
+} from "./memory-sufficiency.js";
+import { evaluateAskBudget } from "./sufficiency-budget.js";
+import { routeAgentQuestionsToManager } from "./agent-question-routing.js";
+import type { IssueComplexity, MemoryEntry, MemoryQueryResult } from "@combyne/shared";
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
 import { loadAssignedIssueQueue, loadNextFocusedIssue } from "./agent-queue.js";
 import {
@@ -182,6 +190,174 @@ export function renderLongTermMemoryPreamble(entries: MemoryEntry[]): string {
 
 function autoCloseManualIssueRunsEnabled(): boolean {
   return asBoolean(process.env.COMBYNE_AUTO_CLOSE_MANUAL_ISSUES, false);
+}
+
+/**
+ * PR-10 — master flag for the ask-don't-hallucinate sufficiency gate. DEFAULT
+ * OFF. While off (DARK) the gate emits a `sufficiency_verdict` telemetry event
+ * ONLY: it NEVER withholds context and NEVER posts a question
+ * (MEMORY_UI_AND_QUALITY_PLAN §2.8). Read live (not cached) so the ask-mode flip
+ * is a Phase-3 env change after calibration — never a code path change. Mirrors
+ * the usagePauseEnabled() pattern.
+ */
+export function sufficiencyGateEnabled(): boolean {
+  return process.env.COMBYNE_SUFFICIENCY_GATE_ENABLED === "true";
+}
+
+export interface SufficiencyGateInput {
+  companyId: string;
+  agentId: string;
+  issueId: string;
+  /** Ranked retrieval result for the self-retrieval channel. */
+  ranked: MemoryQueryResult;
+  /** Full entries fetched from the ranked ids (carry the 0049 trust fields). */
+  entries: MemoryEntry[];
+  /** Ticket fields for entity + requirement coverage. */
+  ticket: { serviceScope: string | null; title: string; description: string | null };
+  complexity: IssueComplexity | null;
+  /** Optional sink so tests can assert the exact telemetry without a log scrape. */
+  onTelemetry?: (event: SufficiencyTelemetryEvent) => void;
+}
+
+export interface SufficiencyTelemetryEvent {
+  event: "sufficiency_verdict";
+  companyId: string;
+  agentId: string;
+  issueId: string;
+  verdict: SufficiencyResult["verdict"];
+  topScore: number;
+  verifiedCovered: boolean;
+  entityCoverage: number;
+  requirementCoverage: number;
+  thresholdsMissing: boolean;
+  gateEnabled: boolean;
+  /** Whether the gate actually withheld context (always false while dark). */
+  withheld: boolean;
+  /** Whether the gate actually posted a question (always false while dark). */
+  asked: boolean;
+}
+
+export interface SufficiencyGateOutcome {
+  verdict: SufficiencyResult["verdict"];
+  /** H1 — true ⇒ the heartbeat must NOT inject the sub-threshold preamble. */
+  withholdPreamble: boolean;
+  /** H2 — true ⇒ a gate-authored question was posted + the issue transitioned. */
+  asked: boolean;
+  result: SufficiencyResult;
+}
+
+/**
+ * PR-10 — the self-retrieval sufficiency gate (H1 + H2), shipped DARK.
+ *
+ * ALWAYS runs `evaluateSufficiency` and ALWAYS emits a `sufficiency_verdict`
+ * telemetry event. The behavioral half is gated:
+ *
+ *  - DARK (default, gate disabled): returns `{ withholdPreamble:false, asked:false }`.
+ *    A TRUE NO-OP — it never touches the preamble and never posts a question.
+ *    This is the calibration phase: emit verdicts on the real corpus first
+ *    (§2.8). It is also non-actionable when the threshold set for the active
+ *    embedding version is missing (§2.3) — the verdict is forced `sufficient`.
+ *
+ *  - ENABLED (Phase-3 ask-mode, not flipped here): on `insufficient` it
+ *    (H1) signals the caller to withhold the sub-threshold preamble AND
+ *    (H2) posts the gate-authored question via routeAgentQuestionsToManager —
+ *    subject to the §2.7 per-issue budget + per-subjectKey cooldown — which
+ *    also deterministically transitions the issue to blocked. `thin` is
+ *    label-only (never withholds, never asks).
+ */
+export async function maybeRunSufficiencyGate(
+  db: Db,
+  input: SufficiencyGateInput,
+): Promise<SufficiencyGateOutcome> {
+  const trustById = new Map(input.entries.map((e) => [e.id, e]));
+  const items: SufficiencyItem[] = input.ranked.items.map((it) => {
+    const entry = trustById.get(it.id);
+    return {
+      score: it.score,
+      verificationState: entry?.verificationState ?? null,
+      provenance: entry?.provenance ?? null,
+      confidence: entry?.confidence ?? null,
+      serviceScope: entry?.serviceScope ?? it.serviceScope ?? null,
+      subject: entry?.subject ?? it.subject ?? null,
+    };
+  });
+  const requirementTokens = extractRequirementTokens(
+    `${input.ticket.title}\n${input.ticket.description ?? ""}`,
+  );
+  // The active embedding version is the version stamped on the surviving
+  // entries (PR-11 stamps real entries); null ⇒ the legacy hash-64 embedder,
+  // resolved inside evaluateSufficiency.
+  const embeddingVersion =
+    input.entries.find((e) => e.embeddingVersion)?.embeddingVersion ?? null;
+  const result = evaluateSufficiency({
+    items,
+    serviceScope: input.ticket.serviceScope,
+    requirementTokens,
+    complexity: input.complexity,
+    embeddingVersion,
+  });
+
+  const enabled = sufficiencyGateEnabled();
+  // Decision-critical ask only (§2.7): insufficient AND entityCoverage===0.
+  // Never actionable when the threshold set is missing (§2.3 forces sufficient).
+  const actionable =
+    enabled && result.verdict === "insufficient" && result.entityCoverage === 0;
+
+  let withholdPreamble = false;
+  let asked = false;
+  if (actionable) {
+    // H1 — withhold the sub-threshold context (don't just annotate it).
+    withholdPreamble = true;
+    // H2 — post the gate-authored question via the EXISTING routing machinery,
+    // gated by the §2.7 budget + per-subjectKey cooldown.
+    try {
+      const missing = result.missingEntities.join(", ");
+      const question =
+        `I don't have vetted context to act on this safely` +
+        (missing ? ` (missing: ${missing})` : "") +
+        `. Can you confirm the intended approach or point me to the source of truth?`;
+      const budget = await evaluateAskBudget(db, {
+        companyId: input.companyId,
+        issueId: input.issueId,
+        question,
+      });
+      if (budget.allowed) {
+        await routeAgentQuestionsToManager(db, {
+          companyId: input.companyId,
+          issueId: input.issueId,
+          askingAgentId: input.agentId,
+          questions: [question],
+          actor: { actorType: "system", actorId: "sufficiency-gate" },
+        });
+        asked = true;
+      }
+    } catch (err) {
+      logger.warn(
+        { err, issueId: input.issueId, agentId: input.agentId },
+        "sufficiency gate failed to post question",
+      );
+    }
+  }
+
+  const telemetry: SufficiencyTelemetryEvent = {
+    event: "sufficiency_verdict",
+    companyId: input.companyId,
+    agentId: input.agentId,
+    issueId: input.issueId,
+    verdict: result.verdict,
+    topScore: result.topScore,
+    verifiedCovered: result.verifiedCovered,
+    entityCoverage: result.entityCoverage,
+    requirementCoverage: result.requirementCoverage,
+    thresholdsMissing: result.thresholdsMissing,
+    gateEnabled: enabled,
+    withheld: withholdPreamble,
+    asked,
+  };
+  input.onTelemetry?.(telemetry);
+  logger.info(telemetry, "sufficiency_verdict");
+
+  return { verdict: result.verdict, withholdPreamble, asked, result };
 }
 
 /**
@@ -3976,6 +4152,7 @@ export function heartbeatService(db: Db) {
             title: issues.title,
             description: issues.description,
             identifier: issues.identifier,
+            serviceScope: issues.serviceScope,
           })
           .from(issues)
           .where(and(eq(issues.id, memoryIssueId), eq(issues.companyId, agent.companyId)))
@@ -4034,6 +4211,43 @@ export function heartbeatService(db: Db) {
               entryCount: entries.length,
               source: "memory_entries",
             };
+          }
+          // ---- PR-10 — sufficiency gate (H1/H2), shipped DARK (§2.8) ----
+          // ALWAYS emits a `sufficiency_verdict` telemetry event. While
+          // COMBYNE_SUFFICIENCY_GATE_ENABLED is off this is a TRUE NO-OP: it
+          // never withholds the preamble above (H1) and never posts a question
+          // (H2). The ask-mode flip is a Phase-3 env change after calibration —
+          // never a code change here. Best-effort: a gate failure must never
+          // break the memory-injection path.
+          try {
+            const gate = await maybeRunSufficiencyGate(db, {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              issueId: memoryIssueId,
+              ranked,
+              entries,
+              ticket: {
+                serviceScope: issueRow.serviceScope ?? null,
+                title: issueRow.title,
+                description: issueRow.description ?? null,
+              },
+              complexity:
+                issueComplexity === "small" ||
+                issueComplexity === "medium" ||
+                issueComplexity === "large"
+                  ? (issueComplexity as IssueComplexity)
+                  : null,
+            });
+            // H1 — withhold the sub-threshold context (only when ENABLED;
+            // always false while dark, so the preamble above is untouched).
+            if (gate.withholdPreamble) {
+              delete context.combyneLongTermMemoryPreamble;
+            }
+          } catch (err) {
+            logger.debug(
+              { err, agentId: agent.id, runId, issueId: memoryIssueId },
+              "sufficiency gate evaluation failed",
+            );
           }
         }
       } catch (err) {
