@@ -119,6 +119,62 @@ function isAllowlisted(file, line) {
   );
 }
 
+/**
+ * Replace the contents of `//` line comments and `/* *​/` block comments with
+ * spaces (newlines preserved) so a `queryRanked` mention in prose is not scanned
+ * as a call. Strings/templates are tracked so a `//` inside a string literal is
+ * not mistaken for a comment. Offsets and line counts are preserved exactly.
+ */
+function stripComments(src) {
+  let out = "";
+  let i = 0;
+  let inString = null; // '"' | "'" | '`'
+  while (i < src.length) {
+    const ch = src[i];
+    const next = src[i + 1];
+    if (inString) {
+      out += ch;
+      if (ch === "\\") {
+        out += next ?? "";
+        i += 2;
+        continue;
+      }
+      if (ch === inString) inString = null;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inString = ch;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      while (i < src.length && src[i] !== "\n") {
+        out += " ";
+        i++;
+      }
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      out += "  ";
+      i += 2;
+      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) {
+        out += src[i] === "\n" ? "\n" : " ";
+        i++;
+      }
+      if (i < src.length) {
+        out += "  ";
+        i += 2;
+      }
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
 const CALL_RE = /\bqueryRanked\s*\(/g;
 const violations = [];
 let callSitesChecked = 0;
@@ -133,6 +189,11 @@ for (const entry of listSourceFiles()) {
     continue;
   }
   if (!src.includes("queryRanked")) continue;
+  // A `queryRanked` mention inside a `//` or `/* */` comment is prose (e.g. a
+  // JSDoc "Ranked items from queryRanked"), not a runtime call site. Blank out
+  // comment spans (preserving offsets + newlines so reported line numbers stay
+  // correct) so the call-count scan never trips on documentation.
+  src = stripComments(src);
 
   CALL_RE.lastIndex = 0;
   let m;

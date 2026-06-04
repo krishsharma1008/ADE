@@ -22,6 +22,8 @@ import type {
   MemoryCoreContext,
   MemoryPromotion,
 } from "@combyne/shared";
+import type { MemoryEmbedder, EmbedForStorageResult } from "./memory-embedder.js";
+import { getMemoryEmbedder } from "./memory-embedder.js";
 
 type MemoryEntryRow = typeof memoryEntries.$inferSelect;
 
@@ -88,8 +90,35 @@ function l2Normalize(v: number[]): number[] {
   return v.map((x) => x / norm);
 }
 
-export function cosineSimilarity(a: number[] | null, b: number[] | null): number {
+/**
+ * Cosine similarity between two L2-normalized vectors (returns the dot product).
+ *
+ * PR-11 embedding_version guard: when BOTH a version for the query side
+ * (`versionA`) and the entry side (`versionB`) are provided, the score is only
+ * computed when the versions MATCH. Mismatched versions mean the two vectors
+ * live in different embedding spaces (e.g. a 64-dim hash vector vs a 1536-dim
+ * API vector); dotting them over min(len) returns a valid-but-meaningless score
+ * with no error. On a version mismatch we return 0 — never cross-score two
+ * spaces. Callers that have unembedded/hash-space query+entry pairs simply omit
+ * the versions (the legacy 2-arg call) and get the historical behaviour.
+ */
+export function cosineSimilarity(
+  a: number[] | null,
+  b: number[] | null,
+  versionA?: string | null,
+  versionB?: string | null,
+): number {
   if (!a || !b) return 0;
+  // Version guard: if both versions are known and differ, refuse to cross-score.
+  if (
+    versionA !== undefined &&
+    versionA !== null &&
+    versionB !== undefined &&
+    versionB !== null &&
+    versionA !== versionB
+  ) {
+    return 0;
+  }
   const len = Math.min(a.length, b.length);
   if (len === 0) return 0;
   let dot = 0;
@@ -148,8 +177,20 @@ export interface RankInputEntry {
   body: string;
   tags: string[];
   embedding: number[] | null;
+  /**
+   * embedding_version of `embedding` (PR-11). When present alongside the query
+   * embedding's version, the cosine version-guard refuses to cross-score two
+   * spaces. Omitted (undefined) for the legacy hash-only path.
+   */
+  embeddingVersion?: string | null;
   lastUsedAt: Date | null;
   updatedAt: Date;
+}
+
+/** A precomputed query embedding lifted OUT of rankEntries (PR-11, §0.3). */
+export interface QueryEmbedding {
+  vector: number[];
+  version: string;
 }
 
 export interface RankedEntry {
@@ -162,21 +203,33 @@ export interface RankedEntry {
 
 /**
  * Hybrid ranker: lexical + embedding-cosine + recency, scaled by layer weight.
- * Pure function — easy to unit-test without a DB.
+ * Pure function — easy to unit-test without a DB. Stays SYNC and deterministic.
+ *
+ * PR-11 (§1.1 load-bearing): the QUERY-side embedding is lifted OUT of this
+ * ranker into an async pre-step (embedQuery). queryRanked computes the query
+ * embedding first and passes it in via `queryEmbedding`. When `queryEmbedding`
+ * is omitted (the test oracle + any pure caller), the ranker falls back to the
+ * deterministic hash-64 embedText(query) — preserving the historical behaviour
+ * and keeping memory-ranker.test.ts green. The cosine version-guard then refuses
+ * to cross-score a hash-space query against an API-space entry vector.
  */
 export function rankEntries(
   query: string,
   entries: RankInputEntry[],
   weights: { lexical?: number; semantic?: number; recency?: number } = {},
+  queryEmbedding?: QueryEmbedding,
 ): RankedEntry[] {
   const wLex = weights.lexical ?? 0.5;
   const wSem = weights.semantic ?? 0.35;
   const wRec = weights.recency ?? 0.15;
-  const queryEmb = embedText(query);
+  // Fall back to the synchronous hash embedding when no precomputed query
+  // embedding is supplied (the pure-ranker oracle path).
+  const queryEmb = queryEmbedding?.vector ?? embedText(query);
+  const queryVersion = queryEmbedding?.version;
   return entries
     .map((entry) => {
       const lex = lexicalScore(query, entry.subject, entry.body, entry.tags);
-      const sem = cosineSimilarity(queryEmb, entry.embedding);
+      const sem = cosineSimilarity(queryEmb, entry.embedding, queryVersion, entry.embeddingVersion);
       const rec = recencyBoost(entry.lastUsedAt, entry.updatedAt);
       const layerW = LAYER_WEIGHT[entry.layer];
       const score = (wLex * lex + wSem * sem + wRec * rec) * layerW;
@@ -317,7 +370,61 @@ function provenanceRank(provenance: string | null): number {
   return PROVENANCE_PRECEDENCE[provenance] ?? 0;
 }
 
-export function memoryService(db: Db) {
+export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedder()) {
+  /**
+   * Best-effort vector write (PR-11). Writes the pgvector `embedding_vec` column
+   * + bookkeeping ONLY when the embedder is enabled (real pgvector deployment).
+   * On the hash-64/test path the column is absent, so we touch it via raw SQL
+   * gated on `embedder.enabled` and swallow any error — a vector write must
+   * never fail or block a memory write.
+   */
+  // Cached once per service instance: does the pgvector `embedding_vec` column
+  // exist? On a real pgvector deployment yes; on a rig without pgvector no. We
+  // avoid issuing a doomed `embedding_vec` write on every memory write.
+  let vectorColumnPresent: boolean | null = null;
+  async function hasVectorColumn(): Promise<boolean> {
+    if (vectorColumnPresent !== null) return vectorColumnPresent;
+    try {
+      const rows = (await db.execute(sql`
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'memory_entries'
+          AND column_name = 'embedding_vec'
+        LIMIT 1
+      `)) as unknown as unknown[];
+      vectorColumnPresent = rows.length > 0;
+    } catch {
+      vectorColumnPresent = false;
+    }
+    return vectorColumnPresent;
+  }
+
+  async function writeVectorColumns(
+    id: string,
+    storage: { vector: number[]; version: string; contentHash: string },
+  ): Promise<void> {
+    if (!embedder.enabled || storage.version === "hash-64:64") return;
+    // Always persist the bookkeeping columns (created unconditionally by 0052).
+    await db
+      .execute(sql`
+        UPDATE ${memoryEntries}
+        SET embedding_model = ${storage.version},
+            embedding_dim = ${storage.vector.length},
+            content_hash = ${storage.contentHash}
+        WHERE id = ${id}
+      `)
+      .catch(() => {});
+    // The pgvector column only when it exists.
+    if (await hasVectorColumn()) {
+      const literal = `[${storage.vector.join(",")}]`;
+      await db
+        .execute(
+          sql`UPDATE ${memoryEntries} SET embedding_vec = ${literal}::vector WHERE id = ${id}`,
+        )
+        .catch(() => {});
+    }
+  }
+
   async function createEntry(input: CreateEntryInput): Promise<MemoryEntry> {
     if (input.layer === "shared") {
       throw new Error("shared entries must be created via promotion");
@@ -325,7 +432,11 @@ export function memoryService(db: Db) {
     if (input.layer === "personal" && (!input.ownerType || !input.ownerId)) {
       throw new Error("personal entries require ownerType and ownerId");
     }
-    const embedding = embedText(`${input.subject}\n${input.body}`);
+    // PR-11: redact-before-embed + hash fallback. Writes the jsonb `embedding`
+    // (oracle/fallback) + embedding_version always; the embedding_vec column is
+    // written separately (best-effort) only on a real pgvector deployment.
+    const embedResult = await embedder.embedForStorage(input.subject, input.body);
+    const embedding = embedResult.vector;
     const subjectKey = computeSubjectKey(input.subject);
 
     // ---- WRITE-side trust gate (§3.2) ----
@@ -349,6 +460,15 @@ export function memoryService(db: Db) {
       confidence = Math.min(confidence, AGENT_QUARANTINE_MAX_CONFIDENCE);
     }
 
+    // ---- PR-11 redact-before-embed quarantine (§1.4.1) ----
+    // The embedder scanned subject+body for credential shapes before egress. If
+    // it found and redacted any, the entry is force-quarantined to needs_review
+    // (excluded from retrieval) so a secret never both egresses AND lands in the
+    // highest-trust, never-expiring tier.
+    if (embedResult.redactedFindings.length > 0) {
+      verificationState = "needs_review";
+    }
+
     const insertValues = {
       companyId: input.companyId,
       layer: input.layer,
@@ -361,6 +481,7 @@ export function memoryService(db: Db) {
       serviceScope: input.serviceScope ?? null,
       source: input.source ?? null,
       embedding,
+      embeddingVersion: embedResult.version,
       provenance,
       verificationState,
       confidence,
@@ -391,7 +512,14 @@ export function memoryService(db: Db) {
           where: sql`${memoryEntries.source} IS NOT NULL`,
         })
         .returning();
-      if (inserted) return rowToEntry(inserted);
+      if (inserted) {
+        await writeVectorColumns(inserted.id, {
+          vector: embedding,
+          version: embedResult.version,
+          contentHash: embedResult.contentHash,
+        });
+        return rowToEntry(inserted);
+      }
       const [existing] = await db
         .select()
         .from(memoryEntries)
@@ -406,6 +534,11 @@ export function memoryService(db: Db) {
     }
 
     const [row] = await db.insert(memoryEntries).values(insertValues).returning();
+    await writeVectorColumns(row.id, {
+      vector: embedding,
+      version: embedResult.version,
+      contentHash: embedResult.contentHash,
+    });
     return rowToEntry(row);
   }
 
@@ -421,10 +554,17 @@ export function memoryService(db: Db) {
       subject: input.subject ?? existing.subject,
       body: input.body ?? existing.body,
     };
-    const embedding =
-      input.subject !== undefined || input.body !== undefined
-        ? embedText(`${next.subject}\n${next.body}`)
-        : undefined;
+    // PR-11: re-embed ONLY when the subject/body content actually changed. The
+    // previous code re-embedded on ANY subject/body field touch even when the
+    // value was identical; gating on the content hash skips a redundant embed
+    // (and a provider call on the real embedder path) for an unchanged body.
+    const textChanged =
+      (input.subject !== undefined && input.subject !== existing.subject) ||
+      (input.body !== undefined && input.body !== existing.body);
+    let embedResult: EmbedForStorageResult | undefined;
+    if (textChanged) {
+      embedResult = await embedder.embedForStorage(next.subject, next.body);
+    }
     const updates: Partial<MemoryEntryRow> & { updatedAt: Date } = { updatedAt: new Date() };
     if (input.subject !== undefined) updates.subject = input.subject;
     if (input.body !== undefined) updates.body = input.body;
@@ -434,13 +574,25 @@ export function memoryService(db: Db) {
     if (input.source !== undefined) updates.source = input.source;
     if (input.status !== undefined) updates.status = input.status;
     if (input.ttlDays !== undefined) updates.ttlDays = input.ttlDays;
-    if (embedding !== undefined) updates.embedding = embedding;
+    if (embedResult) {
+      updates.embedding = embedResult.vector;
+      updates.embeddingVersion = embedResult.version;
+      // A re-embed that newly redacted a secret re-quarantines the entry.
+      if (embedResult.redactedFindings.length > 0) updates.verificationState = "needs_review";
+    }
     if (input.subject !== undefined) updates.subjectKey = computeSubjectKey(input.subject);
     const [row] = await db
       .update(memoryEntries)
       .set(updates)
       .where(eq(memoryEntries.id, id))
       .returning();
+    if (row && embedResult) {
+      await writeVectorColumns(row.id, {
+        vector: embedResult.vector,
+        version: embedResult.version,
+        contentHash: embedResult.contentHash,
+      });
+    }
     return row ? rowToEntry(row) : null;
   }
 
@@ -478,6 +630,7 @@ export function memoryService(db: Db) {
   async function loadCandidates(
     companyId: string,
     opts: QueryOptions,
+    queryEmbedding?: QueryEmbedding,
   ): Promise<MemoryEntryRow[]> {
     const filters = [eq(memoryEntries.companyId, companyId), eq(memoryEntries.status, "active")];
     if (opts.layers && opts.layers.length > 0) {
@@ -497,6 +650,25 @@ export function memoryService(db: Db) {
     if (opts.excludeSuperseded !== false) {
       filters.push(isNull(memoryEntries.supersededById));
     }
+
+    // ---- PR-11 pgvector ANN pushdown (§1.7) ----
+    // When the embedder is enabled (real pgvector deployment) and the query was
+    // embedded with the SAME version, push the nearest-neighbour ordering into
+    // Postgres: `embedding_vec <=> $q ORDER BY … LIMIT k`. This replaces the
+    // unordered 500-row window with a true top-k and is best-effort — any error
+    // (e.g. column absent) falls through to the jsonb/lexical path below.
+    if (
+      embedder.enabled &&
+      queryEmbedding &&
+      queryEmbedding.version !== "hash-64:64" &&
+      (await hasVectorColumn())
+    ) {
+      const annRows = await loadCandidatesByVector(companyId, opts, queryEmbedding).catch(
+        () => null,
+      );
+      if (annRows) return filterPersonal(annRows, opts);
+    }
+
     const rows = await db
       .select()
       .from(memoryEntries)
@@ -506,6 +678,10 @@ export function memoryService(db: Db) {
       // quality fix is a later slice; this only makes the window stable).
       .orderBy(desc(memoryEntries.updatedAt))
       .limit(500);
+    return filterPersonal(rows, opts);
+  }
+
+  function filterPersonal(rows: MemoryEntryRow[], opts: QueryOptions): MemoryEntryRow[] {
     if (!opts.ownerType || !opts.ownerId) {
       return rows.filter((r) => r.layer !== "personal");
     }
@@ -514,6 +690,50 @@ export function memoryService(db: Db) {
         r.layer !== "personal" ||
         (r.ownerType === opts.ownerType && r.ownerId === opts.ownerId),
     );
+  }
+
+  /**
+   * pgvector top-k candidate load. Selects ids ordered by cosine distance to the
+   * query vector (only rows on the SAME embedding_version — never cross-score
+   * two spaces), then hydrates the full drizzle rows for those ids (preserving
+   * the distance order). Raw SQL because the `embedding_vec` column is NOT a
+   * drizzle column (it is absent on rigs without pgvector).
+   */
+  async function loadCandidatesByVector(
+    companyId: string,
+    opts: QueryOptions,
+    queryEmbedding: QueryEmbedding,
+  ): Promise<MemoryEntryRow[]> {
+    const literal = `[${queryEmbedding.vector.join(",")}]`;
+    const k = Math.min(Math.max((opts.limit ?? 10) * 5, 50), 500);
+    const conds = [
+      sql`company_id = ${companyId}`,
+      sql`status = 'active'`,
+      sql`embedding_vec IS NOT NULL`,
+      sql`embedding_version = ${queryEmbedding.version}`,
+    ];
+    if (opts.layers && opts.layers.length > 0) {
+      conds.push(sql`layer = ANY(${opts.layers})`);
+    }
+    if (opts.serviceScope) conds.push(sql`service_scope = ${opts.serviceScope}`);
+    if (opts.requireVerified) conds.push(sql`verification_state = 'verified'`);
+    if (opts.minConfidence !== undefined) conds.push(sql`confidence >= ${opts.minConfidence}`);
+    if (opts.excludeSuperseded !== false) conds.push(sql`superseded_by_id IS NULL`);
+    const whereSql = sql.join(conds, sql` AND `);
+    const idRows = (await db.execute(sql`
+      SELECT id FROM ${memoryEntries}
+      WHERE ${whereSql}
+      ORDER BY embedding_vec <=> ${literal}::vector
+      LIMIT ${k}
+    `)) as unknown as Array<{ id: string }>;
+    const ids = idRows.map((r) => r.id);
+    if (ids.length === 0) return [];
+    const hydrated = await db
+      .select()
+      .from(memoryEntries)
+      .where(inArray(memoryEntries.id, ids));
+    const order = new Map(ids.map((id, i) => [id, i]));
+    return hydrated.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
   }
 
   function buildSnippet(body: string, query: string): string {
@@ -538,7 +758,12 @@ export function memoryService(db: Db) {
     query: string,
     opts: QueryOptions = {},
   ): Promise<MemoryQueryResult> {
-    const candidates = await loadCandidates(companyId, opts);
+    // PR-11 (§1.1): compute the QUERY embedding FIRST (async, redact-before-embed
+    // on the query path too), then load candidates (ANN pushdown when enabled)
+    // and pass the precomputed embedding into the PURE/SYNC ranker. The ranker
+    // never embeds the query itself, so it stays deterministic for the oracle.
+    const queryEmbedding = await embedder.embedQuery(query);
+    const candidates = await loadCandidates(companyId, opts, queryEmbedding);
     const ranked = rankEntries(
       query,
       candidates.map((r) => ({
@@ -548,9 +773,12 @@ export function memoryService(db: Db) {
         body: r.body,
         tags: (r.tags as string[]) ?? [],
         embedding: (r.embedding as number[] | null) ?? null,
+        embeddingVersion: r.embeddingVersion ?? null,
         lastUsedAt: r.lastUsedAt ?? null,
         updatedAt: r.updatedAt,
       })),
+      {},
+      queryEmbedding,
     );
     const limit = Math.min(Math.max(opts.limit ?? 10, 1), 50);
     const byId = new Map(candidates.map((r) => [r.id, r]));
@@ -853,9 +1081,16 @@ export function memoryService(db: Db) {
   async function createSharedFromPromotion(
     promotion: typeof memoryPromotions.$inferSelect,
   ): Promise<MemoryEntry> {
-    const embedding = embedText(`${promotion.proposedSubject}\n${promotion.proposedBody}`);
+    // PR-11: redact-before-embed + hash fallback on the promotion path too.
+    const embedResult = await embedder.embedForStorage(
+      promotion.proposedSubject,
+      promotion.proposedBody,
+    );
     // Board-promoted lineage is trusted: verified-summary / verified / 0.9.
-    // Mirrors the 0049 backfill for pre-existing promotion:% rows.
+    // Mirrors the 0049 backfill for pre-existing promotion:% rows. A secret
+    // detected in the promoted body still quarantines to needs_review.
+    const verificationState: MemoryVerificationState =
+      embedResult.redactedFindings.length > 0 ? "needs_review" : "verified";
     const [row] = await db
       .insert(memoryEntries)
       .values({
@@ -865,10 +1100,11 @@ export function memoryService(db: Db) {
         body: promotion.proposedBody,
         kind: promotion.proposedKind,
         tags: promotion.proposedTags as string[],
-        embedding,
+        embedding: embedResult.vector,
+        embeddingVersion: embedResult.version,
         source: `promotion:${promotion.id}`,
         provenance: "verified-summary",
-        verificationState: "verified",
+        verificationState,
         confidence: 0.9,
         authorType: "system",
         sourceRefType: "promotion",
@@ -876,6 +1112,11 @@ export function memoryService(db: Db) {
         subjectKey: computeSubjectKey(promotion.proposedSubject),
       })
       .returning();
+    await writeVectorColumns(row.id, {
+      vector: embedResult.vector,
+      version: embedResult.version,
+      contentHash: embedResult.contentHash,
+    });
     return rowToEntry(row);
   }
 

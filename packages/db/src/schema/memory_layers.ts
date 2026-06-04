@@ -7,8 +7,41 @@ import {
   jsonb,
   index,
   real,
+  customType,
 } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
+
+/**
+ * pgvector `vector(N)` custom type (PR-11). drizzle-orm ^0.38.4 has no native
+ * vector type, so we declare one that serializes a `number[]` to the pgvector
+ * text literal `[a,b,c]` and parses it back.
+ *
+ * IMPORTANT: the `embedding_vec` column is created by migration 0052 ONLY when
+ * the `vector` extension is available (the embedded-postgres test rig does NOT
+ * ship pgvector). It is therefore NOT declared as a column on `memoryEntries`
+ * below — doing so would make every `db.select().from(memoryEntries)` emit
+ * `SELECT … "embedding_vec" …`, which THROWS on a rig where the column is
+ * absent and would break the whole suite. The column is touched exclusively via
+ * raw SQL (the `<=>` ANN pushdown read + the embedder write), and only when
+ * `vectorSearchEnabled` is true — which requires a real pgvector deployment
+ * where the column exists. This type is exported for those raw-SQL/codec uses
+ * and for documentation of the on-disk shape.
+ */
+export const vector = customType<{ data: number[]; driverData: string; config: { dimensions: number } }>({
+  dataType(config) {
+    return `vector(${config?.dimensions ?? 1536})`;
+  },
+  toDriver(value: number[]): string {
+    return `[${value.join(",")}]`;
+  },
+  fromDriver(value: string): number[] {
+    return value
+      .replace(/^\[|\]$/g, "")
+      .split(",")
+      .filter((s) => s.length > 0)
+      .map(Number);
+  },
+});
 
 /**
  * Layered memory store for the 4-layer context system.
@@ -58,6 +91,14 @@ export const memoryEntries = pgTable(
     verifiedBy: text("verified_by"),
     verifiedAt: timestamp("verified_at", { withTimezone: true }),
     embeddingVersion: text("embedding_version"),
+    // Embedding bookkeeping (migration 0052). embeddingVersion lands in 0049;
+    // these are the unconditional plain columns the embedder writes on every
+    // storage path. The pgvector `embedding_vec` column is NOT declared here on
+    // purpose (see the `vector` customType doc above) — it is conditional and
+    // touched only via raw SQL behind vectorSearchEnabled.
+    embeddingModel: text("embedding_model"),
+    embeddingDim: integer("embedding_dim"),
+    contentHash: text("content_hash"), // sha256(subject+body) for embed cache + change-detect
     status: text("status").notNull().default("active"), // active | archived | deprecated
     usageCount: integer("usage_count").notNull().default(0),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),

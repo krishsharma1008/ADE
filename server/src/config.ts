@@ -83,6 +83,30 @@ export interface Config {
   sufficiencyMinScore: number;
   /** Hash-64 calibrated minimum requirement-coverage fraction (§2.3). */
   sufficiencyReqCoverMin: number;
+  // ---- Managed-API embeddings (PR-11, MEMORY_UI_AND_QUALITY_PLAN §1.2) ----
+  /** Embedding provider. Default 'openai'. Part of the embedding_version string. */
+  embeddingProvider: string;
+  /** Embedding model. Default 'text-embedding-3-small'. Part of embedding_version. */
+  embeddingModel: string;
+  /** Embedding dimension. Default 1536. Part of embedding_version; THROW on API mismatch. */
+  embeddingDim: number;
+  /**
+   * ONE team-shared embedding API key, set once at install. Resolves
+   * COMBYNE_EMBEDDING_API_KEY → OPENAI_API_KEY → '' (never throws on unset).
+   * Empty key COERCES vectorSearchEnabled to false (zero egress, never crash).
+   */
+  embeddingApiKey: string;
+  /**
+   * ANN/vector-search master flag. COMBYNE_VECTOR_SEARCH_ENABLED === 'true'.
+   * DEFAULT false. COERCED false when embeddingApiKey is empty — so the OFF
+   * state (incl. all CI/test runs) takes the hash-64 jsonb path with no
+   * provider call and no egress.
+   */
+  vectorSearchEnabled: boolean;
+  /** Monthly cost cap (USD) — visibility-only, no hard cutoff. '' = no cap. */
+  embeddingMonthlyCapUsd: string;
+  /** Embedder requests-per-minute soft budget for the backfill batcher. Default 3000. */
+  embeddingRpm: number;
 }
 
 export function loadConfig(): Config {
@@ -252,6 +276,23 @@ export function loadConfig(): Config {
     ? sufficiencyReqCoverRaw
     : 0.34;
 
+  // ---- Managed-API embeddings (PR-11) ----
+  // Mirror the envVar pattern: never throw on unset. The key resolves
+  // COMBYNE_EMBEDDING_API_KEY → OPENAI_API_KEY → '' (lazy validation happens in
+  // the driver on first use, exactly like the summarizer driver).
+  const embeddingProvider = envVar("EMBEDDING_PROVIDER") ?? "openai";
+  const embeddingModel = envVar("EMBEDDING_MODEL") ?? "text-embedding-3-small";
+  const embeddingDimRaw = Number(envVar("EMBEDDING_DIM"));
+  const embeddingDim = Number.isFinite(embeddingDimRaw) && embeddingDimRaw > 0 ? embeddingDimRaw : 1536;
+  const embeddingApiKey = envVar("EMBEDDING_API_KEY") ?? process.env.OPENAI_API_KEY ?? "";
+  // COERCION (closes the chatty-fallback hole): an empty key forces vector
+  // search OFF regardless of the flag, so no path can egress with no key set.
+  const vectorSearchEnabled =
+    envVar("VECTOR_SEARCH_ENABLED") === "true" && embeddingApiKey.length > 0;
+  const embeddingMonthlyCapUsd = envVar("EMBEDDING_MONTHLY_CAP_USD") ?? "";
+  const embeddingRpmRaw = Number(envVar("EMBEDDING_RPM"));
+  const embeddingRpm = Number.isFinite(embeddingRpmRaw) && embeddingRpmRaw > 0 ? embeddingRpmRaw : 3000;
+
   return {
     deploymentMode,
     deploymentExposure,
@@ -305,5 +346,12 @@ export function loadConfig(): Config {
     sufficiencyGateEnabled,
     sufficiencyMinScore,
     sufficiencyReqCoverMin,
+    embeddingProvider,
+    embeddingModel,
+    embeddingDim,
+    embeddingApiKey,
+    vectorSearchEnabled,
+    embeddingMonthlyCapUsd,
+    embeddingRpm,
   };
 }

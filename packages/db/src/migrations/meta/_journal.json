@@ -358,6 +358,13 @@
       "when": 1780405304900,
       "tag": "0051_issue_service_scope",
       "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1780405305000,
+      "tag": "0052_pgvector_embeddings",
+      "breakpoints": true
     }
   ]
 }

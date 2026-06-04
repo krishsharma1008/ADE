@@ -18,6 +18,8 @@
     "db:backup": "./scripts/backup-db.sh",
     "db:memory-export": "pnpm --filter @combyne/server exec tsx scripts/memory-export.ts",
     "db:memory-import": "pnpm --filter @combyne/server exec tsx scripts/memory-import.ts",
+    "db:memory-reembed": "pnpm --filter @combyne/server exec tsx scripts/memory-reembed.ts",
+    "lint:embedding-driver": "node scripts/lint-embedding-driver-imports.mjs",
     "combyne": "node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts",
     "build:npm": "./scripts/build-npm.sh",
     "release": "./scripts/release.sh",
