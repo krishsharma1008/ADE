@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   memoryEntries,
@@ -270,6 +270,15 @@ export interface UpdateEntryInput {
   ttlDays?: number | null;
 }
 
+/**
+ * The ONE canonical retrieval-options signature (MEMORY_UI_AND_QUALITY_PLAN §0.3).
+ * Every retrieval call site — heartbeat self-retrieval, the EM passdown packet
+ * (PR-9), and any future path — threads this exact shape through queryRanked so
+ * the three in-flight designs (trust filter, embedding swap, passdown) cannot
+ * collide on the opts object. The trust fields below are CENTRAL_CONTEXT_DB_PLAN
+ * §3.2 (two-sided rule): apply requireVerified/minConfidence/excludeSuperseded on
+ * the retrieval side to BOTH channels, never one.
+ */
 export interface QueryOptions {
   layers?: MemoryLayer[];
   ownerType?: MemoryOwnerType;
@@ -277,6 +286,35 @@ export interface QueryOptions {
   serviceScope?: string;
   limit?: number;
   includeSnippets?: boolean;
+  // ---- core-plan §3.2 trust filter (sufficiency gate + passdown consume) ----
+  /** Drop rows below this confidence floor. undefined = no floor (label-only). */
+  minConfidence?: number;
+  /**
+   * When true, only verification_state='verified' rows survive. DEFAULT false:
+   * this is the §3.3 label-then-exclude rollout — flipping to true before a
+   * backfill empties the preamble (the starvation failure). The flip is a
+   * Phase-2 one-line change at the heartbeat call site, never here.
+   */
+  requireVerified?: boolean;
+  /** When true (DEFAULT), hide rows whose supersededById is set (conflict losers). */
+  excludeSuperseded?: boolean;
+}
+
+/**
+ * Provenance precedence for §3.6 conflict resolution: within a subjectKey, the
+ * highest-precedence row wins; ties break by recency. Higher number = stronger.
+ * human-answer > pr-approval > verified-summary > agent-claim.
+ */
+const PROVENANCE_PRECEDENCE: Record<string, number> = {
+  "human-answer": 4,
+  "pr-approval": 3,
+  "verified-summary": 2,
+  "agent-claim": 1,
+};
+
+function provenanceRank(provenance: string | null): number {
+  if (!provenance) return 0;
+  return PROVENANCE_PRECEDENCE[provenance] ?? 0;
 }
 
 export function memoryService(db: Db) {
@@ -448,10 +486,25 @@ export function memoryService(db: Db) {
     if (opts.serviceScope) {
       filters.push(eq(memoryEntries.serviceScope, opts.serviceScope));
     }
+    // ---- §3.2 retrieval-side trust filter (BOTH channels) ----
+    if (opts.requireVerified) {
+      filters.push(eq(memoryEntries.verificationState, "verified"));
+    }
+    if (opts.minConfidence !== undefined) {
+      filters.push(gte(memoryEntries.confidence, opts.minConfidence));
+    }
+    // excludeSuperseded defaults true once 0049 lands: hide conflict losers.
+    if (opts.excludeSuperseded !== false) {
+      filters.push(isNull(memoryEntries.supersededById));
+    }
     const rows = await db
       .select()
       .from(memoryEntries)
       .where(and(...filters))
+      // Deterministic 500-row window: ORDER BY updatedAt desc so the cap drops
+      // the oldest rows rather than an arbitrary set (the ORDER BY-into-rank
+      // quality fix is a later slice; this only makes the window stable).
+      .orderBy(desc(memoryEntries.updatedAt))
       .limit(500);
     if (!opts.ownerType || !opts.ownerId) {
       return rows.filter((r) => r.layer !== "personal");
@@ -500,12 +553,50 @@ export function memoryService(db: Db) {
       })),
     );
     const limit = Math.min(Math.max(opts.limit ?? 10, 1), 50);
+    const byId = new Map(candidates.map((r) => [r.id, r]));
     // Recency alone keeps every entry above zero, so require some lexical or
     // semantic signal before the ranker is willing to surface a result.
-    const topIds = ranked
-      .filter((r) => r.lexical > 0 || r.semantic > 0.05)
-      .slice(0, limit);
-    const byId = new Map(candidates.map((r) => [r.id, r]));
+    const signalled = ranked.filter((r) => r.lexical > 0 || r.semantic > 0.05);
+    // ---- §3.6 deterministic conflict resolution ----
+    // Group ranked hits by subjectKey; the winner is the highest-precedence
+    // provenance (human-answer > pr-approval > verified-summary > agent-claim),
+    // ties broken by recency (updatedAt). Losers are dropped from ranked output.
+    // Rows with no subjectKey never conflict (each is its own group). subjectKey
+    // normalization is conservative (tokenize() only), so paraphrases that key
+    // differently are NOT merged — accepted residual duplication, not silent
+    // wrong-merges (CENTRAL_CONTEXT_DB_PLAN §3.6 caveat).
+    const winnerBySubjectKey = new Map<string, string>();
+    for (const r of signalled) {
+      const row = byId.get(r.id);
+      if (!row || !row.subjectKey) continue;
+      const key = row.subjectKey;
+      const currentWinnerId = winnerBySubjectKey.get(key);
+      if (!currentWinnerId) {
+        winnerBySubjectKey.set(key, r.id);
+        continue;
+      }
+      const currentWinner = byId.get(currentWinnerId);
+      if (!currentWinner) {
+        winnerBySubjectKey.set(key, r.id);
+        continue;
+      }
+      const challengerRank = provenanceRank(row.provenance ?? null);
+      const winnerRank = provenanceRank(currentWinner.provenance ?? null);
+      if (challengerRank > winnerRank) {
+        winnerBySubjectKey.set(key, r.id);
+      } else if (
+        challengerRank === winnerRank &&
+        row.updatedAt.getTime() > currentWinner.updatedAt.getTime()
+      ) {
+        winnerBySubjectKey.set(key, r.id);
+      }
+    }
+    const deduped = signalled.filter((r) => {
+      const row = byId.get(r.id);
+      if (!row || !row.subjectKey) return true;
+      return winnerBySubjectKey.get(row.subjectKey) === r.id;
+    });
+    const topIds = deduped.slice(0, limit);
     const layerCounts: Record<MemoryLayer, number> = {
       workspace: 0,
       personal: 0,

@@ -102,4 +102,39 @@ describe("memory ranker (pure)", () => {
     const ranked = rankEntries("kafka topic", entries);
     expect(ranked[0].id).toBe("fresh");
   });
+
+  it("rankEntries stays PURE and SYNC (PR-3 must not lift embedText into an async pre-step)", () => {
+    // PR-3 adds retrieval-side trust filtering in queryRanked/loadCandidates but
+    // must NOT touch the ranker. rankEntries returns a plain array (not a
+    // Promise), is deterministic across calls, and does not mutate its inputs.
+    const entries = [
+      {
+        id: "a",
+        layer: "workspace" as const,
+        subject: "auth middleware jwt",
+        body: "sessions live in signed jwt cookies",
+        tags: ["auth"],
+        embedding: embedText("auth middleware jwt cookies sessions"),
+        lastUsedAt: null,
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      },
+    ];
+    const frozenInput = JSON.stringify(entries);
+    const first = rankEntries("auth jwt", entries);
+    const second = rankEntries("auth jwt", entries);
+    // Synchronous: a real array, never a thenable.
+    expect(Array.isArray(first)).toBe(true);
+    expect(typeof (first as unknown as { then?: unknown }).then).toBe("undefined");
+    // Deterministic: identical scores on repeat calls.
+    expect(second.map((r) => r.score)).toEqual(first.map((r) => r.score));
+    // Non-mutating: inputs unchanged.
+    expect(JSON.stringify(entries)).toBe(frozenInput);
+  });
+
+  it("embedText is untouched by PR-3 (still deterministic + L2-normalized)", () => {
+    const v = embedText("budget hard stop pause policy");
+    const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
+    expect(norm).toBeCloseTo(1, 5);
+    expect(embedText("budget hard stop pause policy")).toEqual(v);
+  });
 });

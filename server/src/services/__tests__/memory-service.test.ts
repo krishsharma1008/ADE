@@ -640,4 +640,169 @@ describe("memory service (4-layer)", () => {
     expect(otherEntry?.provenance).toBe("agent-claim");
     expect(otherEntry?.verificationState).toBe("unverified");
   });
+
+  // ---------- PR-3: retrieval-side trust filter + conflict resolution ----------
+
+  it("RETRIEVAL: requireVerified:true returns only verification_state='verified' rows", async () => {
+    const svc = memoryService(handle.db);
+    // One verified (human-answer) + one unverified (agent-claim) row sharing a
+    // rare sentinel token so only these two are candidates for the query.
+    const verified = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject: "Verified retrieval fact reqVerifiedSentinel",
+      body: "reqVerifiedSentinel the verified body",
+      authorType: "user",
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.95,
+    });
+    const unverified = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject: "Unverified retrieval fact reqVerifiedSentinel",
+      body: "reqVerifiedSentinel the unverified body",
+      authorType: "agent",
+    });
+    expect(unverified.verificationState).toBe("unverified");
+
+    // Label-only default (no requireVerified): BOTH surface.
+    const labelOnly = await svc.queryRanked(companyId, "reqVerifiedSentinel", {
+      limit: 10,
+    });
+    const labelIds = labelOnly.items.map((i) => i.id);
+    expect(labelIds).toContain(verified.id);
+    expect(labelIds).toContain(unverified.id);
+
+    // requireVerified:true → ONLY the verified row survives.
+    const strict = await svc.queryRanked(companyId, "reqVerifiedSentinel", {
+      limit: 10,
+      requireVerified: true,
+    });
+    const strictIds = strict.items.map((i) => i.id);
+    expect(strictIds).toContain(verified.id);
+    expect(strictIds).not.toContain(unverified.id);
+  });
+
+  it("RETRIEVAL: minConfidence drops rows below the confidence floor", async () => {
+    const svc = memoryService(handle.db);
+    const high = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject: "High confidence fact minConfSentinel",
+      body: "minConfSentinel high-confidence body",
+      authorType: "user",
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.9,
+    });
+    const low = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject: "Low confidence fact minConfSentinel",
+      body: "minConfSentinel low-confidence body",
+      authorType: "agent", // quarantined to conf <= 0.4
+    });
+    expect(low.confidence).toBeLessThanOrEqual(0.4);
+
+    // No floor → both candidates surface.
+    const noFloor = await svc.queryRanked(companyId, "minConfSentinel", {
+      limit: 10,
+    });
+    const noFloorIds = noFloor.items.map((i) => i.id);
+    expect(noFloorIds).toContain(high.id);
+    expect(noFloorIds).toContain(low.id);
+
+    // minConfidence:0.5 → the 0.4 row is dropped, the 0.9 row stays.
+    const floored = await svc.queryRanked(companyId, "minConfSentinel", {
+      limit: 10,
+      minConfidence: 0.5,
+    });
+    const flooredIds = floored.items.map((i) => i.id);
+    expect(flooredIds).toContain(high.id);
+    expect(flooredIds).not.toContain(low.id);
+  });
+
+  it("RETRIEVAL: excludeSuperseded defaults true (hides rows with supersededById set)", async () => {
+    const svc = memoryService(handle.db);
+    const winner = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject: "Surviving canonical fact supersedeSentinel",
+      body: "supersedeSentinel the winner body",
+      authorType: "user",
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.95,
+    });
+    const loser = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject: "Stale superseded fact supersedeSentinel",
+      body: "supersedeSentinel the loser body",
+      authorType: "user",
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.95,
+    });
+    // Mark the loser as superseded by the winner (direct row write — there is no
+    // service method for this yet; the conflict-resolution UI lands in a later slice).
+    await handle.db
+      .update(memoryEntries)
+      .set({ supersededById: winner.id })
+      .where(eq(memoryEntries.id, loser.id));
+
+    // Default (excludeSuperseded omitted == true): the loser is hidden.
+    const defaulted = await svc.queryRanked(companyId, "supersedeSentinel", {
+      limit: 10,
+    });
+    const defaultedIds = defaulted.items.map((i) => i.id);
+    expect(defaultedIds).toContain(winner.id);
+    expect(defaultedIds).not.toContain(loser.id);
+
+    // Explicit excludeSuperseded:false → the superseded row reappears.
+    const including = await svc.queryRanked(companyId, "supersedeSentinel", {
+      limit: 10,
+      excludeSuperseded: false,
+    });
+    const includingIds = including.items.map((i) => i.id);
+    expect(includingIds).toContain(winner.id);
+    expect(includingIds).toContain(loser.id);
+  });
+
+  it("CONFLICT: same subjectKey, a human-answer beats an agent-claim (precedence + drop loser)", async () => {
+    const svc = memoryService(handle.db);
+    // Two entries with the IDENTICAL subject → identical subjectKey → conflict.
+    // One is a verified human-answer, the other an unverified agent-claim. Only
+    // the human-answer must survive the ranked output.
+    const subject = "Kafka topic naming convention conflictSentinel";
+    const humanAnswer = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject,
+      body: "conflictSentinel topics are <service>.<entity>.<event>.vN",
+      authorType: "user",
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.95,
+    });
+    const agentClaim = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject,
+      body: "conflictSentinel agent guessed topics are just <entity>",
+      authorType: "agent", // forced to agent-claim/unverified by the write-gate
+    });
+    expect(agentClaim.subjectKey).toBe(humanAnswer.subjectKey);
+    expect(agentClaim.provenance).toBe("agent-claim");
+
+    const result = await svc.queryRanked(companyId, "conflictSentinel", {
+      limit: 10,
+    });
+    const ids = result.items.map((i) => i.id);
+    // The human-answer wins by precedence; the agent-claim loser is dropped even
+    // though both match the query (label-only default surfaces unverified too).
+    expect(ids).toContain(humanAnswer.id);
+    expect(ids).not.toContain(agentClaim.id);
+  });
 });

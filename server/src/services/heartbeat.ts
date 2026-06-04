@@ -3916,6 +3916,12 @@ export function heartbeatService(db: Db) {
             ownerId: agent.id,
             limit: 8,
             includeSnippets: false,
+            // ---- §3.2/§3.3 canonical trust opts (label-only, Phase 1) ----
+            // requireVerified stays FALSE: flipping it pre-backfill empties the
+            // preamble (the starvation failure). The flip to true is the
+            // Phase-2 one-line change here. excludeSuperseded defaults true.
+            requireVerified: false,
+            excludeSuperseded: true,
           });
           const entries = [];
           for (const item of ranked.items) {
