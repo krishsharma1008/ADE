@@ -16,6 +16,8 @@
     "db:migrate": "pnpm --filter @combyne/db migrate",
     "secrets:migrate-inline-env": "tsx scripts/migrate-inline-env-secrets.ts",
     "db:backup": "./scripts/backup-db.sh",
+    "db:memory-export": "pnpm --filter @combyne/server exec tsx scripts/memory-export.ts",
+    "db:memory-import": "pnpm --filter @combyne/server exec tsx scripts/memory-import.ts",
     "combyne": "node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts",
     "build:npm": "./scripts/build-npm.sh",
     "release": "./scripts/release.sh",

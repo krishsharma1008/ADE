@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { eq, sql } from "drizzle-orm";
-import { agents, companies, issues, memoryEntries, memoryPromotions } from "@combyne/db";
+import { and, eq, sql } from "drizzle-orm";
+import { agents, companies, createDb, issues, memoryEntries, memoryPromotions } from "@combyne/db";
 import { memoryService, computeSubjectKey } from "../memory.js";
+import { buildExportBundle, EmptyExportError, importBundle } from "../memory-etl.js";
 import { startTestDb, stopTestDb, type TestDbHandle } from "./_test-db.js";
 
 describe("memory service (4-layer)", () => {
@@ -804,5 +805,181 @@ describe("memory service (4-layer)", () => {
     // though both match the query (label-only default surfaces unverified too).
     expect(ids).toContain(humanAnswer.id);
     expect(ids).not.toContain(agentClaim.id);
+  });
+});
+
+// ---------- PR-7: memory ETL export/import + refuse-on-empty cutover gate ----------
+
+describe("memory ETL (export/import cutover)", () => {
+  let handle: TestDbHandle;
+  let srcCompanyId: string;
+  let dstCompanyId: string;
+  let userId: string;
+
+  beforeAll(async () => {
+    handle = await startTestDb();
+    const suffix = Math.random().toString(36).slice(2, 5).toUpperCase();
+    const [src] = await handle.db
+      .insert(companies)
+      .values({ name: `EtlSrc-${suffix}`, issuePrefix: `ES${suffix}` })
+      .returning();
+    const [dst] = await handle.db
+      .insert(companies)
+      .values({ name: `EtlDst-${suffix}`, issuePrefix: `ED${suffix}` })
+      .returning();
+    srcCompanyId = src.id;
+    dstCompanyId = dst.id;
+    userId = `user-${suffix}`;
+  }, 60_000);
+
+  afterAll(async () => {
+    if (handle) await stopTestDb();
+  });
+
+  it("export preserves the 0049 trust columns + the jsonb embedding byte-for-byte", async () => {
+    const svc = memoryService(handle.db);
+    const entry = await svc.createEntry({
+      companyId: srcCompanyId,
+      layer: "workspace",
+      subject: "kafka topic naming convention",
+      body: "Topics are <team>.<domain>.<event>; never bare names.",
+      kind: "convention",
+      tags: ["kafka", "convention"],
+      source: "pr-approval:etl-1",
+      provenance: "pr-approval",
+      verificationState: "verified",
+      confidence: 0.8,
+      authorType: "user",
+      authorId: userId,
+      sourceRefType: "approval",
+    });
+    // Stamp embedding_version so the export carries it.
+    await handle.db
+      .update(memoryEntries)
+      .set({ embeddingVersion: "hash-64:64" })
+      .where(eq(memoryEntries.id, entry.id));
+
+    const bundle = await buildExportBundle(handle.connectionString, srcCompanyId);
+    expect(bundle.counts.memory_entries).toBeGreaterThan(0);
+    const exported = (bundle.memory_entries as Array<Record<string, unknown>>).find(
+      (r) => r.id === entry.id,
+    );
+    expect(exported).toBeDefined();
+    // Trust columns preserved.
+    expect(exported!.provenance).toBe("pr-approval");
+    expect(exported!.verificationState).toBe("verified");
+    expect(exported!.confidence).toBeCloseTo(0.8);
+    expect(exported!.authorType).toBe("user");
+    expect(exported!.authorId).toBe(userId);
+    expect(exported!.sourceRefType).toBe("approval");
+    expect(exported!.embeddingVersion).toBe("hash-64:64");
+    // The stored jsonb embedding round-trips byte-for-byte: the exported array
+    // equals the live row's embedding exactly (same length, same values).
+    const live = await svc.getEntry(entry.id);
+    expect(Array.isArray(exported!.embedding)).toBe(true);
+    expect(exported!.embedding).toEqual(live!.embedding);
+    expect(JSON.stringify(exported!.embedding)).toBe(JSON.stringify(live!.embedding));
+  });
+
+  it("import recreates entries under a target company, is idempotent on re-run, and remaps personal owners", async () => {
+    const svc = memoryService(handle.db);
+    // A workspace (sourced) entry + a personal entry owned by 'local-board'.
+    const ws = await svc.createEntry({
+      companyId: srcCompanyId,
+      layer: "workspace",
+      subject: "budget pause policy etl",
+      body: "Pause the run when the monthly cap is hit; resume on the next window.",
+      source: "human-answer:etl-2",
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.95,
+      authorType: "user",
+    });
+    const personal = await svc.createEntry({
+      companyId: srcCompanyId,
+      layer: "personal",
+      ownerType: "user",
+      ownerId: "local-board",
+      subject: "personal etl note",
+      body: "My standing preference for this repo.",
+    });
+
+    const bundle = await buildExportBundle(handle.connectionString, srcCompanyId);
+    const dstDb = createDb(handle.connectionString);
+
+    const first = await importBundle(dstDb, bundle, {
+      companyId: dstCompanyId,
+      ownerRemap: new Map([["local-board", userId]]),
+    });
+    expect(first.insertedEntries).toBe(bundle.counts.memory_entries);
+
+    // The workspace entry landed under the destination company with its trust
+    // columns intact.
+    const dstWs = await dstDb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, dstCompanyId),
+          eq(memoryEntries.source, "human-answer:etl-2"),
+        ),
+      );
+    expect(dstWs).toHaveLength(1);
+    expect(dstWs[0].provenance).toBe("human-answer");
+    expect(dstWs[0].verificationState).toBe("verified");
+    expect(dstWs[0].confidence).toBeCloseTo(0.95);
+    expect(dstWs[0].subject).toBe(ws.subject);
+
+    // --owner-remap rewrote the personal owner from local-board → userId.
+    const dstPersonal = await dstDb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, dstCompanyId),
+          eq(memoryEntries.layer, "personal"),
+          eq(memoryEntries.subject, personal.subject),
+        ),
+      );
+    expect(dstPersonal).toHaveLength(1);
+    expect(dstPersonal[0].ownerId).toBe(userId);
+    expect(dstPersonal[0].ownerId).not.toBe("local-board");
+
+    // Re-running is idempotent: zero new entries, all skipped.
+    const second = await importBundle(dstDb, bundle, {
+      companyId: dstCompanyId,
+      ownerRemap: new Map([["local-board", userId]]),
+    });
+    expect(second.insertedEntries).toBe(0);
+    expect(second.skippedEntries).toBe(bundle.counts.memory_entries);
+
+    // No duplicate rows on (companyId, layer, subject, source).
+    const dupCheck = await dstDb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, dstCompanyId),
+          eq(memoryEntries.source, "human-answer:etl-2"),
+        ),
+      );
+    expect(dupCheck).toHaveLength(1);
+  });
+
+  it("REFUSE-ON-EMPTY: importing a zero-entry bundle throws (the hard cutover gate)", async () => {
+    const dstDb = createDb(handle.connectionString);
+    const emptyBundle = {
+      version: 1,
+      memory_entries: [],
+      memory_promotions: [],
+      memory_usage: [],
+      agent_memory: [],
+    };
+    await expect(
+      importBundle(dstDb, emptyBundle, {
+        companyId: dstCompanyId,
+        ownerRemap: new Map(),
+      }),
+    ).rejects.toBeInstanceOf(EmptyExportError);
   });
 });
