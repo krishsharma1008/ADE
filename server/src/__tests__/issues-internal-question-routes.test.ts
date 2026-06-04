@@ -2,7 +2,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, isNull } from "drizzle-orm";
-import { agentTaskSessions, agents, companies, heartbeatRuns, issueComments, issues } from "@combyne/db";
+import { agentTaskSessions, agents, companies, heartbeatRuns, issueComments, issues, memoryEntries } from "@combyne/db";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { startTestDb, stopTestDb, type TestDbHandle } from "../services/__tests__/_test-db.js";
@@ -222,6 +222,21 @@ describe("issue internal question routes", () => {
     expect(res.body.answerComment.kind).toBe("manager_answer");
     expect(res.body.answerComment.body).toContain("Assumption:");
 
+    // HOOK 1 mirror via the route: the assumption flag (input.assumption===true) forces
+    // the captured row to agent-claim/unverified — NOT keyed on the "Assumption:" prefix.
+    const [captured] = await handle.db
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.source, `human-answer:${child.id}:${res.body.answerComment.id}`),
+        ),
+      );
+    expect(captured).toBeTruthy();
+    expect(captured!.provenance).toBe("agent-claim");
+    expect(captured!.verificationState).toBe("unverified");
+
     const childRuns = await handle.db
       .select()
       .from(heartbeatRuns)
@@ -233,6 +248,46 @@ describe("issue internal question routes", () => {
         context?.managerAnswerBody &&
         run.sessionIdBefore === "route-session-child";
     })).toBe(true);
+  });
+
+  it("captures a genuine internal answer (assumption=false) as verified/human-answer", async () => {
+    const { child } = await createParentAndChild("Genuine internal answer");
+    const [question] = await handle.db
+      .insert(issueComments)
+      .values({
+        companyId,
+        issueId: child.id,
+        authorAgentId: devId,
+        body: "Which queue should the worker drain first?",
+        kind: "manager_question",
+      })
+      .returning();
+    await handle.db
+      .update(issues)
+      .set({ status: "blocked", blockedSource: "agent", blockedAt: new Date() })
+      .where(eq(issues.id, child.id));
+
+    const res = await request(app)
+      .post(`/api/issues/${child.id}/internal-questions/${question.id}/answer`)
+      .set("x-test-agent-id", emId)
+      .set("x-test-company-id", companyId)
+      .send({ answer: "Drain the high-priority queue first.", assumption: false });
+
+    expect(res.status).toBe(201);
+
+    const [captured] = await handle.db
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.source, `human-answer:${child.id}:${res.body.answerComment.id}`),
+        ),
+      );
+    expect(captured).toBeTruthy();
+    expect(captured!.provenance).toBe("human-answer");
+    expect(captured!.verificationState).toBe("verified");
+    expect(captured!.body).toContain("A: Drain the high-priority queue first.");
   });
 
   it("wakes the existing assignee when an assigned issue is reopened by status update", async () => {

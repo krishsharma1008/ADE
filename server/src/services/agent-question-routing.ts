@@ -4,6 +4,8 @@ import { agents, issueComments, issues } from "@combyne/db";
 import { logger } from "../middleware/logger.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { notifyParentOnChildStatus } from "./issue-parent-notifications.js";
+import { memoryService } from "./memory.js";
+import { scanBody } from "../secret-scan.js";
 
 const COORDINATOR_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
 const INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
@@ -420,6 +422,47 @@ export async function answerInternalManagerQuestion(
     .update(issueComments)
     .set({ answeredAt: now, answeredCommentId: answerComment.id, updatedAt: now })
     .where(eq(issueComments.id, question.id));
+
+  // ---- HOOK 1 mirror: internal manager-answer capture (CENTRAL_CONTEXT_DB_PLAN §4.1) ----
+  // Best-effort: a capture failure must NEVER fail the answer flow. The trust gate keys
+  // on the CODE FLAG input.assumption (§3.4 / §4.1), never on the "Assumption:" body
+  // prefix at :405. A genuine answer (assumption=false) → human-answer/verified; an
+  // assumption-flagged answer (assumption=true) is an agent CLAIM the human merely
+  // waved through → forced provenance='agent-claim'/verificationState='unverified' so it
+  // can never be retrieved as a vetted fact.
+  try {
+    const isAssumption = input.assumption === true;
+    const questionText = (question.body ?? "").trim() || "(question unavailable)";
+    const subject = questionText.slice(0, 480);
+    // Redaction gate (§4.4): scan the answer body BEFORE write. A finding always
+    // quarantines to needs_review (overrides verified) so a secret never lands verified.
+    const scan = scanBody(answer);
+    const verificationState: "needs_review" | "unverified" | "verified" =
+      scan.findings.length > 0 ? "needs_review" : isAssumption ? "unverified" : "verified";
+    await memoryService(db).createEntry({
+      companyId: input.companyId,
+      layer: "workspace",
+      kind: "fact",
+      subject,
+      body: `Q: ${questionText}\nA: ${scan.clean}`,
+      source: `human-answer:${issue.id}:${answerComment.id}`,
+      provenance: isAssumption ? "agent-claim" : "human-answer",
+      verificationState,
+      confidence: isAssumption ? 0.5 : 0.95,
+      // authorType is deliberately stamped 'user' to represent the human Q&A channel
+      // regardless of the proxying actor (the answering actor may be an EM agent). Trust
+      // here is governed solely by the explicit provenance + verificationState above
+      // (the input.assumption flag), NOT by authorType — so a future reader should not
+      // treat this 'user' as "a human typed this".
+      authorType: "user",
+      authorId: input.actor.actorId,
+      sourceRefType: "comment",
+      sourceRefId: answerComment.id,
+      createdBy: input.actor.actorId,
+    });
+  } catch (err) {
+    logger.warn({ err, issueId: issue.id }, "HOOK 1 internal manager-answer capture failed (best-effort)");
+  }
 
   const remainingOpen = await db
     .select({ count: sql<number>`count(*)::int` })

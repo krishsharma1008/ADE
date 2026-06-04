@@ -22,10 +22,12 @@ import {
   issueApprovalService,
   issueService,
   logActivity,
+  memoryService,
   projectService,
   answerInternalManagerQuestion,
   routeAgentQuestionsToManager,
 } from "../services/index.js";
+import { scanBody } from "../secret-scan.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -78,6 +80,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
+  const memorySvc = memoryService(db);
   const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: MAX_ATTACHMENT_BYTES, files: 1 },
@@ -1107,6 +1110,50 @@ export function issueRoutes(db: Db, storage: StorageService) {
         remainingOpenQuestions: remaining,
       },
     });
+
+    // ---- HOOK 1: human-answer capture (CENTRAL_CONTEXT_DB_PLAN §4.1) ----
+    // Best-effort: a capture failure must NEVER fail the answer response. We stamp a
+    // verified human-answer row only when a REAL human typed the answer. Per §3.4 the
+    // trust gate keys on actor.SOURCE, not actorType (getActorInfo returns
+    // actorType='user' for the local_implicit board too): an authenticated human
+    // (source !== 'local_implicit' + real userId) is trusted, AND in local single-user
+    // mode local_implicit IS the trusted operator by design — both → verified. An AGENT
+    // actor never reaches this provenance (the write-gate would force it unverified).
+    try {
+      const isHuman = actor.actorType === "user";
+      const userId = actor.actorId && actor.actorId !== "board" ? actor.actorId : null;
+      if (isHuman) {
+        // Required added work (§4.1): the handler only has questionCommentId — load the
+        // original question comment to recover the question body for the subject.
+        const questionComment = await svc.getComment(questionCommentId);
+        const questionText = (questionComment?.body ?? "").trim() || "(question unavailable)";
+        const subject = questionText.slice(0, 480);
+        // Redaction gate (§4.4 / MEMORY_UI_AND_QUALITY_PLAN §1.4.1): scan the answer
+        // body BEFORE write. On any finding, quarantine to needs_review (excluded from
+        // retrieval) so a secret never both lands in workspace AND becomes "verified".
+        const scan = scanBody(answer);
+        const verificationState: "needs_review" | "verified" =
+          scan.findings.length > 0 ? "needs_review" : "verified";
+        await memorySvc.createEntry({
+          companyId: issue.companyId,
+          layer: "workspace",
+          kind: "fact",
+          subject,
+          body: `Q: ${questionText}\nA: ${scan.clean}`,
+          source: `human-answer:${issue.id}:${answerComment.id}`,
+          provenance: "human-answer",
+          verificationState,
+          confidence: 0.95,
+          authorType: "user",
+          authorId: userId,
+          sourceRefType: "comment",
+          sourceRefId: answerComment.id,
+          createdBy: userId,
+        });
+      }
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "HOOK 1 human-answer capture failed (best-effort)");
+    }
 
     res.status(201).json({ comment: answerComment, issue: updated, remainingOpenQuestions: remaining });
   });

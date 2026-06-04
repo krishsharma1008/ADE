@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, isNull } from "drizzle-orm";
-import { agentTaskSessions, agents, companies, heartbeatRuns, issueComments, issues } from "@combyne/db";
+import { agentTaskSessions, agents, companies, heartbeatRuns, issueComments, issues, memoryEntries } from "@combyne/db";
 import { extractAndPostQuestions } from "../agent-question-extract.js";
 import {
   answerInternalManagerQuestion,
@@ -263,5 +263,103 @@ describe("agent question routing", () => {
     if (!result.routedToManager) {
       expect(result.reason).toBe("no_manager_target");
     }
+  });
+
+  async function seedManagerQuestion(child: { id: string }, body: string) {
+    const [question] = await handle.db
+      .insert(issueComments)
+      .values({ companyId, issueId: child.id, authorAgentId: devId, body, kind: "manager_question" })
+      .returning();
+    await handle.db
+      .update(issues)
+      .set({ status: "blocked", blockedSource: "agent", blockedAt: new Date() })
+      .where(eq(issues.id, child.id));
+    return question;
+  }
+
+  it("HOOK 1 mirror: assumption=true forces unverified/agent-claim (keyed on the code flag, not the body prefix)", async () => {
+    const { child } = await createParentAndChild("Internal assumption capture");
+    const question = await seedManagerQuestion(child, "Should missing income be zero?");
+
+    const result = await answerInternalManagerQuestion(handle.db, {
+      companyId,
+      issueId: child.id,
+      questionCommentId: question.id,
+      answer: "Use zero as a defensive default.",
+      assumption: true,
+      actor: { actorType: "agent", actorId: emId, agentId: emId },
+    });
+
+    const [entry] = await handle.db
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.source, `human-answer:${child.id}:${result.answerComment.id}`),
+        ),
+      );
+    expect(entry).toBeTruthy();
+    expect(entry!.provenance).toBe("agent-claim");
+    expect(entry!.verificationState).toBe("unverified");
+    // Subject comes from the loaded question; body carries Q/A with no "Assumption:" parse.
+    expect(entry!.subject).toContain("missing income");
+    expect(entry!.body).toContain("Q: Should missing income be zero?");
+  });
+
+  it("HOOK 1 mirror: a genuine answer (assumption=false) is captured verified/human-answer", async () => {
+    const { child } = await createParentAndChild("Internal genuine answer capture");
+    const question = await seedManagerQuestion(child, "Which timezone for the cron?");
+
+    const result = await answerInternalManagerQuestion(handle.db, {
+      companyId,
+      issueId: child.id,
+      questionCommentId: question.id,
+      answer: "Use UTC for all scheduled jobs.",
+      assumption: false,
+      actor: { actorType: "agent", actorId: emId, agentId: emId },
+    });
+
+    const [entry] = await handle.db
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.source, `human-answer:${child.id}:${result.answerComment.id}`),
+        ),
+      );
+    expect(entry).toBeTruthy();
+    expect(entry!.provenance).toBe("human-answer");
+    expect(entry!.verificationState).toBe("verified");
+    expect(entry!.confidence).toBeCloseTo(0.95, 5);
+    expect(entry!.body).toContain("A: Use UTC for all scheduled jobs.");
+  });
+
+  it("HOOK 1 mirror: an sk- key in the answer quarantines to needs_review even for a genuine answer", async () => {
+    const { child } = await createParentAndChild("Internal secret capture");
+    const question = await seedManagerQuestion(child, "What credential does the worker use?");
+
+    const result = await answerInternalManagerQuestion(handle.db, {
+      companyId,
+      issueId: child.id,
+      questionCommentId: question.id,
+      answer: "It uses sk-live-ABCDEFGHIJKLMNOPQRSTUVWX for the call.",
+      assumption: false,
+      actor: { actorType: "agent", actorId: emId, agentId: emId },
+    });
+
+    const [entry] = await handle.db
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.source, `human-answer:${child.id}:${result.answerComment.id}`),
+        ),
+      );
+    expect(entry!.verificationState).toBe("needs_review");
+    expect(entry!.body).not.toContain("sk-live-ABCDEFGHIJKLMNOPQRSTUVWX");
+    expect(entry!.body).toContain("***REDACTED***");
   });
 });

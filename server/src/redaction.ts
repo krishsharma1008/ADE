@@ -1,6 +1,6 @@
-const SECRET_PAYLOAD_KEY_RE =
+export const SECRET_PAYLOAD_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
-const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
+export const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
