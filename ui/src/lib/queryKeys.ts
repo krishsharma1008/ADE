@@ -83,6 +83,8 @@ export const queryKeys = {
   integrations: (companyId: string) => ["integrations", companyId] as const,
   memory: {
     entries: (companyId: string, layer?: string) => ["memory", companyId, "entries", layer ?? "all"] as const,
+    browse: (companyId: string, filters?: object) =>
+      ["memory", companyId, "browse", filters ?? {}] as const,
     acceptedWork: (companyId: string) => ["memory", companyId, "accepted-work"] as const,
   },
   qa: {

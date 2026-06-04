@@ -9,7 +9,11 @@ import {
   memoryRecordUsageSchema,
   memoryProposePromotionSchema,
   memoryDecidePromotionSchema,
+  MEMORY_PROVENANCES,
+  MEMORY_VERIFICATION_STATES,
   type MemoryOwnerType,
+  type MemoryProvenance,
+  type MemoryVerificationState,
 } from "@combyne/shared";
 import { validate } from "../middleware/validate.js";
 import { memoryService, logActivity } from "../services/index.js";
@@ -105,12 +109,41 @@ export function memoryRoutes(db: Db) {
     const ownerType = req.query.ownerType as MemoryOwnerType | undefined;
     const ownerId = req.query.ownerId as string | undefined;
     const status = (req.query.status as string | undefined) ?? "active";
+    // Trust-spine (0049) browse filters surfaced by the Memory UI (PR-13). Each
+    // is validated against its enum/range before being passed to the service so
+    // a malformed query string is simply ignored (no filter) rather than 500ing.
+    const provenanceRaw = req.query.provenance as string | undefined;
+    const provenance =
+      provenanceRaw && (MEMORY_PROVENANCES as readonly string[]).includes(provenanceRaw)
+        ? (provenanceRaw as MemoryProvenance)
+        : undefined;
+    const verificationRaw = req.query.verificationState as string | undefined;
+    const verificationState =
+      verificationRaw &&
+      (MEMORY_VERIFICATION_STATES as readonly string[]).includes(verificationRaw)
+        ? (verificationRaw as MemoryVerificationState)
+        : undefined;
+    const minConfidenceRaw = req.query.minConfidence as string | undefined;
+    const minConfidenceParsed = minConfidenceRaw ? Number(minConfidenceRaw) : NaN;
+    const minConfidence =
+      Number.isFinite(minConfidenceParsed) && minConfidenceParsed >= 0 && minConfidenceParsed <= 1
+        ? minConfidenceParsed
+        : undefined;
+    const serviceScope = (req.query.serviceScope as string | undefined) || undefined;
+    const ageRaw = req.query.age as string | undefined;
+    const ageParsed = ageRaw ? Number(ageRaw) : NaN;
+    const ageDays = Number.isFinite(ageParsed) && ageParsed > 0 ? ageParsed : undefined;
     const list = await svc.listEntries({
       companyId,
       layer: layer === "workspace" || layer === "personal" || layer === "shared" ? layer : undefined,
       ownerType,
       ownerId,
       status,
+      provenance,
+      verificationState,
+      minConfidence,
+      serviceScope,
+      ageDays,
     });
     res.json(list);
   });

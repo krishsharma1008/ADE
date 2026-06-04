@@ -113,6 +113,14 @@ import {
   AvatarGroupCount,
 } from "@/components/ui/avatar";
 import { StatusBadge } from "@/components/StatusBadge";
+import {
+  ConfidenceMeter,
+  MemoryCitationLine,
+  ProvenanceBadge,
+  VerificationBadge,
+} from "@/components/memory/MemoryTrustBadges";
+import { MemoryEntryCard } from "@/components/memory/MemoryEntryCard";
+import { makeMemoryEntryFixture } from "@/components/memory/memoryFixtures";
 import { StatusIcon } from "@/components/StatusIcon";
 import { PriorityIcon } from "@/components/PriorityIcon";
 import { agentStatusDot, agentStatusDotDefault } from "@/lib/status-colors";
@@ -1249,6 +1257,90 @@ export function DesignGuide() {
         <SubSection title="Page Skeleton (detail)">
           <div className="border border-border rounded-md p-4">
             <PageSkeleton variant="detail" />
+          </div>
+        </SubSection>
+      </Section>
+
+      {/* ============================================================ */}
+      {/*  MEMORY TRUST SPINE                                           */}
+      {/* ============================================================ */}
+      <Section title="Memory Trust Badges">
+        <SubSection title="Provenance">
+          <div className="flex flex-wrap items-center gap-2">
+            <ProvenanceBadge provenance="human-answer" />
+            <ProvenanceBadge provenance="pr-approval" />
+            <ProvenanceBadge provenance="verified-summary" />
+            <ProvenanceBadge provenance="agent-claim" />
+            <ProvenanceBadge provenance="system" />
+            <ProvenanceBadge provenance={null} />
+          </div>
+        </SubSection>
+
+        <SubSection title="Verification state">
+          <div className="flex flex-wrap items-center gap-2">
+            <VerificationBadge state="verified" />
+            <VerificationBadge state="unverified" />
+            <VerificationBadge state="needs_review" />
+          </div>
+        </SubSection>
+
+        <SubSection title="Confidence meter (red < 0.4 · yellow < 0.7 · green)">
+          <div className="flex flex-wrap items-center gap-6">
+            <ConfidenceMeter confidence={0.2} />
+            <ConfidenceMeter confidence={0.55} />
+            <ConfidenceMeter confidence={0.9} />
+          </div>
+        </SubSection>
+
+        <SubSection title="Citation line">
+          <MemoryCitationLine
+            id="11111111-1111-4111-8111-111111111111"
+            provenance="human-answer"
+            confidence={0.95}
+            sourceRefType="comment"
+            sourceRefId="comment-9"
+          />
+        </SubSection>
+
+        <SubSection title="Entry card (verified · unverified · needs review · superseded)">
+          <div className="overflow-hidden rounded-md border border-border">
+            <MemoryEntryCard
+              entry={makeMemoryEntryFixture({
+                provenance: "human-answer",
+                verificationState: "verified",
+                confidence: 0.95,
+              })}
+            />
+            <MemoryEntryCard
+              entry={makeMemoryEntryFixture({
+                id: "22222222-2222-4222-8222-222222222222",
+                subject: "Agent guessed the retry policy is 3 attempts",
+                provenance: "agent-claim",
+                verificationState: "unverified",
+                confidence: 0.3,
+                sourceRefType: "run",
+                sourceRefId: "run-7",
+              })}
+            />
+            <MemoryEntryCard
+              entry={makeMemoryEntryFixture({
+                id: "33333333-3333-4333-8333-333333333333",
+                subject: "Answer flagged — contains a possible secret",
+                provenance: "human-answer",
+                verificationState: "needs_review",
+                confidence: 0.5,
+              })}
+            />
+            <MemoryEntryCard
+              entry={makeMemoryEntryFixture({
+                id: "44444444-4444-4444-8444-444444444444",
+                subject: "Old naming convention (replaced)",
+                provenance: "verified-summary",
+                verificationState: "verified",
+                confidence: 0.9,
+                supersededById: "11111111-1111-4111-8111-111111111111",
+              })}
+            />
           </div>
         </SubSection>
       </Section>

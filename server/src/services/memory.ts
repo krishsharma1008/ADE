@@ -656,12 +656,31 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     ownerId?: string;
     status?: string;
     limit?: number;
+    // Trust-spine (0049) browse filters surfaced by the Memory UI (PR-13).
+    provenance?: MemoryProvenance;
+    verificationState?: MemoryVerificationState;
+    minConfidence?: number;
+    serviceScope?: string;
+    // Relative recency window: only return rows updated within the last N days.
+    ageDays?: number;
   }): Promise<MemoryEntry[]> {
     const filters = [eq(memoryEntries.companyId, opts.companyId)];
     if (opts.layer) filters.push(eq(memoryEntries.layer, opts.layer));
     if (opts.ownerType) filters.push(eq(memoryEntries.ownerType, opts.ownerType));
     if (opts.ownerId) filters.push(eq(memoryEntries.ownerId, opts.ownerId));
     filters.push(eq(memoryEntries.status, opts.status ?? "active"));
+    if (opts.provenance) filters.push(eq(memoryEntries.provenance, opts.provenance));
+    if (opts.verificationState) {
+      filters.push(eq(memoryEntries.verificationState, opts.verificationState));
+    }
+    if (opts.minConfidence !== undefined) {
+      filters.push(gte(memoryEntries.confidence, opts.minConfidence));
+    }
+    if (opts.serviceScope) filters.push(eq(memoryEntries.serviceScope, opts.serviceScope));
+    if (opts.ageDays !== undefined && opts.ageDays > 0) {
+      const cutoff = new Date(Date.now() - opts.ageDays * 24 * 60 * 60 * 1000);
+      filters.push(gte(memoryEntries.updatedAt, cutoff));
+    }
     const rows = await db
       .select()
       .from(memoryEntries)

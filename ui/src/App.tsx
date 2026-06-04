@@ -152,6 +152,7 @@ function boardRoutes() {
       <Route path="routines/:routineId" element={<RoutineDetail />} />
       <Route path="skills" element={<CompanySkills />} />
       <Route path="memory" element={<CompanyMemory />} />
+      <Route path="memory/:tab" element={<CompanyMemory />} />
       <Route path="qa" element={<QA />} />
       <Route path="skills/:skillId" element={<CompanySkills />} />
       <Route path="skills/:skillId/*" element={<CompanySkills />} />
@@ -295,6 +296,7 @@ export function App() {
           <Route path="routines" element={<UnprefixedBoardRedirect />} />
           <Route path="routines/:routineId" element={<UnprefixedBoardRedirect />} />
           <Route path="memory" element={<UnprefixedBoardRedirect />} />
+          <Route path="memory/:tab" element={<UnprefixedBoardRedirect />} />
           <Route path="qa" element={<UnprefixedBoardRedirect />} />
           <Route path="skills" element={<UnprefixedBoardRedirect />} />
           <Route path="skills/:skillId" element={<UnprefixedBoardRedirect />} />
