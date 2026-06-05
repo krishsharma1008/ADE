@@ -238,7 +238,13 @@ function isPleasantryQuestion(candidate: string): boolean {
  * the work is actually finished.
  */
 function stripBullet(line: string): string {
-  const bulletMatch = line.match(
+  // Strip a leading bold marker so a markdown-styled list item like
+  // "**1. Button purpose — …?**" or "**- Which color?**" is recognized. Agents
+  // commonly emit bold-wrapped numbered questions; without this they fall through
+  // as plain comments and never become structured `question` comments (so the
+  // answer card never appears and the human answer is never captured).
+  const deBolded = line.replace(/^\*\*\s*/, "");
+  const bulletMatch = deBolded.match(
     /^(?:[-*+]\s+|\(\d+\)\s*|\d+[.)]\s+|Q\d+[:.)]\s*)(.*)$/i,
   );
   if (bulletMatch) return bulletMatch[1]!.trim().replace(/^\*\*|\*\*$/g, "").trim();

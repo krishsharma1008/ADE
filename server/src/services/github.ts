@@ -32,6 +32,26 @@ export function createGitHubClient(config: GitHubConfig) {
     return res.json() as T;
   }
 
+  // Accept EITHER a bare repo name (uses the configured owner) OR a full
+  // "owner/repo" slug (e.g. as stored on a tracked PR row). Without this, a value
+  // like "krishsharma1008/Voca.ai_website" would be double-prefixed with
+  // config.owner → /repos/owner/owner%2Frepo/... → GitHub 404. Returns the encoded
+  // "owner/repo" path segment so callers never double-prepend.
+  function repoPath(repo: string): string {
+    const slash = repo.indexOf("/");
+    const owner = slash >= 0 ? repo.slice(0, slash) : config.owner;
+    const name = slash >= 0 ? repo.slice(slash + 1) : repo;
+    return `${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
+  }
+  // Unencoded owner/name for clone URLs.
+  function repoOwnerName(repo: string): { owner: string; name: string } {
+    const slash = repo.indexOf("/");
+    return {
+      owner: slash >= 0 ? repo.slice(0, slash) : config.owner,
+      name: slash >= 0 ? repo.slice(slash + 1) : repo,
+    };
+  }
+
   function mapRepo(r: Record<string, unknown>): GitHubRepo {
     return {
       id: r.id as number,
@@ -101,7 +121,7 @@ export function createGitHubClient(config: GitHubConfig) {
     /** Get a single repository by name. */
     async getRepo(repo: string): Promise<GitHubRepo> {
       const r = await request<Record<string, unknown>>(
-        `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}`,
+        `/repos/${repoPath(repo)}`,
       );
       return mapRepo(r);
     },
@@ -110,7 +130,7 @@ export function createGitHubClient(config: GitHubConfig) {
     async listBranches(repo: string): Promise<GitHubBranch[]> {
       const data = await request<
         Array<{ name: string; commit: { sha: string }; protected: boolean }>
-      >(`/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/branches?per_page=100`);
+      >(`/repos/${repoPath(repo)}/branches?per_page=100`);
       return data.map((b) => ({
         name: b.name,
         sha: b.commit.sha,
@@ -124,24 +144,23 @@ export function createGitHubClient(config: GitHubConfig) {
       branch: string,
       fromBranch?: string,
     ): Promise<{ ref: string; sha: string }> {
-      const owner = encodeURIComponent(config.owner);
-      const repoEnc = encodeURIComponent(repo);
+      const rp = repoPath(repo);
 
       let sourceBranch = fromBranch;
       if (!sourceBranch) {
         const repoData = await request<{ default_branch: string }>(
-          `/repos/${owner}/${repoEnc}`,
+          `/repos/${rp}`,
         );
         sourceBranch = repoData.default_branch;
       }
 
       const refData = await request<{ object: { sha: string } }>(
-        `/repos/${owner}/${repoEnc}/git/ref/heads/${encodeURIComponent(sourceBranch)}`,
+        `/repos/${rp}/git/ref/heads/${encodeURIComponent(sourceBranch)}`,
       );
       const sha = refData.object.sha;
 
       const result = await request<{ ref: string; object: { sha: string } }>(
-        `/repos/${owner}/${repoEnc}/git/refs`,
+        `/repos/${rp}/git/refs`,
         {
           method: "POST",
           body: JSON.stringify({ ref: `refs/heads/${branch}`, sha }),
@@ -156,7 +175,7 @@ export function createGitHubClient(config: GitHubConfig) {
       state?: "open" | "closed" | "all",
     ): Promise<GitHubPullRequest[]> {
       const data = await request<Array<Record<string, unknown>>>(
-        `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/pulls?state=${state || "open"}&per_page=100`,
+        `/repos/${repoPath(repo)}/pulls?state=${state || "open"}&per_page=100`,
       );
       return data.map(mapPullRequest);
     },
@@ -164,7 +183,7 @@ export function createGitHubClient(config: GitHubConfig) {
     /** Get a single pull request by number. */
     async getPullRequest(repo: string, number: number): Promise<GitHubPullRequest> {
       const p = await request<Record<string, unknown>>(
-        `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/pulls/${number}`,
+        `/repos/${repoPath(repo)}/pulls/${number}`,
       );
       return mapPullRequest(p);
     },
@@ -179,7 +198,7 @@ export function createGitHubClient(config: GitHubConfig) {
       draft?: boolean,
     ): Promise<GitHubPullRequest> {
       const p = await request<Record<string, unknown>>(
-        `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/pulls`,
+        `/repos/${repoPath(repo)}/pulls`,
         {
           method: "POST",
           body: JSON.stringify({ title, head, base, body: body ?? "", draft: draft ?? false }),
@@ -196,7 +215,7 @@ export function createGitHubClient(config: GitHubConfig) {
       commitMessage?: string,
     ): Promise<{ merged: boolean; message: string; sha?: string }> {
       return request<{ merged: boolean; message: string; sha?: string }>(
-        `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/pulls/${number}/merge`,
+        `/repos/${repoPath(repo)}/pulls/${number}/merge`,
         {
           method: "PUT",
           body: JSON.stringify({
@@ -218,7 +237,7 @@ export function createGitHubClient(config: GitHubConfig) {
           submitted_at: string;
         }>
       >(
-        `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/pulls/${number}/reviews`,
+        `/repos/${repoPath(repo)}/pulls/${number}/reviews`,
       );
       return data.map((r) => ({
         id: r.id,
@@ -243,7 +262,7 @@ export function createGitHubClient(config: GitHubConfig) {
         body: string | null;
         submitted_at: string;
       }>(
-        `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/pulls/${number}/reviews`,
+        `/repos/${repoPath(repo)}/pulls/${number}/reviews`,
         {
           method: "POST",
           body: JSON.stringify({ body, event }),
@@ -265,7 +284,7 @@ export function createGitHubClient(config: GitHubConfig) {
       body: string,
     ): Promise<{ id: number }> {
       return request<{ id: number }>(
-        `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/issues/${number}/comments`,
+        `/repos/${repoPath(repo)}/issues/${number}/comments`,
         {
           method: "POST",
           body: JSON.stringify({ body }),
@@ -285,7 +304,7 @@ export function createGitHubClient(config: GitHubConfig) {
           completed_at: string | null;
         }>;
       }>(
-        `/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(ref)}/check-runs`,
+        `/repos/${repoPath(repo)}/commits/${encodeURIComponent(ref)}/check-runs`,
       );
       return data.check_runs.map((c) => ({
         id: c.id,
@@ -301,7 +320,8 @@ export function createGitHubClient(config: GitHubConfig) {
     getCloneUrl(repo: string): string {
       const host = config.baseUrl.replace(/^https?:\/\//, "").replace(/\/api\/v3\/?$/, "");
       const effectiveHost = host === "api.github.com" ? "github.com" : host;
-      return `https://x-access-token:${config.token}@${effectiveHost}/${config.owner}/${repo}.git`;
+      const { owner, name } = repoOwnerName(repo);
+      return `https://x-access-token:${config.token}@${effectiveHost}/${owner}/${name}.git`;
     },
   };
 }

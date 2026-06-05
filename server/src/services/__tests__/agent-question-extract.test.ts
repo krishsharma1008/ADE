@@ -42,6 +42,26 @@ I had a few thoughts:
       expect(out).toHaveLength(2);
     });
 
+    it("extracts BOLD-numbered questions (the realistic agent format)", () => {
+      // Mirrors how agents (e.g. claude) actually emit clarifying questions: bold,
+      // numbered, ending in "?". Before the stripBullet bold-strip these fell
+      // through as plain comments and never became structured `question` comments.
+      const text = `
+I've reviewed the hero section. Before implementing:
+
+**1. Button purpose — new button alongside the existing two, or update the existing CTA?**
+**2. Which brand color should the primary CTA use?**
+**3. Should the label be "Get Started" or "Learn More"?**
+Implementation note: nothing to decide here.
+`;
+      const out = extractQuestionsFromText(text);
+      expect(out).toHaveLength(3);
+      expect(out[0]).toMatch(/Button purpose/);
+      expect(out[1]).toMatch(/brand color/);
+      // The bold markers are stripped from the captured question text.
+      expect(out.every((q) => !q.includes("**"))).toBe(true);
+    });
+
     it("dedupes questions that only differ in whitespace/case", () => {
       const text = `
 ## Clarifying questions
