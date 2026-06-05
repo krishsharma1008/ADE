@@ -772,7 +772,15 @@ export function issueRoutes(db: Db, storage: StorageService) {
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
       });
 
-      if (issue.status === "awaiting_user" && actor.agentId) {
+      // Structure any questions an agent buries in a PLAIN comment into proper
+      // `question`/`manager_question` comments — regardless of the issue's current
+      // status. Otherwise an agent that asks via a comment while its run reports
+      // "complete" gets auto-closed to `done` with the question unanswered (the
+      // auto-close guard only blocks on structured question kinds). Running it on
+      // every agent comment is safe: extractAndPostQuestions only acts when it finds
+      // real bulleted/numbered questions (pleasantries + progress notes are ignored),
+      // dedupes against existing open questions, and flips the issue to awaiting_user.
+      if (actor.agentId && issue.status !== "done" && issue.status !== "cancelled") {
         await extractAndPostQuestions(db, {
           companyId: issue.companyId,
           agentId: actor.agentId,
