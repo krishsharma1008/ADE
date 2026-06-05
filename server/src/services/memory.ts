@@ -190,6 +190,45 @@ const LAYER_WEIGHT: Record<MemoryLayer, number> = {
   global: 1.0,
 };
 
+/**
+ * Default minimum combined relevance score a row must clear on the REAL-embedding
+ * path before it is allowed to surface. Recency alone keeps every row above zero,
+ * so without a score floor a fresh-but-semantically-orthogonal row (incl. a
+ * force-fetched global fixture) leaks into results. Env-tunable so it can be
+ * calibrated without a code change.
+ */
+const DEFAULT_MIN_RELEVANCE_SCORE = 0.25;
+
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * Resolve the relevance floor for a query, keyed on the QUERY embedding's version.
+ *
+ * On the hash-64 oracle path (`undefined` / `HASH_EMBEDDING_VERSION`) the cosine
+ * channel is near-noise, so we keep the historical `signal` mode — a row needs any
+ * lexical or non-trivial semantic signal (`r.lexical > 0 || r.semantic > 0.05`)
+ * and the suite stays byte-identical. On a REAL embedder version the cosine signal
+ * is meaningful, so we switch to `score` mode: a row must clear an absolute combined
+ * `score` floor (env-tunable via COMBYNE_MIN_RELEVANCE_SCORE), which drops
+ * recency-only / orthogonal rows that the signal test would have let through.
+ */
+export function minRelevanceForVersion(
+  version: string | undefined,
+): { mode: "signal"; floor: 0 } | { mode: "score"; floor: number } {
+  if (version === undefined || version === HASH_EMBEDDING_VERSION) {
+    return { mode: "signal", floor: 0 };
+  }
+  return {
+    mode: "score",
+    floor: envNumber("COMBYNE_MIN_RELEVANCE_SCORE", DEFAULT_MIN_RELEVANCE_SCORE),
+  };
+}
+
 export interface RankInputEntry {
   id: string;
   layer: MemoryLayer;
@@ -1031,8 +1070,15 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     const limit = Math.min(Math.max(opts.limit ?? 10, 1), 50);
     const byId = new Map(candidates.map((r) => [r.id, r]));
     // Recency alone keeps every entry above zero, so require some lexical or
-    // semantic signal before the ranker is willing to surface a result.
-    const signalled = ranked.filter((r) => r.lexical > 0 || r.semantic > 0.05);
+    // semantic signal before the ranker is willing to surface a result. On the
+    // REAL-embedding path the cosine signal is meaningful, so we additionally
+    // enforce an absolute combined-score floor (mode:'score') that drops
+    // recency-only / semantically-orthogonal rows (incl. force-fetched global
+    // fixtures); the hash-64 oracle path keeps the byte-identical `signal` test.
+    const floor = minRelevanceForVersion(queryEmbedding?.version);
+    const signalled = ranked.filter((r) =>
+      floor.mode === "score" ? r.score >= floor.floor : r.lexical > 0 || r.semantic > 0.05,
+    );
     // ---- §3.6 deterministic conflict resolution ----
     // Group ranked hits by subjectKey; the winner is the highest-precedence
     // provenance (human-answer > pr-approval > verified-summary > agent-claim),
@@ -1072,6 +1118,10 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       if (!row || !row.subjectKey) return true;
       return winnerBySubjectKey.get(row.subjectKey) === r.id;
     });
+    // `deduped` already descends from `signalled`, which the relevance floor
+    // applied ABOVE — this slice MUST stay AFTER the floor so the returned count
+    // is min(limit, rows-above-floor), never a limit window padded with
+    // below-floor rows. Do not hoist the slice above the floor.
     const topIds = deduped.slice(0, limit);
     const layerCounts: Record<MemoryLayer, number> = {
       workspace: 0,

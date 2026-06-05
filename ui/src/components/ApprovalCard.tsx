@@ -81,7 +81,7 @@ export function ApprovalCard({
                     : "/issues"
                 }
               >
-                Review &amp; merge in PR panel
+                Open PR panel to merge
               </Link>
             </Button>
           </div>

@@ -42,6 +42,11 @@ const ENTRIES: Entry[] = [
   { id: "qa-deploy", kind: "human-answer", subject: "How do we deploy the staging build?", body: "Q: how is the staging environment deployed?\nA: push to the release/staging branch; CI builds the image and the Fly staging app picks it up. Never deploy staging from a laptop." },
 ];
 
+/** Subjects of the code-style eval fixture, re-exported for the global-fixture
+ *  cleanup allowlist (scripts/cleanup-global-fixtures.ts). Pairs with EVAL_ENTRIES
+ *  in src/services/embedding-eval-fixture.ts. */
+export const EVAL_CODE_SUBJECTS = ENTRIES.map((e) => e.subject);
+
 const QUERIES: Query[] = [
   { q: "what should I use for logging in a new service?", expected: ["logging-conv"], persona: "engineer" },
   { q: "how do I make sure messages stay in order when producing to a stream?", expected: ["kafka-send"], persona: "engineer" },
@@ -140,4 +145,8 @@ async function main() {
     console.log(`\n  (live tier skipped — set COMBYNE_EVAL_LIVE_EMBEDDINGS=1 + an OpenAI key)`);
   }
 }
-main().catch((e) => { console.error(e); process.exit(1); });
+// Only run the eval when executed directly as a CLI; importing this module (e.g.
+// scripts/cleanup-global-fixtures.ts pulls in EVAL_CODE_SUBJECTS) must be a no-op.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((e) => { console.error(e); process.exit(1); });
+}

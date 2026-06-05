@@ -816,6 +816,18 @@ export async function startServer(): Promise<StartedServer> {
     const AWAITING_USER_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
     let lastAwaitingUserSweepAt = 0;
 
+    // Stale agent-self-block recovery. An agent can park an issue in `blocked`
+    // (blockedSource='agent') from a free-text blocker; if its blockers later clear
+    // with no answer/approval event, nothing wakes it. This sweep recovers such an
+    // issue once it is older than COMBYNE_SELF_BLOCK_REEVAL_MS (default 30min) and all
+    // four auto-close blocker probes are absent. Same 30-min tick gate as awaiting_user.
+    const SELF_BLOCK_REEVAL_MS = Math.max(
+      0,
+      Number(process.env.COMBYNE_SELF_BLOCK_REEVAL_MS ?? `${30 * 60 * 1000}`) || 0,
+    );
+    const SELF_BLOCK_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
+    let lastSelfBlockSweepAt = 0;
+
     // Issue 4 — usage-pause boot recovery MUST run before reapOrphanedRuns so
     // the reaper sees a clean window set: it deletes windows whose run is gone
     // or no longer paused_usage and leaves valid ones for the resume poller.
@@ -927,6 +939,26 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "awaiting_user sweeper tick failed");
+          });
+      }
+
+      if (
+        SELF_BLOCK_REEVAL_MS > 0 &&
+        now - lastSelfBlockSweepAt >= SELF_BLOCK_SWEEP_INTERVAL_MS
+      ) {
+        lastSelfBlockSweepAt = now;
+        void issuesSvc
+          .reEvaluateStaleAgentSelfBlocks(new Date(now), SELF_BLOCK_REEVAL_MS)
+          .then((result) => {
+            if (result.recovered > 0) {
+              logger.info(
+                { recovered: result.recovered },
+                "self-block sweeper recovered stale agent self-blocked issues",
+              );
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "self-block sweeper tick failed");
           });
       }
     }, config.heartbeatSchedulerIntervalMs);

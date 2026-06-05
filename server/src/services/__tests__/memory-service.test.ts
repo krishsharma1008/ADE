@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { agents, companies, createDb, issues, memoryEntries, memoryPromotions } from "@combyne/db";
 import { memoryService, computeSubjectKey } from "../memory.js";
+import type { MemoryEmbedder } from "../memory-embedder.js";
 import { buildExportBundle, EmptyExportError, importBundle } from "../memory-etl.js";
 import {
   startIsolatedTestDb,
@@ -339,6 +340,165 @@ describe("memory service (4-layer)", () => {
     await svc.archiveEntry(e.id);
     result = await svc.queryRanked(companyId, "archivedSentinel", { limit: 10 });
     expect(result.items.some((i) => i.id === e.id)).toBe(false);
+  });
+
+  it("hash-path: a unique-token lexical hit still surfaces under the relevance floor", async () => {
+    // The default service uses the hash-64 oracle embedder, so the query version
+    // is HASH_EMBEDDING_VERSION → minRelevanceForVersion returns mode:'signal'.
+    // A pure lexical hit (r.lexical > 0, semantic near-zero) must still surface,
+    // proving the new floor did NOT change the hash path (this is the archived
+    // sentinel's positive arm restated as an explicit floor regression).
+    const svc = memoryService(handle.db);
+    const e = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject: "floorRegressionUniqueToken policy note",
+      body: "floorRegressionUniqueToken describes a one-of-a-kind keyword",
+    });
+    const result = await svc.queryRanked(companyId, "floorRegressionUniqueToken", { limit: 10 });
+    expect(result.items.some((i) => i.id === e.id)).toBe(true);
+  });
+
+  it("real-embedding floor: relevant row surfaces, fresh-orthogonal noise is excluded", async () => {
+    // Exercise the REAL-embedding path WITHOUT a network embedder via the
+    // memoryService(db, fakeEmbedder) seam. enabled:false keeps the storage and
+    // ANN-pushdown branches off (they gate on embedder.enabled), so candidates
+    // load via the jsonb window and the precomputed query embedding flows into the
+    // ranker. embedQuery returns a real (non-hash) version → mode:'score', floor 0.25.
+    const VERSION = "test-real:8";
+    // 8-dim unit vectors. The relevant entry's vector is identical to the query
+    // (cosine 1.0); the noise vectors are orthogonal (cosine 0.0). All entries use
+    // disjoint lexical vocabularies from the query so lexical never masks the test.
+    const queryVec = [1, 0, 0, 0, 0, 0, 0, 0];
+    const relevantVec = [1, 0, 0, 0, 0, 0, 0, 0];
+    const noiseVecA = [0, 1, 0, 0, 0, 0, 0, 0];
+    const noiseVecB = [0, 0, 1, 0, 0, 0, 0, 0];
+    const fakeEmbedder: MemoryEmbedder = {
+      enabled: false,
+      version: VERSION,
+      embedForStorage: async () => ({
+        vector: relevantVec,
+        version: VERSION,
+        model: "test-real",
+        redactedFindings: [],
+        contentHash: "test",
+      }),
+      embedQuery: async () => ({ vector: queryVec, version: VERSION, redactedFindings: [] }),
+    };
+    const svc = memoryService(handle.db, fakeEmbedder);
+
+    // Seed entries DIRECTLY (bypassing the embedder-gated write path) so the
+    // jsonb `embedding` + `embedding_version` are exactly the real-space vectors.
+    const fresh = new Date();
+    const [relevant] = await handle.db
+      .insert(memoryEntries)
+      .values({
+        companyId,
+        layer: "workspace",
+        subject: "alpha vector relevant fixture",
+        body: "alpha vector relevant fixture body",
+        embedding: relevantVec,
+        embeddingVersion: VERSION,
+        updatedAt: new Date(fresh.getTime() - 1000 * 60 * 60 * 24 * 30),
+      })
+      .returning();
+    const [noise1] = await handle.db
+      .insert(memoryEntries)
+      .values({
+        companyId,
+        layer: "workspace",
+        subject: "bravo unrelated fresh noise one",
+        body: "bravo unrelated fresh noise one body",
+        embedding: noiseVecA,
+        embeddingVersion: VERSION,
+        updatedAt: fresh,
+      })
+      .returning();
+    const [noise2] = await handle.db
+      .insert(memoryEntries)
+      .values({
+        companyId,
+        layer: "workspace",
+        subject: "charlie unrelated fresh noise two",
+        body: "charlie unrelated fresh noise two body",
+        embedding: noiseVecB,
+        embeddingVersion: VERSION,
+        updatedAt: fresh,
+      })
+      .returning();
+
+    // Query has its own vocabulary (no lexical overlap with any seeded row) so the
+    // only thing that can lift the relevant row above the 0.25 floor is the cosine.
+    const result = await svc.queryRanked(companyId, "delta echo foxtrot query", { limit: 10 });
+    const ids = result.items.map((i) => i.id);
+    // Relevant row (cosine 1.0 → score ≈ 0.55) clears the floor and surfaces.
+    expect(ids).toContain(relevant.id);
+    // Fresh-but-orthogonal noise (cosine 0, recency-only → score ≈ 0.15) is dropped.
+    expect(ids).not.toContain(noise1.id);
+    expect(ids).not.toContain(noise2.id);
+
+    // Cleanup so the seeded fixtures don't pollute other tests in this company.
+    for (const id of [relevant.id, noise1.id, noise2.id]) {
+      await handle.db.delete(memoryEntries).where(eq(memoryEntries.id, id));
+    }
+  });
+
+  it("real-embedding floor: an all-orthogonal corpus returns zero items", async () => {
+    // Every candidate is orthogonal to the query vector (cosine 0) and carries no
+    // lexical overlap, so under mode:'score' nothing clears the 0.25 floor → 0 items.
+    const VERSION = "test-real:8";
+    const queryVec = [1, 0, 0, 0, 0, 0, 0, 0];
+    const fakeEmbedder: MemoryEmbedder = {
+      enabled: false,
+      version: VERSION,
+      embedForStorage: async () => ({
+        vector: queryVec,
+        version: VERSION,
+        model: "test-real",
+        redactedFindings: [],
+        contentHash: "test",
+      }),
+      embedQuery: async () => ({ vector: queryVec, version: VERSION, redactedFindings: [] }),
+    };
+    const svc = memoryService(handle.db, fakeEmbedder);
+
+    // Fresh company so the corpus is exactly these orthogonal rows (no global rows
+    // exist in this isolated rig, so the result is purely the seeded set).
+    const suffix = Math.random().toString(36).slice(2, 5).toUpperCase();
+    const [isoCo] = await handle.db
+      .insert(companies)
+      .values({ name: `OrthoCo-${suffix}`, issuePrefix: `X${suffix}` })
+      .returning();
+    const fresh = new Date();
+    const seeded: string[] = [];
+    const orthoVecs = [
+      [0, 1, 0, 0, 0, 0, 0, 0],
+      [0, 0, 1, 0, 0, 0, 0, 0],
+      [0, 0, 0, 1, 0, 0, 0, 0],
+    ];
+    for (let i = 0; i < orthoVecs.length; i++) {
+      const [row] = await handle.db
+        .insert(memoryEntries)
+        .values({
+          companyId: isoCo.id,
+          layer: "workspace",
+          subject: `orthogonal fixture ${i} subject`,
+          body: `orthogonal fixture ${i} body`,
+          embedding: orthoVecs[i],
+          embeddingVersion: VERSION,
+          updatedAt: fresh,
+        })
+        .returning();
+      seeded.push(row.id);
+    }
+
+    const result = await svc.queryRanked(isoCo.id, "unrelated query tokens here", { limit: 10 });
+    expect(result.items.length).toBe(0);
+
+    for (const id of seeded) {
+      await handle.db.delete(memoryEntries).where(eq(memoryEntries.id, id));
+    }
+    await handle.db.delete(companies).where(eq(companies.id, isoCo.id));
   });
 
   it("queryRanked is company-scoped", async () => {

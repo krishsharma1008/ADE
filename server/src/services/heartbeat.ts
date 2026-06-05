@@ -706,6 +706,7 @@ export async function autoCloseIssueAfterSuccessfulRun(
     issueId: string;
     questionResult?: ExtractedQuestionsResult | null;
     allowAutoClose?: boolean;
+    requiresArtifact?: boolean;
     summary?: string | null;
     changedFiles?: string[];
     checks?: string[];
@@ -815,6 +816,58 @@ export async function autoCloseIssueAfterSuccessfulRun(
     .limit(1)
     .then((rows) => rows[0] ?? null);
   if (unresolvedQaFeedback) return { closed: false, reason: "unresolved_qa_feedback" };
+
+  if (input.requiresArtifact && issue.originKind !== "routine_execution") {
+    const hasChangedFiles = Boolean(input.changedFiles && input.changedFiles.length > 0);
+    const trackedPullRequest = hasChangedFiles
+      ? null
+      : await db
+          .select({ id: issuePullRequests.id })
+          .from(issuePullRequests)
+          .where(
+            and(
+              eq(issuePullRequests.companyId, issue.companyId),
+              eq(issuePullRequests.issueId, issue.id),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+    const artifactPresent = hasChangedFiles || Boolean(trackedPullRequest);
+    if (!artifactPresent) {
+      const advisory =
+        "Run completed but produced no verifiable artifact — no pull request was opened and no changed " +
+        "files were reported for this code ticket. Re-run with the work committed (a PR or a non-empty " +
+        "change set) or close this issue manually if no code change is expected.";
+      await db.insert(issueComments).values({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        authorAgentId: null,
+        authorUserId: null,
+        body: advisory,
+        kind: "system",
+      });
+      const updated = await issueService(db).update(issue.id, {
+        status: "awaiting_user",
+        latestUserFacingAgentMessage: advisory,
+      });
+      if (!updated) return { closed: false, reason: "update_failed" };
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.auto_close_blocked",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          reason: "no_artifact_on_code_ticket",
+          previousStatus: issue.status,
+        },
+      });
+      return { closed: false, reason: "no_artifact" };
+    }
+  }
 
   if (
     !input.allowAutoClose &&
@@ -5880,6 +5933,11 @@ export function heartbeatService(db: Db) {
           }
 
           if (!skipAutoCloseForScope) {
+            const requiresArtifact =
+              resolvedWorkspace.source === "project_primary" ||
+              resolvedWorkspace.source === "execution_workspace" ||
+              Boolean(resolvedWorkspace.projectId) ||
+              Boolean(resolvedWorkspace.repoUrl);
             await autoCloseIssueAfterSuccessfulRun(db, {
               companyId: finalizedRun.companyId,
               agentId: finalizedRun.agentId,
@@ -5887,6 +5945,7 @@ export function heartbeatService(db: Db) {
               issueId: runIssueId,
               questionResult,
               allowAutoClose: false,
+              requiresArtifact,
               summary: completion.summary,
               changedFiles: completion.changedFiles,
               checks: completion.checks,

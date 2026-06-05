@@ -570,7 +570,7 @@ export function issuePullRequestService(db: Db) {
       .select({ id: issuePullRequests.id })
       .from(issuePullRequests)
       .where(and(eq(issuePullRequests.companyId, companyId), ne(issuePullRequests.mergeStatus, "merged")))
-      .orderBy(asc(issuePullRequests.updatedAt))
+      .orderBy(asc(issuePullRequests.lastReconciledAt))
       .limit(50);
 
     let scanned = 0;

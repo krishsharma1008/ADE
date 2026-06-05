@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   agents,
@@ -10,12 +10,14 @@ import {
   issueAttachments,
   issueLabels,
   issueComments,
+  issuePullRequests,
   issueReadStates,
   issueWorkProducts,
   issues,
   labels,
   projectWorkspaces,
   projects,
+  qaFeedbackEvents,
 } from "@combyne/db";
 import { extractProjectMentionIds } from "@combyne/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
@@ -1000,6 +1002,168 @@ export function issueService(db: Db) {
         }
       }
       return { closed };
+    },
+
+    // Recover from a stale FREE-TEXT agent self-block. An agent can park an issue in
+    // `blocked` (blockedSource='agent') from a plain blocker comment; if every gating
+    // condition is since gone but no answer/approval event ever fired, nothing wakes
+    // it. This sweep clears such an issue once it is older than `staleAfterMs` AND all
+    // FOUR auto-close blocker probes (open question/manager_question, open child
+    // issues, unresolved PR feedback, unresolved QA feedback) are absent — the same
+    // gates heartbeat.autoCloseIssueAfterSuccessfulRun checks. `now`/threshold are
+    // injected for deterministic tests. Best-effort per row (try/catch).
+    reEvaluateStaleAgentSelfBlocks: async (
+      now: Date,
+      staleAfterMs: number,
+    ): Promise<{ recovered: number }> => {
+      const cutoff = new Date(now.getTime() - staleAfterMs);
+      const stale = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          startedAt: issues.startedAt,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.status, "blocked"),
+            eq(issues.blockedSource, "agent"),
+            isNotNull(issues.blockedAt),
+            lt(issues.blockedAt, cutoff),
+          ),
+        );
+
+      if (stale.length === 0) return { recovered: 0 };
+
+      let recovered = 0;
+      for (const row of stale) {
+        try {
+          const openQuestion = await db
+            .select({ id: issueComments.id })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.issueId, row.id),
+                inArray(issueComments.kind, ["question", "manager_question"]),
+                isNull(issueComments.answeredAt),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (openQuestion) continue;
+
+          const openChildIssue = await db
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(eq(issues.parentId, row.id), notInArray(issues.status, ["done", "cancelled"])))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (openChildIssue) continue;
+
+          const unresolvedPullRequestBlocker = await db
+            .select({ id: issuePullRequests.id })
+            .from(issuePullRequests)
+            .where(
+              and(
+                eq(issuePullRequests.companyId, row.companyId),
+                eq(issuePullRequests.issueId, row.id),
+                eq(issuePullRequests.state, "open"),
+                sql<boolean>`(
+                  ${issuePullRequests.mergeStatus} = 'blocked'
+                  OR ${issuePullRequests.reviewStatus} = 'changes_requested'
+                  OR ${issuePullRequests.ciStatus} IN ('failed', 'failing')
+                  OR ${issuePullRequests.qualityStatus} IN ('failed', 'blocked')
+                  OR ${issuePullRequests.feedbackStatus} IN ('needs_agent', 'sent', 'awaiting_human')
+                )`,
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (unresolvedPullRequestBlocker) continue;
+
+          const unresolvedQaFeedback = await db
+            .select({ id: qaFeedbackEvents.id })
+            .from(qaFeedbackEvents)
+            .where(
+              and(
+                eq(qaFeedbackEvents.companyId, row.companyId),
+                eq(qaFeedbackEvents.issueId, row.id),
+                notInArray(qaFeedbackEvents.status, [
+                  "known_issue",
+                  "deferred",
+                  "needs_product_decision",
+                  "acknowledged",
+                  "resolved",
+                ]),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (unresolvedQaFeedback) continue;
+
+          const hasAssignee = Boolean(row.assigneeAgentId || row.assigneeUserId);
+          await db.transaction(async (tx) => {
+            await tx
+              .update(issues)
+              .set({
+                status: hasAssignee ? "in_progress" : "todo",
+                startedAt: hasAssignee ? row.startedAt ?? now : row.startedAt,
+                completedAt: null,
+                cancelledAt: null,
+                blockedSource: null,
+                blockedReason: null,
+                blockedAt: null,
+                awaitingUserSince: null,
+                latestUserFacingAgentMessage: null,
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(issues.id, row.id),
+                  eq(issues.status, "blocked"),
+                  eq(issues.blockedSource, "agent"),
+                ),
+              );
+            await tx.insert(issueComments).values({
+              companyId: row.companyId,
+              issueId: row.id,
+              authorAgentId: null,
+              authorUserId: null,
+              body: "Self-block auto-cleared: no open questions, child issues, PR feedback, or QA feedback remain. Resuming work.",
+              kind: "system",
+            });
+          });
+
+          if (row.assigneeAgentId) {
+            try {
+              const { heartbeatService } = await import("./heartbeat.js");
+              await heartbeatService(db).wakeup(row.assigneeAgentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "self_block_recovered",
+                payload: { issueId: row.id },
+                requestedByActorType: "system",
+                requestedByActorId: "self-block-sweeper",
+                contextSnapshot: {
+                  issueId: row.id,
+                  taskId: row.id,
+                  source: "issue.self_block_recovered",
+                  wakeReason: "self_block_recovered",
+                },
+              });
+            } catch (_wakeErr) {
+              // Wake failure must not undo the clear; the next routine cycle still
+              // dispatches the issue to the now-unblocked agent.
+            }
+          }
+          recovered++;
+        } catch (_err) {
+          // Soft-fail per row so one bad issue doesn't kill the sweep.
+        }
+      }
+      return { recovered };
     },
 
     remove: (id: string) =>

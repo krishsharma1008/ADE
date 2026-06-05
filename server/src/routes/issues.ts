@@ -1,6 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
+import { eq } from "drizzle-orm";
 import type { Db } from "@combyne/db";
+import { issues } from "@combyne/db";
 import {
   addIssueCommentSchema,
   answerInternalQuestionSchema,
@@ -1101,6 +1103,44 @@ export function issueRoutes(db: Db, storage: StorageService) {
         } catch (err) {
           logger.warn({ err, issueId: id }, "failed to wake agent after question answered");
         }
+      }
+    } else if (remaining === 0 && issue.status === "blocked" && issue.blockedSource === "agent") {
+      // The agent self-blocked on its own board question (e.g. a manager/product
+      // decision). Answering it clears the block with the exact field set
+      // agent-question-routing.ts uses for an answered manager_question, then wakes
+      // the assignee. Best-effort: a failure must never fail the answer response.
+      try {
+        const now = new Date();
+        await db
+          .update(issues)
+          .set({
+            status: issue.assigneeAgentId || issue.assigneeUserId ? "in_progress" : "todo",
+            startedAt:
+              issue.assigneeAgentId || issue.assigneeUserId ? issue.startedAt ?? now : issue.startedAt,
+            completedAt: null,
+            cancelledAt: null,
+            blockedSource: null,
+            blockedReason: null,
+            blockedAt: null,
+            awaitingUserSince: null,
+            latestUserFacingAgentMessage: null,
+            updatedAt: now,
+          })
+          .where(eq(issues.id, id));
+        updated = (await svc.getById(id)) ?? issue;
+        if (issue.assigneeAgentId) {
+          await heartbeat.wakeup(issue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "user_responded",
+            payload: { issueId: id, questionCommentId, answerCommentId: answerComment.id },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: { issueId: id, source: "issue.answer_question" },
+          });
+        }
+      } catch (err) {
+        logger.warn({ err, issueId: id }, "failed to clear agent self-block after question answered");
       }
     }
 

@@ -6,7 +6,7 @@ export const typeLabel: Record<string, string> = {
   plan_review: "Plan Review",
   // The agent has OPENED a PR and is requesting review — approving does not merge
   // automatically; a human reviews and merges from the PR panel (or on GitHub).
-  merge_pr: "PR ready for review",
+  merge_pr: "PR ready — open & merge in PR panel",
 };
 
 export const typeIcon: Record<string, typeof UserPlus> = {
@@ -94,9 +94,9 @@ export function MergePrPayload({ payload }: { payload: Record<string, unknown> }
   return (
     <div className="mt-3 space-y-1.5 text-sm">
       <p className="text-[11px] text-muted-foreground">
-        The agent opened this pull request and is requesting review. It will <strong>not</strong> merge
-        automatically — review and merge it from the issue&apos;s PR panel (or on GitHub). The approved
-        decision is captured to memory once the PR is merged.
+        The agent opened this pull request and is requesting review. Approving records your sign-off only
+        and does <strong>not</strong> merge — review and merge it from the issue&apos;s PR panel (or on
+        GitHub). The approved decision is captured to memory once the PR is merged.
       </p>
       <PayloadField label="Repo" value={payload.repo} />
       <PayloadField label="PR" value={payload.pullNumber ? `#${payload.pullNumber}` : payload.pullUrl} />

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { embedText, cosineSimilarity, rankEntries } from "../memory.js";
+import { embedText, cosineSimilarity, rankEntries, minRelevanceForVersion } from "../memory.js";
 
 describe("memory ranker (pure)", () => {
   it("embedText is deterministic and L2-normalized", () => {
@@ -156,5 +156,35 @@ describe("memory ranker (pure)", () => {
     const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
     expect(norm).toBeCloseTo(1, 5);
     expect(embedText("budget hard stop pause policy")).toEqual(v);
+  });
+
+  describe("minRelevanceForVersion (relevance floor)", () => {
+    const ENV_KEY = "COMBYNE_MIN_RELEVANCE_SCORE";
+
+    it("hash-64 / undefined query versions stay on the historical signal floor", () => {
+      // undefined === the oracle/pure path (no precomputed query embedding); the
+      // hash-64 version is the deterministic test rig. Both must keep mode:'signal'
+      // so the existing ~866-test suite stays byte-identical.
+      expect(minRelevanceForVersion(undefined)).toEqual({ mode: "signal", floor: 0 });
+      expect(minRelevanceForVersion("hash-64:64")).toEqual({ mode: "signal", floor: 0 });
+    });
+
+    it("a real embedder version uses the absolute score floor (default 0.25)", () => {
+      delete process.env[ENV_KEY];
+      expect(minRelevanceForVersion("openai:test:1536")).toEqual({ mode: "score", floor: 0.25 });
+    });
+
+    it("COMBYNE_MIN_RELEVANCE_SCORE overrides the score floor; junk falls back", () => {
+      const original = process.env[ENV_KEY];
+      try {
+        process.env[ENV_KEY] = "0.4";
+        expect(minRelevanceForVersion("openai:test:1536")).toEqual({ mode: "score", floor: 0.4 });
+        process.env[ENV_KEY] = "not-a-number";
+        expect(minRelevanceForVersion("openai:test:1536")).toEqual({ mode: "score", floor: 0.25 });
+      } finally {
+        if (original === undefined) delete process.env[ENV_KEY];
+        else process.env[ENV_KEY] = original;
+      }
+    });
   });
 });

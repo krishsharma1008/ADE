@@ -1,6 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { activityLog, agents, companies, heartbeatRuns, issueComments, issues } from "@combyne/db";
+import {
+  activityLog,
+  agents,
+  companies,
+  heartbeatRuns,
+  issueComments,
+  issuePullRequests,
+  issues,
+} from "@combyne/db";
 import {
   autoCloseIssueAfterSuccessfulRun,
   enforceDelegationPolicyAfterSuccessfulRun,
@@ -223,6 +231,116 @@ describe("heartbeat successful-run auto-close", () => {
     expect(commentsAfterSecondCheck.filter((comment) => /Delegation required/.test(comment.body)).length).toBe(1);
     const [refreshedRun] = await handle.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
     expect((refreshedRun.promptBudgetJson as Record<string, unknown> | null)?.orchestrationPolicy).toBeTruthy();
+  });
+
+  it("routes a code ticket with no artifact to awaiting_user instead of closing", async () => {
+    const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
+
+    const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      issueId: issue.id,
+      questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
+      requiresArtifact: true,
+    });
+
+    expect(result).toEqual({ closed: false, reason: "no_artifact" });
+    const [refreshed] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(refreshed.status).toBe("awaiting_user");
+    expect(refreshed.completedAt).toBeNull();
+
+    const comments = await handle.db.select().from(issueComments).where(eq(issueComments.issueId, issue.id));
+    const advisory = comments.find((comment) =>
+      /no pull request|changed files|verifiable artifact/i.test(comment.body),
+    );
+    expect(advisory).toBeTruthy();
+    expect(advisory?.kind).not.toBe("question");
+    expect(advisory?.kind).toBe("system");
+    expect(comments.some((comment) => /Run completed successfully/.test(comment.body))).toBe(false);
+
+    const blockedActivity = await handle.db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issue.id));
+    expect(blockedActivity.some((row) => row.action === "issue.auto_close_blocked")).toBe(true);
+  });
+
+  it("closes a code ticket when changed files are reported", async () => {
+    const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
+
+    const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      issueId: issue.id,
+      questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
+      requiresArtifact: true,
+      changedFiles: ["src/example.ts"],
+    });
+
+    expect(result).toEqual({ closed: true, reason: "successful_run_without_questions" });
+    const [refreshed] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(refreshed.status).toBe("done");
+  });
+
+  it("closes a code ticket when a tracked pull request exists", async () => {
+    const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
+    await handle.db.insert(issuePullRequests).values({
+      companyId,
+      issueId: issue.id,
+      repo: "acme/widgets",
+      pullNumber: 42,
+      pullUrl: "https://github.com/acme/widgets/pull/42",
+      title: "Implement the widget",
+      baseBranch: "main",
+    });
+
+    const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      issueId: issue.id,
+      questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
+      requiresArtifact: true,
+    });
+
+    expect(result).toEqual({ closed: true, reason: "successful_run_without_questions" });
+    const [refreshed] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(refreshed.status).toBe("done");
+  });
+
+  it("closes a non-code ticket without requiring an artifact", async () => {
+    const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
+
+    const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      issueId: issue.id,
+      questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
+    });
+
+    expect(result).toEqual({ closed: true, reason: "successful_run_without_questions" });
+    const [refreshed] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(refreshed.status).toBe("done");
+  });
+
+  it("closes a routine_execution ticket even when an artifact is required and absent", async () => {
+    const { issue, run } = await seedIssue("in_progress", { originKind: "routine_execution" });
+
+    const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      issueId: issue.id,
+      questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
+      requiresArtifact: true,
+    });
+
+    expect(result).toEqual({ closed: true, reason: "successful_run_without_questions" });
+    const [refreshed] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(refreshed.status).toBe("done");
   });
 
   it("leaves explicit awaiting_user issues alone", async () => {

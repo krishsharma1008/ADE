@@ -1,5 +1,7 @@
 import { Router } from "express";
+import { eq } from "drizzle-orm";
 import type { Db } from "@combyne/db";
+import { issues } from "@combyne/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
@@ -13,6 +15,7 @@ import {
   approvalService,
   heartbeatService,
   issueApprovalService,
+  issueService,
   logActivity,
   secretService,
 } from "../services/index.js";
@@ -31,6 +34,7 @@ export function approvalRoutes(db: Db) {
   const svc = approvalService(db);
   const heartbeat = heartbeatService(db);
   const issueApprovalsSvc = issueApprovalService(db);
+  const issuesSvc = issueService(db);
   const secretsSvc = secretService(db);
   const strictSecretsMode = process.env.COMBYNE_SECRETS_STRICT_MODE === "true";
 
@@ -200,6 +204,78 @@ export function approvalRoutes(db: Db) {
             error: err instanceof Error ? err.message : String(err),
           },
         });
+      }
+    }
+
+    // Wake-on-approval for blocked-on-agent issues. `listIssuesForApproval`'s
+    // projection omits `blockedSource`, so re-load each linked issue via getById to
+    // see whether the agent self-blocked it pending THIS approval. When it did, clear
+    // the block with the exact field set agent-question-routing.ts uses when a
+    // manager_question is answered, then wake the assignee. If the assignee IS the
+    // requester, the requester-wake above already fired — clear the block but skip the
+    // second (duplicate) wake. Best-effort: a per-issue failure must never fail the
+    // approve response.
+    for (const linkedIssueId of linkedIssueIds) {
+      try {
+        const issue = await issuesSvc.getById(linkedIssueId);
+        if (!issue || issue.status !== "blocked" || issue.blockedSource !== "agent") {
+          continue;
+        }
+        const now = new Date();
+        await db
+          .update(issues)
+          .set({
+            status: issue.assigneeAgentId || issue.assigneeUserId ? "in_progress" : "todo",
+            startedAt:
+              issue.assigneeAgentId || issue.assigneeUserId
+                ? issue.startedAt ?? now
+                : issue.startedAt,
+            completedAt: null,
+            cancelledAt: null,
+            blockedSource: null,
+            blockedReason: null,
+            blockedAt: null,
+            awaitingUserSince: null,
+            latestUserFacingAgentMessage: null,
+            updatedAt: now,
+          })
+          .where(eq(issues.id, issue.id));
+
+        await logActivity(db, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "issue.self_block_cleared",
+          entityType: "issue",
+          entityId: issue.id,
+          details: { reason: "approval_approved", approvalId: approval.id },
+        });
+
+        const alreadyWokenAsRequester =
+          issue.assigneeAgentId != null && issue.assigneeAgentId === approval.requestedByAgentId;
+        if (issue.assigneeAgentId && !alreadyWokenAsRequester) {
+          await heartbeat.wakeup(issue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "approval_approved",
+            payload: { issueId: issue.id, approvalId: approval.id, approvalStatus: approval.status },
+            requestedByActorType: "user",
+            requestedByActorId: req.actor.userId ?? "board",
+            contextSnapshot: {
+              source: "approval.approved",
+              issueId: issue.id,
+              taskId: issue.id,
+              approvalId: approval.id,
+              approvalStatus: approval.status,
+              wakeReason: "approval_approved",
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err, approvalId: approval.id, issueId: linkedIssueId },
+          "failed to clear agent self-block after approval",
+        );
       }
     }
 
