@@ -10,10 +10,58 @@ const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url)
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
 
-/** Detect Supabase pooler (port 6543 / pgBouncer) and disable prepared statements. */
+const LOOPBACK_HOSTS = new Set(["", "127.0.0.1", "::1", "localhost", "[::1]"]);
+
+/** True for the embedded/local Postgres (loopback or unix socket); false for a remote rail. */
+function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTS.has(host);
+}
+
+/**
+ * Build postgres-js connection options.
+ *
+ * - Supabase pooler (port 6543 / pgBouncer): disable prepared statements.
+ * - REMOTE hosts (the shared context rail, e.g. Cloud SQL over the public
+ *   internet): force TLS, bound the pool, and reap idle sockets that a NAT/Cloud
+ *   SQL idle-timeout may have silently killed, so a high-value write doesn't reuse
+ *   a dead connection. connect_timeout is tightened so an unreachable rail fails
+ *   fast instead of hanging the heartbeat (invariant I4).
+ * - LOOPBACK hosts (embedded local PG): relaxed — no TLS, no idle reaping,
+ *   default pool — preserving the zero-config local dev/migration path unchanged.
+ *
+ * `extra` is merged last so callers can layer on per-pool tuning; `connection`
+ * is deep-merged so a context pool can add `statement_timeout` without dropping
+ * the remote SSL/timeout defaults.
+ */
 function pgOptions(url: string, extra?: Options<{}>): Options<{}> {
-  const port = (() => { try { return new URL(url).port; } catch { return ""; } })();
-  return { ...(port === "6543" ? { prepare: false } : {}), ...extra };
+  const parsed = (() => { try { return new URL(url); } catch { return null; } })();
+  const port = parsed?.port ?? "";
+  const host = parsed?.hostname ?? "";
+  const sslmode = parsed?.searchParams.get("sslmode") ?? undefined;
+  const remote = !isLoopbackHost(host);
+
+  const base: Options<{}> = {
+    ...(port === "6543" ? { prepare: false } : {}),
+    ...(remote
+      ? {
+          // Honor an explicit sslmode in the URL; otherwise default remote to TLS.
+          ssl: sslmode === "disable" ? false : ((sslmode ?? "require") as never),
+          max: 4,
+          idle_timeout: 30,
+          connect_timeout: 10,
+          max_lifetime: 60 * 30,
+        }
+      : {}),
+  };
+
+  const merged: Options<{}> = { ...base, ...extra };
+  if ((base as { connection?: object }).connection || (extra as { connection?: object } | undefined)?.connection) {
+    (merged as { connection?: object }).connection = {
+      ...((base as { connection?: object }).connection ?? {}),
+      ...((extra as { connection?: object } | undefined)?.connection ?? {}),
+    };
+  }
+  return merged;
 }
 
 function isSafeIdentifier(value: string): boolean {
@@ -47,9 +95,14 @@ export type MigrationState =
       reason: "no-migration-journal-empty-db" | "no-migration-journal-non-empty-db" | "pending-migrations";
     };
 
-export function createDb(url: string) {
-  const sql = postgres(url, pgOptions(url));
+export function createDb(url: string, extra?: Options<{}>) {
+  const sql = postgres(url, pgOptions(url, extra));
   return drizzlePg(sql, { schema });
+}
+
+/** Exposed for unit tests: the resolved postgres-js options for a given URL. */
+export function resolvePgOptionsForTest(url: string, extra?: Options<{}>): Options<{}> {
+  return pgOptions(url, extra);
 }
 
 async function listMigrationFiles(): Promise<string[]> {
@@ -680,6 +733,41 @@ export async function applyPendingMigrations(url: string): Promise<void> {
   }
 }
 
+/**
+ * Fixed namespaced advisory-lock key for serializing context-DB migrations.
+ * The shared remote context DB is contended by N teammate boots and the explicit
+ * operator one-shot; a session advisory lock guarantees EXACTLY ONE runner applies
+ * DDL at a time while the rest see `upToDate` (re-inspected AFTER the lock) and
+ * no-op. The same numeric key must be used on every machine. 0x636f6d62 = "comb".
+ */
+const CONTEXT_MIGRATE_LOCK_KEY = 0x636f6d62;
+
+/**
+ * Apply pending migrations under a Postgres session advisory lock so concurrent
+ * callers (multiple teammates booting against the one shared context DB, or the
+ * operator one-shot) serialize instead of racing on non-idempotent DDL. A runner
+ * that loses the race acquires the lock after the winner finishes, re-inspects,
+ * sees `upToDate`, and returns without running any DDL.
+ */
+export async function applyPendingMigrationsLocked(url: string): Promise<void> {
+  const sql = postgres(url, pgOptions(url, { max: 1 }));
+  try {
+    await sql.unsafe(`SELECT pg_advisory_lock(${CONTEXT_MIGRATE_LOCK_KEY})`);
+    // Re-inspect AFTER acquiring the lock: a runner that lost the race must see
+    // the winner's applied state and exit without re-running DDL.
+    const state = await inspectMigrations(url);
+    if (state.status === "upToDate") return;
+    await applyPendingMigrations(url);
+  } finally {
+    try {
+      await sql.unsafe(`SELECT pg_advisory_unlock(${CONTEXT_MIGRATE_LOCK_KEY})`);
+    } catch {
+      // best-effort unlock; the session ending releases the lock regardless
+    }
+    await sql.end();
+  }
+}
+
 export type MigrationBootstrapResult =
   | { migrated: true; reason: "migrated-empty-db"; tableCount: 0 }
   | { migrated: false; reason: "already-migrated"; tableCount: number }
@@ -714,6 +802,37 @@ export async function migratePostgresIfEmpty(url: string): Promise<MigrationBoot
     return { migrated: true, reason: "migrated-empty-db", tableCount: 0 };
   } finally {
     await sql.end();
+  }
+}
+
+/**
+ * One-shot reachability + schema probe for a context DB URL. Opens a short-lived
+ * single connection (tight connect_timeout so an unreachable remote fails fast),
+ * checks `memory_entries` exists, and closes. Used by the fail-loud boot check so
+ * a mis-wired or unmigrated shared rail is surfaced instead of silently falling
+ * open to the local ops DB.
+ */
+export async function probeContextDb(
+  url: string,
+): Promise<{ ok: boolean; memorySchemaPresent: boolean; error?: string }> {
+  const sql = postgres(url, pgOptions(url, { max: 1, connect_timeout: 8 }));
+  try {
+    const rows = await sql<{ present: boolean }[]>`
+      SELECT (to_regclass('public.memory_entries') IS NOT NULL) AS present
+    `;
+    return { ok: true, memorySchemaPresent: rows[0]?.present ?? false };
+  } catch (err) {
+    return {
+      ok: false,
+      memorySchemaPresent: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    try {
+      await sql.end({ timeout: 5 });
+    } catch {
+      // best-effort close
+    }
   }
 }
 

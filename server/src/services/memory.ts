@@ -30,7 +30,8 @@ import {
   getEmbedderTelemetry,
   HASH_EMBEDDING_VERSION,
 } from "./memory-embedder.js";
-import { resolveContextDb } from "./context-db.js";
+import { resolveContextDb, resolveContextDbUrl } from "./context-db.js";
+import { logger } from "../middleware/logger.js";
 
 type MemoryEntryRow = typeof memoryEntries.$inferSelect;
 
@@ -238,6 +239,14 @@ export interface EmbeddingStatus {
   queryHashFallbacks: number;
   /** Process-local count of long-body truncations before egress (resets on restart). */
   truncations: number;
+  /** EMB-3: the dominant real (non-hash) embedding_version in the SHARED corpus
+   * (across all companies), or null when none/single-DB. Lets the UI show whether
+   * this machine's embedder agrees with the rest of the team. */
+  corpusDominantVersion: string | null;
+  /** EMB-3: true when this machine's embedder version disagrees with the shared
+   * corpus's dominant version — its new real vectors would be cross-version
+   * (ANN-invisible to teammates). A loud signal that EMBEDDING_MODEL/DIM drifted. */
+  corpusVersionMismatch: boolean;
 }
 
 export interface RankedEntry {
@@ -487,6 +496,35 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
   // Cached once per service instance: does the pgvector `embedding_vec` column
   // exist? On a real pgvector deployment yes; on a rig without pgvector no. We
   // avoid issuing a doomed `embedding_vec` write on every memory write.
+  // EMB-3: the dominant REAL (non-hash) embedding_version across the whole shared
+  // corpus, memoized once per service instance. Used to detect a teammate whose
+  // EMBEDDING_MODEL/DIM drifted from the team's canonical version, and to surface
+  // it on the status endpoint. null = no real rows yet / single-DB / not probed.
+  let corpusDominantVersionMemo: { value: string | null } | null = null;
+  let driftWarned = false;
+  async function corpusDominantVersion(): Promise<string | null> {
+    if (corpusDominantVersionMemo) return corpusDominantVersionMemo.value;
+    // Only meaningful for a shared remote corpus with real vectors enabled.
+    if (!embedder.enabled || !resolveContextDbUrl()) {
+      corpusDominantVersionMemo = { value: null };
+      return null;
+    }
+    try {
+      const rows = (await cdb.execute(sql`
+        SELECT embedding_version AS v, COUNT(*)::int AS n
+        FROM ${memoryEntries}
+        WHERE embedding_version IS NOT NULL AND embedding_version <> ${HASH_EMBEDDING_VERSION}
+        GROUP BY embedding_version
+        ORDER BY n DESC
+        LIMIT 1
+      `)) as unknown as Array<{ v: string; n: number }>;
+      corpusDominantVersionMemo = { value: rows[0]?.v ?? null };
+    } catch {
+      corpusDominantVersionMemo = { value: null };
+    }
+    return corpusDominantVersionMemo.value;
+  }
+
   let vectorColumnPresent: boolean | null = null;
   async function hasVectorColumn(): Promise<boolean> {
     if (vectorColumnPresent !== null) return vectorColumnPresent;
@@ -531,7 +569,21 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
         .execute(
           sql`UPDATE ${memoryEntries} SET embedding_vec = ${literal}::vector WHERE id = ${id}`,
         )
-        .catch(() => {});
+        // EMB-1: distinguish a DIMENSION MISMATCH (the configured EMBEDDING_DIM does
+        // not match the shared vector(N) column → the write is silently dropped and
+        // the row is ANN-invisible) from the benign column-absent / transient case.
+        // A dim mismatch is logged loudly so a mis-configured teammate is detectable.
+        .catch((e: unknown) => {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (/dimension|expected \d+ dimensions/i.test(msg)) {
+            logger.warn(
+              { id, configuredDim: storage.vector.length, err: msg },
+              "memory.embedding_vec_dim_mismatch: configured EMBEDDING_DIM disagrees with the shared " +
+                "vector column width; this vector was NOT stored and the row is ANN-invisible.",
+            );
+          }
+          // else tolerate quietly (column absent / transient)
+        });
     }
   }
 
@@ -557,6 +609,23 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     const embedResult = await embedder.embedForStorage(input.subject, input.body);
     const embedding = embedResult.vector;
     const subjectKey = computeSubjectKey(input.subject);
+
+    // EMB-3: detect embedding-config drift on a SHARED corpus. If this machine's
+    // real embedder version disagrees with the corpus's dominant version, its new
+    // vectors are cross-version (ANN-invisible to teammates; the read-side cosine
+    // guard already prevents mis-scoring). Surface it loudly ONCE so a fat-fingered
+    // EMBEDDING_MODEL/DIM is detected at write time instead of silently degrading.
+    if (embedResult.version !== HASH_EMBEDDING_VERSION) {
+      const dominant = await corpusDominantVersion();
+      if (dominant && dominant !== embedResult.version && !driftWarned) {
+        driftWarned = true;
+        logger.warn(
+          { localVersion: embedResult.version, corpusVersion: dominant },
+          "memory.embedding_version_drift: this machine's embedder disagrees with the shared corpus; " +
+            "new vectors will be ANN-invisible to teammates. Align COMBYNE_EMBEDDING_MODEL/DIM with the team.",
+        );
+      }
+    }
 
     // ---- WRITE-side trust gate (§3.2) ----
     // The default verification state is 'unverified' / confidence 0.5. A caller
@@ -1252,28 +1321,77 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     if (!existing) return null;
     if (existing.state !== "pending") return promotionRowToType(existing);
 
-    let promotedEntryId: string | null = null;
+    // XDBTX-2: the shared-entry insert and the promotion-row update are BOTH
+    // context-DB writes — commit them in ONE context transaction so a crash can't
+    // leave a shared row with the promotion stuck 'pending' (or vice versa). The
+    // embed (network round-trip) is computed BEFORE the txn so no DB locks are held
+    // across it; the best-effort vector write runs AFTER commit (it tolerates
+    // failure and is content-hash gated, exactly as the createEntry path).
+    let prepared: PreparedSharedEntry | null = null;
     if (input.decision === "approved") {
-      const promoted = await createSharedFromPromotion(existing);
-      promotedEntryId = promoted.id;
+      prepared = await prepareSharedFromPromotion(existing);
     }
-    const [row] = await cdb
-      .update(memoryPromotions)
-      .set({
-        state: input.decision,
-        reviewerId: input.reviewerId,
-        reviewNotes: input.reviewNotes ?? null,
-        promotedEntryId,
-        decidedAt: new Date(),
-      })
-      .where(eq(memoryPromotions.id, promotionId))
-      .returning();
-    return row ? promotionRowToType(row) : null;
+
+    const decided = await cdb.transaction(async (tx) => {
+      let promotedEntryId: string | null = null;
+      if (prepared) {
+        const [inserted] = await tx
+          .insert(memoryEntries)
+          .values(prepared.values)
+          // Idempotent: a replay after a partial earlier attempt collapses to the
+          // existing shared row instead of a 23505 crash + permanently stuck promotion.
+          .onConflictDoNothing({
+            target: [memoryEntries.companyId, memoryEntries.source],
+            where: sql`${memoryEntries.source} IS NOT NULL`,
+          })
+          .returning();
+        if (inserted) {
+          promotedEntryId = inserted.id;
+        } else {
+          const [existingShared] = await tx
+            .select()
+            .from(memoryEntries)
+            .where(
+              and(
+                eq(memoryEntries.companyId, prepared.values.companyId as string),
+                eq(memoryEntries.source, prepared.values.source as string),
+              ),
+            )
+            .limit(1);
+          promotedEntryId = existingShared?.id ?? null;
+        }
+      }
+      const [row] = await tx
+        .update(memoryPromotions)
+        .set({
+          state: input.decision,
+          reviewerId: input.reviewerId,
+          reviewNotes: input.reviewNotes ?? null,
+          promotedEntryId,
+          decidedAt: new Date(),
+        })
+        .where(eq(memoryPromotions.id, promotionId))
+        .returning();
+      return { row: row ?? null, promotedEntryId };
+    });
+
+    // Best-effort vector write AFTER commit (only when we just created the row).
+    if (prepared && decided.promotedEntryId) {
+      await writeVectorColumns(decided.promotedEntryId, prepared.storage);
+    }
+    return decided.row ? promotionRowToType(decided.row) : null;
   }
 
-  async function createSharedFromPromotion(
+  type PreparedSharedEntry = {
+    values: typeof memoryEntries.$inferInsert;
+    storage: { vector: number[]; version: string; model: string; contentHash: string };
+  };
+
+  /** Embed + build the shared-entry insert values for an approved promotion.
+   * The network embed happens here so the caller can open a short txn afterwards. */
+  async function prepareSharedFromPromotion(
     promotion: typeof memoryPromotions.$inferSelect,
-  ): Promise<MemoryEntry> {
+  ): Promise<PreparedSharedEntry> {
     // PR-11: redact-before-embed + hash fallback on the promotion path too.
     const embedResult = await embedder.embedForStorage(
       promotion.proposedSubject,
@@ -1284,9 +1402,8 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     // detected in the promoted body still quarantines to needs_review.
     const verificationState: MemoryVerificationState =
       embedResult.redactedFindings.length > 0 ? "needs_review" : "verified";
-    const [row] = await cdb
-      .insert(memoryEntries)
-      .values({
+    return {
+      values: {
         companyId: promotion.companyId,
         layer: "shared",
         subject: promotion.proposedSubject,
@@ -1303,15 +1420,14 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
         sourceRefType: "promotion",
         sourceRefId: promotion.id,
         subjectKey: computeSubjectKey(promotion.proposedSubject),
-      })
-      .returning();
-    await writeVectorColumns(row.id, {
-      vector: embedResult.vector,
-      version: embedResult.version,
-      model: embedResult.model,
-      contentHash: embedResult.contentHash,
-    });
-    return rowToEntry(row);
+      },
+      storage: {
+        vector: embedResult.vector,
+        version: embedResult.version,
+        model: embedResult.model,
+        contentHash: embedResult.contentHash,
+      },
+    };
   }
 
   // ---------- 0054: instance-wide GLOBAL layer promotion ----------
@@ -1898,12 +2014,15 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       if (r.version === HASH_EMBEDDING_VERSION) hashCount += n;
     }
 
-    // Re-embed backlog = the EXACT predicate reembedBackfill uses, restricted to
-    // this company. embedding_vec may be absent (no pgvector), so guard it.
+    // Re-embed backlog = the EXACT (gap-only) predicate reembedBackfill uses,
+    // restricted to this company. On a shared corpus the backlog counts only true
+    // GAPS (hash-fallback / never-embedded / missing vector) — NOT another machine's
+    // real, different-version rows (EMB-2), so the gauge isn't permanently inflated
+    // by teammates on a different model. embedding_vec may be absent (no pgvector).
     const hasVec = await hasVectorColumn();
     const backlogPredicate = hasVec
-      ? sql`(embedding_version IS DISTINCT FROM ${currentVersion} OR embedding_vec IS NULL)`
-      : sql`embedding_version IS DISTINCT FROM ${currentVersion}`;
+      ? sql`(embedding_version = ${HASH_EMBEDDING_VERSION} OR embedding_version IS NULL OR embedding_vec IS NULL)`
+      : sql`(embedding_version = ${HASH_EMBEDDING_VERSION} OR embedding_version IS NULL)`;
     const backlogRows = (await cdb.execute(sql`
       SELECT COUNT(*)::int AS n FROM ${memoryEntries}
       WHERE company_id = ${companyId} AND status = 'active' AND ${backlogPredicate}
@@ -1934,6 +2053,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     }
 
     const tel = getEmbedderTelemetry();
+    const dominant = await corpusDominantVersion();
     return {
       embedderEnabled: embedder.enabled,
       currentVersion,
@@ -1948,6 +2068,10 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       // Process-local telemetry (resets on restart — multi-worker is per-worker).
       queryHashFallbacks: tel.hashFallbacks,
       truncations: tel.truncations,
+      // EMB-3: shared-corpus version agreement.
+      corpusDominantVersion: dominant,
+      corpusVersionMismatch:
+        embedder.enabled && dominant != null && dominant !== currentVersion,
     };
   }
 

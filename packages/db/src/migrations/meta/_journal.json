@@ -400,6 +400,20 @@
       "when": 1780405305500,
       "tag": "0057_global_source_uniq",
       "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1780405305600,
+      "tag": "0058_context_capture_outbox",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1780405305700,
+      "tag": "0059_agent_memory_rls",
+      "breakpoints": true
     }
   ]
 }

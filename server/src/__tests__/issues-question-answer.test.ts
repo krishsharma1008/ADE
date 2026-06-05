@@ -2,7 +2,8 @@ import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { companies, memoryEntries } from "@combyne/db";
+import { companies, memoryEntries, contextCaptureOutbox } from "@combyne/db";
+import { drainContextCaptureOutbox } from "../services/memory-capture.js";
 import { issueService } from "../services/issues.js";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
@@ -177,19 +178,20 @@ describe("HOOK 1 — human-answer capture via answer-question route", () => {
     expect(entry!.body).toContain("***REDACTED***");
   });
 
-  it("returns 201 even when createEntry throws (best-effort capture)", async () => {
+  it("returns 201 AND durably enqueues the answer when createEntry throws (RDB-2: no silent drop)", async () => {
     const { issue, question } = await postQuestion(
       "Resilient capture",
       "Does a capture failure break the answer?",
     );
 
-    // memorySvc is captured once at issueRoutes() construction, so the mock must be in
-    // place BEFORE we build the app under test. The route imports memoryService from
-    // services/index.js — spy on THAT binding, then build a fresh app whose HOOK 1
-    // createEntry always throws.
-    const servicesIndex = await import("../services/index.js");
+    // HOOK 1 now routes through captureHumanMemoryDurable, which imports
+    // memoryService from ../services/memory.js — spy on THAT binding so the context
+    // write throws (simulating an unreachable remote context DB), then build a fresh
+    // app. The high-value human answer must NOT be silently dropped: it is enqueued
+    // to the LOCAL ops outbox and replayed once the context DB is healthy again.
+    const memoryModule = await import("../services/memory.js");
     const spy = vi
-      .spyOn(servicesIndex, "memoryService")
+      .spyOn(memoryModule, "memoryService")
       .mockImplementation(
         (() =>
           ({
@@ -199,6 +201,7 @@ describe("HOOK 1 — human-answer capture via answer-question route", () => {
           }) as any) as any,
       );
 
+    let answerCommentId = "";
     try {
       const throwingApp = createApp(handle);
       const res = await request(throwingApp)
@@ -206,21 +209,44 @@ describe("HOOK 1 — human-answer capture via answer-question route", () => {
         .send({ questionCommentId: question.id, answer: "No — the answer still returns." });
       expect(res.status).toBe(201);
       expect(res.body.comment.body).toContain("the answer still returns");
+      answerCommentId = res.body.comment.id as string;
 
-      // And crucially: NO memory row was written for this failed capture.
-      const answerCommentId = res.body.comment.id as string;
+      const source = `human-answer:${issue.id}:${answerCommentId}`;
+
+      // The direct context write failed, so no memory row yet…
       const rows = await handle.db
         .select()
         .from(memoryEntries)
-        .where(
-          and(
-            eq(memoryEntries.companyId, companyId),
-            eq(memoryEntries.source, `human-answer:${issue.id}:${answerCommentId}`),
-          ),
-        );
+        .where(and(eq(memoryEntries.companyId, companyId), eq(memoryEntries.source, source)));
       expect(rows).toHaveLength(0);
+
+      // …but it was NOT lost: an outbox row exists in the local ops DB for replay.
+      const outbox = await handle.db
+        .select()
+        .from(contextCaptureOutbox)
+        .where(eq(contextCaptureOutbox.source, source));
+      expect(outbox).toHaveLength(1);
+      expect(outbox[0].provenance).toBe("human-answer");
     } finally {
       spy.mockRestore();
+    }
+
+    // Once the context DB is healthy again, draining replays it idempotently.
+    const source = `human-answer:${issue.id}:${answerCommentId}`;
+    await drainContextCaptureOutbox(handle.db);
+    {
+      const rows = await handle.db
+        .select()
+        .from(memoryEntries)
+        .where(and(eq(memoryEntries.companyId, companyId), eq(memoryEntries.source, source)));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].provenance).toBe("human-answer");
+      expect(rows[0].verificationState).toBe("verified");
+      const drained = await handle.db
+        .select()
+        .from(contextCaptureOutbox)
+        .where(eq(contextCaptureOutbox.source, source));
+      expect(drained).toHaveLength(0);
     }
   });
 

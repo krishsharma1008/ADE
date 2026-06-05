@@ -1,6 +1,7 @@
 import type { Db } from "@combyne/db";
 import type { IssueComplexity, MemoryLayer, MemoryProvenance } from "@combyne/shared";
 import { memoryService } from "./memory.js";
+import { contextTrace } from "./context-trace.js"; // CONTEXT-TRACE
 
 /**
  * EM passdown packet (CENTRAL_CONTEXT_DB_PLAN §5, IMPLEMENTATION_PLAN PR-9).
@@ -229,6 +230,16 @@ export function passdownService(db: Db) {
     // subjectKey; the curated union is small and EM-authored, so we keep it.
     const items = applyTierBudget(Array.from(byId.values()), tier);
     const body = renderPacketBody(items);
+
+    // CONTEXT-TRACE: the tier-budgeted context packet an EM is passing to a child.
+    contextTrace("context_passdown", {
+      companyId: input.companyId,
+      issueId: input.childIssueId,
+      tier: input.complexity,
+      layers: tier.layers,
+      entriesCited: items.length,
+      estimatedTokens: estimateTokens(body),
+    });
 
     return {
       kind: "passdown",

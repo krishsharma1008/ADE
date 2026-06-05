@@ -14,7 +14,7 @@ import { sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { memoryEntries } from "@combyne/db";
 import type { MemoryEmbedder } from "./memory-embedder.js";
-import { resolveContextDb } from "./context-db.js";
+import { HASH_EMBEDDING_VERSION } from "./memory-embedder.js";
 
 export interface ReembedOptions {
   companyId?: string;
@@ -63,8 +63,10 @@ export async function reembedBackfill(
   // Nothing to backfill on the hash-64 path; the local fallback is the oracle.
   if (!embedder.enabled) return { scanned: 0, reembedded: 0 };
 
-  // memory_entries physically lives in the context DB when configured.
-  const cdb = resolveContextDb(db);
+  // ETL-ROUTE-1: honor the destination handle the caller passed (the CLI now
+  // defaults it to the context DB). A non-CLI caller that wants the shared rail
+  // passes resolveContextDb(db) explicitly — we do NOT override here.
+  const cdb = db;
   const batchSize = Math.min(Math.max(opts.batchSize ?? DEFAULT_BATCH, 1), 2048);
   const sleep = opts.sleep ?? defaultSleep;
   const current = embedder.version;
@@ -87,9 +89,16 @@ export async function reembedBackfill(
   for (;;) {
     if (opts.maxRows !== undefined && reembedded >= opts.maxRows) break;
 
+    // EMB-2: on a SHARED corpus, fill GAPS only — never overwrite another
+    // machine's already-real, different-version vector. A "gap" is a hash-fallback
+    // row or a never-embedded row. This makes the backfill idempotent across
+    // divergent machines (each row gets a real vector at most once, from whichever
+    // machine first fills it), eliminating version ping-pong / double-spend. A row
+    // left on a foreign version is simply skipped by the cross-version cosine guard
+    // on the read path (lexical fallback) — acceptable and already the read behavior.
     const staleCond = hasVectorColumn
-      ? sql`(embedding_version IS DISTINCT FROM ${current} OR embedding_vec IS NULL)`
-      : sql`embedding_version IS DISTINCT FROM ${current}`;
+      ? sql`(embedding_version = ${HASH_EMBEDDING_VERSION} OR embedding_version IS NULL OR embedding_vec IS NULL)`
+      : sql`(embedding_version = ${HASH_EMBEDDING_VERSION} OR embedding_version IS NULL)`;
     const conds = [staleCond, sql`status = 'active'`, sql`id > ${lastId}`];
     if (opts.companyId) conds.push(sql`company_id = ${opts.companyId}`);
     const whereSql = sql.join(conds, sql` AND `);

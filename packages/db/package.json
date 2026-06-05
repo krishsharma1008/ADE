@@ -31,6 +31,7 @@
     "typecheck": "tsc --noEmit",
     "generate": "tsc -p tsconfig.json && drizzle-kit generate",
     "migrate": "tsx src/migrate.ts",
+    "migrate:context": "tsx src/migrate.ts --context",
     "seed": "tsx src/seed.ts"
   },
   "dependencies": {

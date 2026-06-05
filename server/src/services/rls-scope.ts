@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
+import { resolveContextDb } from "./context-db.js";
 
 /**
  * The transaction handle passed to a `db.transaction(tx => …)` callback. Derived
@@ -35,7 +36,11 @@ export async function withCompanyScope<T>(
   companyId: string,
   fn: (tx: ScopedTx) => Promise<T>,
 ): Promise<T> {
-  return db.transaction(async (tx) => {
+  // The GUC must be bound on the SAME physical connection the memory query runs
+  // on. Under the separate-context-DB topology `memory_entries` lives on the
+  // context connection, so scope the transaction there, not on the ops `db`.
+  const cdb = resolveContextDb(db);
+  return cdb.transaction(async (tx) => {
     // SET LOCAL via set_config(..., true): transaction-scoped, cleared at COMMIT.
     await tx.execute(sql`SELECT set_config('app.current_company', ${companyId}, true)`);
     return fn(tx);

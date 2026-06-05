@@ -67,10 +67,12 @@ async function main(): Promise<number> {
     console.log(HELP);
     return 0;
   }
-  const url = args.db ?? process.env.DATABASE_URL;
+  // ETL-ROUTE-1 symmetry: read from the SHARED context DB by default (where the
+  // corpus lives), then ops; explicit --db overrides.
+  const url = args.db ?? process.env.COMBYNE_CONTEXT_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) {
     console.error(
-      "memory-export: no database URL. Set DATABASE_URL or pass --db <url>. (Run --help for usage.)",
+      "memory-export: no database URL. Set COMBYNE_CONTEXT_DATABASE_URL or DATABASE_URL, or pass --db <url>. (Run --help for usage.)",
     );
     return 2;
   }

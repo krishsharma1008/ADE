@@ -16,7 +16,6 @@ import {
   type Db,
 } from "@combyne/db";
 import { and, eq, or, sql as dsql } from "drizzle-orm";
-import { resolveContextDb } from "./context-db.js";
 
 export const MEMORY_EXPORT_VERSION = 1 as const;
 
@@ -152,8 +151,13 @@ export async function importBundle(
   bundle: ImportBundle,
   opts: { companyId: string; ownerRemap: Map<string, string>; dryRun?: boolean },
 ): Promise<ImportResult> {
-  // All memory tables physically live in the context DB when configured.
-  const cdb = resolveContextDb(db);
+  // ETL-ROUTE-1: HONOR the destination handle the caller passed — do NOT silently
+  // override it with COMBYNE_CONTEXT_DATABASE_URL via resolveContextDb. The CLI's
+  // whole contract is "I am pointing you at the destination" (and it now defaults
+  // that destination to the context DB itself). Symmetric with buildExportBundle,
+  // which reads from the createDb(url) handle it is given. A non-CLI caller that
+  // wants the shared rail passes resolveContextDb(db) explicitly.
+  const cdb = db;
   const entries = asArray(bundle.memory_entries);
   // ---- THE HARD GATE ----
   if (entries.length === 0) {

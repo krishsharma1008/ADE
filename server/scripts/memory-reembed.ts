@@ -90,10 +90,11 @@ async function main(): Promise<number> {
     console.log(HELP);
     return 0;
   }
-  const url = args.db ?? process.env.DATABASE_URL;
+  // ETL-ROUTE-1: re-embed the SHARED context corpus by default; explicit --db wins.
+  const url = args.db ?? process.env.COMBYNE_CONTEXT_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) {
     console.error(
-      "memory-reembed: no database URL. Set DATABASE_URL or pass --db <url>. (Run --help for usage.)",
+      "memory-reembed: no database URL. Set COMBYNE_CONTEXT_DATABASE_URL or DATABASE_URL, or pass --db <url>. (Run --help for usage.)",
     );
     return 2;
   }

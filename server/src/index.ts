@@ -13,7 +13,9 @@ import {
   ensurePostgresDatabase,
   inspectMigrations,
   applyPendingMigrations,
+  applyPendingMigrationsLocked,
   reconcilePendingMigrationHistory,
+  probeContextDb,
   formatDatabaseBackupResult,
   runDatabaseBackup,
   authUsers,
@@ -23,7 +25,10 @@ import {
 } from "@combyne/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, logEmbeddingPosture } from "./config.js";
+import { resolveContextDbUrl } from "./services/context-db.js";
+import { drainContextCaptureOutbox } from "./services/memory-capture.js";
+import { contextTrace } from "./services/context-trace.js"; // CONTEXT-TRACE
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { setupTerminalWebSocketServer } from "./realtime/terminal-ws.js";
@@ -436,8 +441,96 @@ export async function startServer(): Promise<StartedServer> {
   // operational tables go unused. A context-only migration subset is a future
   // optimization.
   if (config.contextDatabaseUrl && config.contextDatabaseUrl !== activeDatabaseConnectionString) {
-    logger.info("Configured separate context DB (CONTEXT_DATABASE_URL); ensuring memory-layer schema");
-    await ensureMigrations(config.contextDatabaseUrl, "Context PostgreSQL", { autoApply: true });
+    // The context DB is REMOTE (Cloud SQL over the public internet) and is the
+    // ONE DB that N teammate boots contend over. So:
+    //  - default teammate boot is INSPECT-ONLY (never auto-applies to the shared
+    //    remote → no concurrent-apply race; MIGPROV-1/2);
+    //  - the explicit operator one-shot (COMBYNE_CONTEXT_DB_MIGRATE=true) applies
+    //    under a pg_advisory_lock so even concurrent operators serialize;
+    //  - a transient outage / collision must NOT crash boot and take the fully
+    //    local, healthy heartbeat down with it (I4) — unless the operator asked
+    //    to migrate, where failing loudly is correct.
+    const isDesignatedMigrator = process.env.COMBYNE_CONTEXT_DB_MIGRATE === "true";
+    try {
+      if (isDesignatedMigrator) {
+        logger.info("Designated context-DB migrator; ensuring shared memory-layer schema (advisory-lock gated)");
+        await applyPendingMigrationsLocked(config.contextDatabaseUrl);
+      } else {
+        const state = await inspectMigrations(config.contextDatabaseUrl);
+        if (state.status !== "upToDate") {
+          const pending = state.status === "needsMigrations" ? state.pendingMigrations : [];
+          logger.warn(
+            { pendingMigrations: pending, count: pending.length },
+            "Shared context DB has pending migrations but this machine is NOT the designated migrator. " +
+              "Run the one-shot provisioning step (COMBYNE_CONTEXT_DB_MIGRATE=true pnpm db:migrate:context) " +
+              "before relying on new context schema. Continuing WITHOUT applying.",
+          );
+        } else {
+          logger.info("Shared context DB schema verified up-to-date.");
+        }
+      }
+    } catch (err) {
+      if (isDesignatedMigrator) {
+        throw err; // explicit operator one-shot: fail loudly
+      }
+      logger.error(
+        { err },
+        "Context DB schema check failed at boot; continuing without it. The memory/context layer " +
+          "degrades gracefully until the remote DB is reachable and migrated. Run " +
+          "`COMBYNE_CONTEXT_DB_MIGRATE=true pnpm db:migrate:context` once to provision the schema.",
+      );
+    }
+
+    // Fail-loud posture check: surface whether the shared rail is actually
+    // separate + reachable + schema-present, so a silent fail-open to the local
+    // ops DB (or a mis-wired/unreachable URL) is visible instead of mysterious.
+    const resolvedContextUrl = resolveContextDbUrl();
+    if (!resolvedContextUrl) {
+      logger.warn(
+        { contextDbConfigured: false },
+        "CONTEXT DB NOT SEPARATE: memory/context writes will use the LOCAL ops DB and will NOT be " +
+          "visible to teammates. Set COMBYNE_CONTEXT_DATABASE_URL to a separate Postgres.",
+      );
+      if (config.contextRequired) {
+        throw new Error("COMBYNE_CONTEXT_REQUIRED=true but no separate context DB is configured");
+      }
+    } else {
+      const probe = await probeContextDb(resolvedContextUrl);
+      let redactedHost = "<unparseable>";
+      try {
+        redactedHost = new URL(resolvedContextUrl).host;
+      } catch {
+        /* keep placeholder */
+      }
+      if (!probe.ok || !probe.memorySchemaPresent) {
+        logger.warn(
+          { contextDbConfigured: true, host: redactedHost, reachable: probe.ok, schemaPresent: probe.memorySchemaPresent },
+          "CONTEXT DB configured but unreachable or missing memory_entries schema; shared context may silently fail.",
+        );
+        if (config.contextRequired) {
+          throw new Error("COMBYNE_CONTEXT_REQUIRED=true but the context DB probe failed (unreachable or no schema)");
+        }
+      } else {
+        logger.info({ host: redactedHost }, "Shared context DB reachable; memory layer routing to the shared rail.");
+      }
+      // CONTEXT-TRACE: confirm the memory layer is routing to a SEPARATE rail (not ops).
+      contextTrace("context_db_route", {
+        contextHost: redactedHost,
+        sameAsOperational: false,
+        reachable: probe.ok,
+        schemaPresent: probe.memorySchemaPresent,
+        vectorSearchEnabled: config.vectorSearchEnabled,
+      });
+    }
+  } else {
+    logger.warn(
+      { contextDbConfigured: false },
+      "CONTEXT DB NOT SEPARATE: memory/context writes use the LOCAL ops DB (single-DB mode) and are NOT " +
+        "shared with teammates. Set COMBYNE_CONTEXT_DATABASE_URL to enable the shared context rail.",
+    );
+    if (config.contextRequired) {
+      throw new Error("COMBYNE_CONTEXT_REQUIRED=true but no separate context DB is configured");
+    }
   }
 
   if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
@@ -701,6 +794,11 @@ export async function startServer(): Promise<StartedServer> {
     }
   }
 
+  // Log the resolved embedding/vector-retrieval posture once at startup so a
+  // shared-corpus deployment can tell whether this machine is on the real
+  // provider version or the hash-64 lexical fallback (CFG-3).
+  logEmbeddingPosture(config, logger);
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any);
     const routines = routineService(db as any);
@@ -780,6 +878,13 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "periodic reap of orphaned heartbeat runs failed");
         });
+
+      // Drain the durable context-capture outbox: replay any human-answer /
+      // PR-approval memory writes that failed when the remote context DB was
+      // unreachable, so an irreplaceable human-sourced answer is never lost (I4).
+      void drainContextCaptureOutbox(db as any).catch((err) => {
+        logger.error({ err }, "context capture outbox drain failed");
+      });
 
       // Round 3 Phase 8 — companion issue-side sweep. Cheap LEFT JOIN on
       // issues with non-null execution_run_id; catches the lock-leak mode
@@ -894,8 +999,22 @@ export async function startServer(): Promise<StartedServer> {
         retentionDays: config.databaseBackupRetentionDays,
         backupDir: config.databaseBackupDir,
       },
-      "Automatic database backups enabled",
+      "Automatic database backups enabled (OPS DB only)",
     );
+    // BACKUP-1: the automatic backup covers only the LOCAL ops DB (throwaway). The
+    // SHARED context DB — the one irreplaceable, durable rail — is NOT covered here
+    // on purpose: runDatabaseBackup is a destructive DROP TABLE … CASCADE dumper
+    // that must never be pointed at a live shared remote DB. Surface the gap loudly
+    // so the operator wires the right DR (managed Cloud SQL automated backups, or a
+    // scheduled non-destructive `pnpm db:memory-export` against the context URL).
+    if (resolveContextDbUrl()) {
+      logger.warn(
+        "SHARED CONTEXT DB IS NOT COVERED BY THIS AUTOMATIC BACKUP (it backs up the throwaway ops DB only). " +
+          "The context DB holds the irreplaceable shared memory/trust-spine — enable managed backups on the " +
+          "context Postgres (e.g. Cloud SQL automated backups + PITR) or schedule `pnpm db:memory-export` " +
+          "against COMBYNE_CONTEXT_DATABASE_URL. See doc/CENTRAL_DB_RUNBOOK.md.",
+      );
+    }
     setInterval(() => {
       void runScheduledBackup();
     }, backupIntervalMs);

@@ -28,6 +28,7 @@ import {
   routeAgentQuestionsToManager,
 } from "../services/index.js";
 import { scanBody } from "../secret-scan.js";
+import { captureHumanMemoryDurable, humanAnswerSource } from "../services/memory-capture.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -1119,7 +1120,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
     // (source !== 'local_implicit' + real userId) is trusted, AND in local single-user
     // mode local_implicit IS the trusted operator by design — both → verified. An AGENT
     // actor never reaches this provenance (the write-gate would force it unverified).
-    try {
+    {
       const isHuman = actor.actorType === "user";
       const userId = actor.actorId && actor.actorId !== "board" ? actor.actorId : null;
       if (isHuman) {
@@ -1134,13 +1135,22 @@ export function issueRoutes(db: Db, storage: StorageService) {
         const scan = scanBody(answer);
         const verificationState: "needs_review" | "verified" =
           scan.findings.length > 0 ? "needs_review" : "verified";
-        await memorySvc.createEntry({
+        // Durable + stable-keyed: a context-DB outage enqueues for replay instead of
+        // silently dropping the human answer (I4); the source key dedups the same
+        // Q+A across machines in shared mode (SCOPE-1).
+        await captureHumanMemoryDurable(db, {
           companyId: issue.companyId,
           layer: "workspace",
           kind: "fact",
           subject,
           body: `Q: ${questionText}\nA: ${scan.clean}`,
-          source: `human-answer:${issue.id}:${answerComment.id}`,
+          source: humanAnswerSource({
+            companyId: issue.companyId,
+            questionText,
+            answerText: scan.clean,
+            issueId: issue.id,
+            answerCommentId: answerComment.id,
+          }),
           provenance: "human-answer",
           verificationState,
           confidence: 0.95,
@@ -1151,8 +1161,6 @@ export function issueRoutes(db: Db, storage: StorageService) {
           createdBy: userId,
         });
       }
-    } catch (err) {
-      logger.warn({ err, issueId: issue.id }, "HOOK 1 human-answer capture failed (best-effort)");
     }
 
     res.status(201).json({ comment: answerComment, issue: updated, remainingOpenQuestions: remaining });

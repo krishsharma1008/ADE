@@ -1,6 +1,6 @@
-import { readConfigFile } from "./config-file.js";
-import { existsSync } from "node:fs";
-import { config as loadDotenv } from "dotenv";
+import { readConfigFile, readConfigFileContextDatabaseUrl } from "./config-file.js";
+import { existsSync, readFileSync } from "node:fs";
+import { config as loadDotenv, parse as parseDotenv } from "dotenv";
 import { resolveCombyneEnvPath } from "./paths.js";
 import {
   AUTH_BASE_URL_MODES,
@@ -28,7 +28,29 @@ function envVar(suffix: string): string | undefined {
 
 const COMBYNE_ENV_FILE_PATH = resolveCombyneEnvPath();
 if (existsSync(COMBYNE_ENV_FILE_PATH)) {
+  // Parse the file BEFORE loadDotenv so we can detect the dangerous case where a
+  // stale/empty process env shadows the instance .env's context URL (override is
+  // false, so a present-but-empty process value wins). For the SHARED context
+  // rail that silent shadow routes "shared" writes to the LOCAL ops DB — invisible
+  // until a teammate sees nothing. Reconcile + warn loudly so it's diagnosable.
+  let parsedEnvFile: Record<string, string> = {};
+  try {
+    parsedEnvFile = parseDotenv(readFileSync(COMBYNE_ENV_FILE_PATH, "utf-8"));
+  } catch {
+    parsedEnvFile = {};
+  }
   loadDotenv({ path: COMBYNE_ENV_FILE_PATH, override: false, quiet: true });
+  const fileCtx = (parsedEnvFile.COMBYNE_CONTEXT_DATABASE_URL ?? "").trim();
+  const procCtx = (process.env.COMBYNE_CONTEXT_DATABASE_URL ?? "").trim();
+  if (fileCtx && fileCtx !== procCtx) {
+    // eslint-disable-next-line no-console -- pre-logger boot path; never logs the value
+    console.warn(
+      `[combyne] COMBYNE_CONTEXT_DATABASE_URL in ${COMBYNE_ENV_FILE_PATH} was shadowed by the process ` +
+        `environment (process value: ${procCtx ? "<different non-empty>" : "<empty>"}); the shared context ` +
+        `rail may have been routing to the local ops DB. Adopting the instance .env value.`,
+    );
+    process.env.COMBYNE_CONTEXT_DATABASE_URL = fileCtx;
+  }
 }
 
 type DatabaseMode = "embedded-postgres" | "postgres";
@@ -50,6 +72,10 @@ export interface Config {
    * (default '') means single-DB mode = today's behavior, fully backward-compatible.
    */
   contextDatabaseUrl: string;
+  /** Refuse to boot when a separate context DB is expected but missing/unreachable. */
+  contextRequired: boolean;
+  /** Pinned canonical company UUID for the shared context rail. '' = unenforced. */
+  contextCompanyId: string;
   embeddedPostgresDataDir: string;
   embeddedPostgresPort: number;
   databaseBackupEnabled: boolean;
@@ -312,7 +338,17 @@ export function loadConfig(): Config {
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     // Separate dedicated context DB. Mirrors the envVar pattern: '' when unset →
     // resolveContextDb() falls back to the main db (single-DB mode, zero change).
-    contextDatabaseUrl: envVar("CONTEXT_DATABASE_URL") ?? "",
+    // Env wins; an unset OR empty env falls back to the UI-saved config.json value
+    // (which the strict schema strips), so a context URL saved in the UI is not
+    // silently dropped — env precedence matches the status route.
+    contextDatabaseUrl: (envVar("CONTEXT_DATABASE_URL") || readConfigFileContextDatabaseUrl()) ?? "",
+    // Hard-refuse-to-boot when a separate context DB is expected but missing/
+    // unreachable, instead of silently failing open to the local ops DB.
+    contextRequired: envVar("CONTEXT_REQUIRED") === "true",
+    // The team's pinned canonical company UUID for the shared context rail. When
+    // set, memory routes assert the URL :companyId matches this pin so a mistyped
+    // tenant id can't address another team's context. '' = unenforced.
+    contextCompanyId: envVar("CONTEXT_COMPANY_ID") ?? "",
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),
@@ -363,4 +399,45 @@ export function loadConfig(): Config {
     embeddingMonthlyCapUsd,
     embeddingRpm,
   };
+}
+
+/** Minimal logger shape so this is unit-testable without the pino instance. */
+type PostureLogger = {
+  info: (obj: unknown, msg?: string) => void;
+  warn: (msg: string) => void;
+};
+
+/**
+ * Log the resolved embedding/vector-retrieval posture once at startup so a
+ * shared-corpus deployment can see whether THIS machine is on the real provider
+ * version or the hash-64 lexical fallback. Mirrors the summarizer warn so the
+ * "flag set but no key → silently coerced off" case is surfaced (CFG-3). Never
+ * logs the key itself.
+ */
+export function logEmbeddingPosture(
+  config: Pick<
+    Config,
+    "vectorSearchEnabled" | "embeddingApiKey" | "embeddingProvider" | "embeddingModel" | "embeddingDim"
+  >,
+  logger: PostureLogger,
+): void {
+  const requestedVector =
+    (process.env.COMBYNE_VECTOR_SEARCH_ENABLED ?? process.env.VECTOR_SEARCH_ENABLED) === "true";
+  const hasKey = config.embeddingApiKey.length > 0;
+  logger.info(
+    {
+      vectorSearchEnabled: config.vectorSearchEnabled,
+      embeddingProvider: config.embeddingProvider,
+      embeddingModel: config.embeddingModel,
+      embeddingDim: config.embeddingDim,
+      hasKey, // never log the key itself
+    },
+    "embedding/vector retrieval posture",
+  );
+  if (requestedVector && !hasKey) {
+    logger.warn(
+      "VECTOR_SEARCH_ENABLED=true but no embedding API key loaded — falling back to hash-64; " +
+        "shared-corpus ranking will be INCONSISTENT with teammates who have a key.",
+    );
+  }
 }

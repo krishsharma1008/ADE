@@ -4,7 +4,7 @@ import { agents, issueComments, issues } from "@combyne/db";
 import { logger } from "../middleware/logger.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { notifyParentOnChildStatus } from "./issue-parent-notifications.js";
-import { memoryService } from "./memory.js";
+import { captureHumanMemoryDurable, humanAnswerSource } from "./memory-capture.js";
 import { scanBody } from "../secret-scan.js";
 
 const COORDINATOR_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
@@ -430,7 +430,7 @@ export async function answerInternalManagerQuestion(
   // assumption-flagged answer (assumption=true) is an agent CLAIM the human merely
   // waved through → forced provenance='agent-claim'/verificationState='unverified' so it
   // can never be retrieved as a vetted fact.
-  try {
+  {
     const isAssumption = input.assumption === true;
     const questionText = (question.body ?? "").trim() || "(question unavailable)";
     const subject = questionText.slice(0, 480);
@@ -439,13 +439,21 @@ export async function answerInternalManagerQuestion(
     const scan = scanBody(answer);
     const verificationState: "needs_review" | "unverified" | "verified" =
       scan.findings.length > 0 ? "needs_review" : isAssumption ? "unverified" : "verified";
-    await memoryService(db).createEntry({
+    // Durable: a context-DB outage enqueues for replay rather than silently
+    // dropping the human answer (I4); stable source dedups across machines (SCOPE-1).
+    await captureHumanMemoryDurable(db, {
       companyId: input.companyId,
       layer: "workspace",
       kind: "fact",
       subject,
       body: `Q: ${questionText}\nA: ${scan.clean}`,
-      source: `human-answer:${issue.id}:${answerComment.id}`,
+      source: humanAnswerSource({
+        companyId: input.companyId,
+        questionText,
+        answerText: scan.clean,
+        issueId: issue.id,
+        answerCommentId: answerComment.id,
+      }),
       provenance: isAssumption ? "agent-claim" : "human-answer",
       verificationState,
       confidence: isAssumption ? 0.5 : 0.95,
@@ -460,8 +468,6 @@ export async function answerInternalManagerQuestion(
       sourceRefId: answerComment.id,
       createdBy: input.actor.actorId,
     });
-  } catch (err) {
-    logger.warn({ err, issueId: issue.id }, "HOOK 1 internal manager-answer capture failed (best-effort)");
   }
 
   const remainingOpen = await db

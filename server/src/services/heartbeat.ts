@@ -34,6 +34,8 @@ import { isPassdownPacket } from "./em-passdown.js";
 import { acceptedWorkService } from "./accepted-work.js";
 import { issuePullRequestService } from "./issue-pull-requests.js";
 import { memoryService } from "./memory.js";
+import { isContextDbConnectivityError, recordContextDbHealth } from "./context-db.js";
+import { contextTrace } from "./context-trace.js"; // CONTEXT-TRACE
 import {
   evaluateSufficiency,
   extractRequirementTokens,
@@ -4186,19 +4188,43 @@ export function heartbeatService(db: Db) {
             excludeSuperseded: true,
           });
           const entries = [];
+          const usageWrites: Array<{ entryId: string; score: number | null }> = [];
           for (const item of ranked.items) {
             const entry = await longTerm.getEntry(item.id);
             if (!entry) continue;
             entries.push(entry);
-            await longTerm.recordUsage({
-              entryId: entry.id,
-              companyId: agent.companyId,
-              issueId: memoryIssueId,
-              actorType: "agent",
-              actorId: agent.id,
-              score: item.score,
-            });
+            usageWrites.push({ entryId: entry.id, score: item.score });
           }
+          // PASS-4: usage bookkeeping is best-effort and decoupled from the read
+          // assembly above. A recordUsage rejection (remote context DB hiccup) must
+          // NEVER drop a successfully-read entry from the preamble or abort the loop.
+          for (const w of usageWrites) {
+            void longTerm
+              .recordUsage({
+                entryId: w.entryId,
+                companyId: agent.companyId,
+                issueId: memoryIssueId,
+                actorType: "agent",
+                actorId: agent.id,
+                score: w.score,
+              })
+              .catch((err) =>
+                logger.debug(
+                  { err, agentId: agent.id, runId, issueId: memoryIssueId, entryId: w.entryId },
+                  "failed to record long-term memory usage (best-effort)",
+                ),
+              );
+          }
+          // CONTEXT-TRACE: what verified shared context this agent retrieved for this issue.
+          contextTrace("context_retrieve", {
+            companyId: agent.companyId,
+            agentId: agent.id,
+            issueId: memoryIssueId,
+            requireVerified: true,
+            candidates: ranked.items.length,
+            returned: entries.length,
+            topScores: ranked.items.slice(0, 5).map((i) => Number(i.score?.toFixed?.(4) ?? i.score)),
+          });
           if (entries.length > 0) {
             // PR-6 / §3.7 — render-side defense-in-depth: per-entry citation,
             // UNVERIFIED sub-header for non-verified entries, and a
@@ -4251,7 +4277,18 @@ export function heartbeatService(db: Db) {
           }
         }
       } catch (err) {
-        logger.debug({ err, agentId: agent.id, runId, issueId: memoryIssueId }, "failed to load long-term memory");
+        // RDB-6: classify a context-DB connectivity failure (shared rail down) and
+        // escalate it to warn + a health signal, instead of burying "the agent is
+        // running WITHOUT verified shared context" in debug. Benign errors stay quiet.
+        if (isContextDbConnectivityError(err)) {
+          recordContextDbHealth({ status: "unreachable", error: err instanceof Error ? err.message : String(err) });
+          logger.warn(
+            { err, agentId: agent.id, runId, issueId: memoryIssueId, code: "context_db_unreachable" },
+            "context_db_unreachable: long-term memory channel degraded (agent running WITHOUT verified shared context)",
+          );
+        } else {
+          logger.debug({ err, agentId: agent.id, runId, issueId: memoryIssueId }, "failed to load long-term memory");
+        }
       }
     }
     if (memoryIssueId) {

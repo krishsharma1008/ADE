@@ -4,6 +4,16 @@ import { issues } from "./issues.js";
 import { issueComments } from "./issue_comments.js";
 import { agents } from "./agents.js";
 
+// OPS TABLE — lives in the per-machine operational DB alongside companies/issues/
+// agents/issue_comments, NOT on the shared context rail. Its rows are per-issue
+// reference pointers (local file paths, export URLs, etc.) that are meaningful only
+// on the machine that produced them, so they are intentionally machine-local. It is
+// captured/loaded via the bare ops `db` handle (issue-context-refs.ts) and must
+// NEVER be routed through resolveContextDb(). The four cross-entity FKs below are
+// intentionally retained because their targets are co-located in the same ops DB
+// (unlike memory_entries/agent_memory, whose FKs were dropped in 0053 so they can
+// live in a separate context DB). A contract test locks this classification so the
+// table can't silently drift to context-resident while routing assumes otherwise.
 export const issueContextRefs = pgTable(
   "issue_context_refs",
   {

@@ -96,12 +96,20 @@ async function main(): Promise<number> {
     console.error("memory-import: --company <targetCompanyId> is required. (Run --help for usage.)");
     return 2;
   }
-  const url = args.db ?? process.env.DATABASE_URL;
+  // ETL-ROUTE-1: destination precedence — explicit --db wins; otherwise default to
+  // the SHARED context DB (the natural home for memory entries) and only then the
+  // ops DB. importBundle now writes to exactly this handle (no hidden override).
+  const url = args.db ?? process.env.COMBYNE_CONTEXT_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) {
     console.error(
-      "memory-import: no database URL. Set DATABASE_URL or pass --db <url>. (Run --help for usage.)",
+      "memory-import: no database URL. Set COMBYNE_CONTEXT_DATABASE_URL or DATABASE_URL, or pass --db <url>. (Run --help for usage.)",
     );
     return 2;
+  }
+  if (args.db && process.env.COMBYNE_CONTEXT_DATABASE_URL && args.db !== process.env.COMBYNE_CONTEXT_DATABASE_URL) {
+    console.warn(
+      "memory-import: --db differs from COMBYNE_CONTEXT_DATABASE_URL; importing to the --db target you named.",
+    );
   }
 
   let bundle: ImportBundle;

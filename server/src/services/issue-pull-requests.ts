@@ -17,7 +17,9 @@ import { createSonarQubeClient } from "./sonarqube.js";
 import { issueService } from "./issues.js";
 import { approvalService } from "./approvals.js";
 import { heartbeatService } from "./heartbeat.js";
-import { memoryService } from "./memory.js";
+import type { CreateEntryInput } from "./memory.js";
+import { captureHumanMemoryDurable, prApprovalSource } from "./memory-capture.js";
+import { contextTrace } from "./context-trace.js"; // CONTEXT-TRACE
 import { logger } from "../middleware/logger.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
@@ -334,6 +336,35 @@ export function issuePullRequestService(db: Db) {
       .returning()
       .then((rows) => rows[0] ?? row);
     await createOrUpdateMergeApproval(updated);
+
+    // HOOK 2 on an EXTERNALLY-detected merge. The in-app merge() captures the
+    // pr-approval, but a human can merge the PR directly on GitHub (bypassing the
+    // PR panel). When reconcile observes the PR has JUST transitioned to merged,
+    // capture the verified pr-approval so the approved decision still lands in the
+    // shared context DB regardless of WHERE the merge happened. Guarded on the
+    // transition (old row not yet merged) so we capture once, not on every poll;
+    // and even a double-fire is idempotent via the (company_id, source) dedup, so
+    // an in-app merge() that already captured is never duplicated here.
+    if (pr.merged && row.mergeStatus !== "merged" && updated.approvalId) {
+      const approvalMemoryEntryId = await captureApprovalMemory({
+        row: updated,
+        status: { feedback, reviews } as IssuePullRequestStatus,
+        approvalId: updated.approvalId,
+        decisionNote: null, // external merge: no in-app decision note
+        decidedByUserId: null, // merged outside ADE
+      });
+      if (approvalMemoryEntryId) {
+        contextTrace("context_write", {
+          provenance: "pr-approval",
+          companyId: updated.companyId,
+          source: `pr-approval:${updated.provider}:${updated.repo}#${updated.pullNumber}`,
+          issueId: updated.issueId,
+          entryId: approvalMemoryEntryId,
+          via: "reconcile_external_merge",
+        });
+      }
+    }
+
     const refreshed = await getById(row.id);
     return { pullRequest: (refreshed ?? updated) as never, checks, reviews, qualityGate, blockers, feedback };
   }
@@ -641,59 +672,70 @@ export function issuePullRequestService(db: Db) {
     status: IssuePullRequestStatus;
     approvalId: string;
     decisionNote: string | null;
-    decidedByUserId: string;
+    decidedByUserId: string | null;
   }): Promise<string | null> {
-    try {
-      const { row, status } = input;
-      const note = readNonEmptyString(input.decisionNote);
-      const reviewFeedback = readNonEmptyString(status.feedback);
-      // Accepted-pattern summary: which reviewers approved the merged work (the
-      // pattern the EM is endorsing by merging). Deterministic, derived from the
-      // reconciled reviews — never agent-authored prose.
-      const approvedReviewers = Array.from(
-        new Set(
-          status.reviews
-            .filter((review) => review.state.toUpperCase() === "APPROVED")
-            .map((review) => review.user),
-        ),
-      );
-      const acceptedPattern = approvedReviewers.length > 0
-        ? `Accepted pattern: approved by ${approvedReviewers.join(", ")}.`
-        : "Accepted pattern: merged from the PR panel.";
+    const { row, status } = input;
+    const note = readNonEmptyString(input.decisionNote);
+    const reviewFeedback = readNonEmptyString(status.feedback);
+    // Accepted-pattern summary: which reviewers approved the merged work (the
+    // pattern the EM is endorsing by merging). Deterministic, derived from the
+    // reconciled reviews — never agent-authored prose.
+    const approvedReviewers = Array.from(
+      new Set(
+        status.reviews
+          .filter((review) => review.state.toUpperCase() === "APPROVED")
+          .map((review) => review.user),
+      ),
+    );
+    const acceptedPattern = approvedReviewers.length > 0
+      ? `Accepted pattern: approved by ${approvedReviewers.join(", ")}.`
+      : "Accepted pattern: merged from the PR panel.";
 
-      const bodyParts: string[] = [];
-      if (note) bodyParts.push(note);
-      if (reviewFeedback) bodyParts.push(reviewFeedback);
-      bodyParts.push(acceptedPattern);
-      const body = bodyParts.join("\n\n");
+    const bodyParts: string[] = [];
+    if (note) bodyParts.push(note);
+    if (reviewFeedback) bodyParts.push(reviewFeedback);
+    bodyParts.push(acceptedPattern);
+    const body = bodyParts.join("\n\n");
 
-      const memorySvc = memoryService(db);
-      const entry = await memorySvc.createEntry({
-        companyId: row.companyId,
-        layer: "workspace",
-        subject: `EM approved PR ${row.repo}#${row.pullNumber}: ${row.title}`.slice(0, 480),
-        body,
-        // The human decisionNote is what makes this a durable CONVENTION; a
-        // note-less merge is captured as a lighter 'note'.
-        kind: note ? "convention" : "note",
-        serviceScope: row.repo,
-        source: `pr-approval:${input.approvalId}`,
-        provenance: "pr-approval",
-        authorType: "user",
-        verificationState: "verified",
-        confidence: 0.8,
-        createdBy: input.decidedByUserId,
-        sourceRefType: "approval",
-        sourceRefId: input.approvalId,
-      });
-      return entry.id;
-    } catch (err) {
-      logger.warn(
-        { err, issuePullRequestId: input.row.id, approvalId: input.approvalId },
-        "HOOK 2 EM PR-approval capture failed (best-effort)",
+    // Stable, cross-machine source key: every machine tracking the same PR collapses
+    // to ONE verified row (SCOPE-1). mergeCommitSha is preferred when present.
+    const mergeCommitSha = (row as { mergeCommitSha?: string | null }).mergeCommitSha ?? null;
+    const provider = (row as { provider?: string | null }).provider ?? "github";
+    const entry: CreateEntryInput = {
+      companyId: row.companyId,
+      layer: "workspace",
+      subject: `EM approved PR ${row.repo}#${row.pullNumber}: ${row.title}`.slice(0, 480),
+      body,
+      // The human decisionNote is what makes this a durable CONVENTION; a
+      // note-less merge is captured as a lighter 'note'.
+      kind: note ? "convention" : "note",
+      serviceScope: row.repo,
+      source: prApprovalSource({
+        approvalId: input.approvalId,
+        provider,
+        repo: row.repo,
+        pullNumber: row.pullNumber,
+        mergeCommitSha,
+      }),
+      provenance: "pr-approval",
+      authorType: "user",
+      verificationState: "verified",
+      confidence: 0.8,
+      createdBy: input.decidedByUserId,
+      sourceRefType: "approval",
+      sourceRefId: input.approvalId,
+    };
+
+    // Durable: a context-DB outage enqueues this verified approval for replay
+    // rather than silently dropping it (I4).
+    const result = await captureHumanMemoryDurable(db, entry);
+    if (!result.ok) {
+      logger.error(
+        { issuePullRequestId: row.id, approvalId: input.approvalId },
+        "HOOK 2 EM PR-approval capture failed; enqueued for replay",
       );
-      return null;
     }
+    return result.entryId ?? null;
   }
 
   return {

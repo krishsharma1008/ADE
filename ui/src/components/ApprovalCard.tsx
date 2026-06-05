@@ -67,26 +67,44 @@ export function ApprovalCard({
       )}
 
       {/* Actions */}
-      {(approval.status === "pending" || approval.status === "revision_requested") && (
-        <div className="flex gap-2 mt-4 pt-3 border-t border-border">
-          <Button
-            size="sm"
-            className="bg-green-700 hover:bg-green-600 text-white"
-            onClick={onApprove}
-            disabled={isPending}
-          >
-            Approve
-          </Button>
-          <Button
-            variant="destructive"
-            size="sm"
-            onClick={onReject}
-            disabled={isPending}
-          >
-            Reject
-          </Button>
-        </div>
-      )}
+      {(approval.status === "pending" || approval.status === "revision_requested") &&
+        (approval.type === "merge_pr" ? (
+          // A merge_pr is NOT a one-click approve — generic "Approve" here only marks
+          // the request resolved, it does not merge. Send the human to the PR panel to
+          // review + merge (HOOK 2 captures the decision when the merge completes).
+          <div className="flex gap-2 mt-4 pt-3 border-t border-border">
+            <Button asChild size="sm" className="bg-green-700 hover:bg-green-600 text-white">
+              <Link
+                to={
+                  (approval.payload as Record<string, unknown>)?.issueId
+                    ? `/issues/${String((approval.payload as Record<string, unknown>).issueId)}`
+                    : "/issues"
+                }
+              >
+                Review &amp; merge in PR panel
+              </Link>
+            </Button>
+          </div>
+        ) : (
+          <div className="flex gap-2 mt-4 pt-3 border-t border-border">
+            <Button
+              size="sm"
+              className="bg-green-700 hover:bg-green-600 text-white"
+              onClick={onApprove}
+              disabled={isPending}
+            >
+              Approve
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={onReject}
+              disabled={isPending}
+            >
+              Reject
+            </Button>
+          </div>
+        ))}
       <div className="mt-3">
         {detailLink ? (
           <Button variant="ghost" size="sm" className="text-xs px-0" asChild>

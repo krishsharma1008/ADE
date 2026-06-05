@@ -669,6 +669,70 @@ describe("HOOK 2 — EM PR-approval capture (deterministic, no LLM)", () => {
     expect(agentEntry.source?.startsWith("pr-approval:")).toBe(false);
   });
 
+  it("captures the pr-approval on reconcile when the PR was merged externally (on GitHub)", async () => {
+    const svc = issuePullRequestService(handle.db);
+    const pullNumber = pullSeq++;
+    const headSha = `sha${pullNumber}`;
+    const { tracked } = await trackPr(svc, pullNumber, headSha);
+    // The human merged the PR directly on GitHub: the PR GET already reports merged,
+    // and there is NO in-app merge() PUT. reconcile() must still capture HOOK 2 so the
+    // approved decision lands regardless of where the merge happened.
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const href = String(url);
+      if (href.includes(`/pulls/${pullNumber}/reviews`)) {
+        return new Response(
+          JSON.stringify([
+            { id: 1, user: { login: "lead-reviewer" }, state: "APPROVED", body: "LGTM", submitted_at: "2026-05-06T00:00:00Z" },
+          ]),
+          { status: 200 },
+        );
+      }
+      if (href.includes("/check-runs")) {
+        return new Response(JSON.stringify({ check_runs: [{ id: 1, name: "ci", status: "completed", conclusion: "success" }] }), { status: 200 });
+      }
+      if (href.includes(`/pulls/${pullNumber}`)) {
+        return new Response(
+          JSON.stringify({
+            id: pullNumber,
+            number: pullNumber,
+            title: `feat: durable change ${pullNumber}`,
+            body: null,
+            state: "closed",
+            draft: false,
+            user: { login: "engineer" },
+            head: { ref: "feat/durable", sha: headSha },
+            base: { ref: "development" },
+            merged: true,
+            mergeable: true,
+            merge_commit_sha: "ext-merge-sha",
+            merged_at: "2026-05-06T02:00:00Z",
+            created_at: "2026-05-06T00:00:00Z",
+            updated_at: "2026-05-06T00:00:00Z",
+            html_url: `https://github.com/combyne/ade/pull/${pullNumber}`,
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+    try {
+      const result = await svc.reconcile(tracked.id);
+      expect(result.pullRequest.mergeStatus).toBe("merged");
+      const source = `pr-approval:${tracked.approvalId}`;
+      const rows = await handle.db.select().from(memoryEntries).where(eq(memoryEntries.source, source));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].provenance).toBe("pr-approval");
+      expect(rows[0].verificationState).toBe("verified");
+      expect(rows[0].createdBy).toBeNull(); // merged outside ADE — no decidedByUserId
+      // Reconciling again must NOT duplicate (transition guard + (companyId, source) dedup).
+      await svc.reconcile(tracked.id);
+      const again = await handle.db.select().from(memoryEntries).where(eq(memoryEntries.source, source));
+      expect(again).toHaveLength(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
   it("completes the merge even if the approval-memory capture throws (best-effort)", async () => {
     const svc = issuePullRequestService(handle.db);
     const pullNumber = pullSeq++;
