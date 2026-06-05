@@ -739,7 +739,15 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     // Relative recency window: only return rows updated within the last N days.
     ageDays?: number;
   }): Promise<MemoryEntry[]> {
-    const filters = [eq(memoryEntries.companyId, opts.companyId)];
+    // M6: the instance-wide GLOBAL layer (0054) is the only cross-company layer —
+    // its rows carry company_id = NULL. When the caller explicitly asks for it,
+    // scope by `company_id IS NULL` so the global rows surface; every other layer
+    // stays strictly company-scoped (eq(companyId)), preserving per-company
+    // isolation exactly as before.
+    const filters =
+      opts.layer === "global"
+        ? [isNull(memoryEntries.companyId)]
+        : [eq(memoryEntries.companyId, opts.companyId)];
     if (opts.layer) filters.push(eq(memoryEntries.layer, opts.layer));
     if (opts.ownerType) filters.push(eq(memoryEntries.ownerType, opts.ownerType));
     if (opts.ownerId) filters.push(eq(memoryEntries.ownerId, opts.ownerId));

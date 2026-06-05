@@ -1132,6 +1132,47 @@ describe("global memory layer hardening (B1/M2/M3/M4)", () => {
     // (inArray-only) would mask it and this would fail.
     expect(ids).toContain(global.id);
   });
+
+  it("M6: listEntries({layer:'global'}) returns company-NULL global rows and NOT a company's workspace rows", async () => {
+    const svc = memoryService(handle.db);
+    // A company-scoped workspace row that MUST NOT appear in the global view.
+    const workspace = await makeVerifiedWorkspace(
+      "m6 company workspace row zorptangle",
+      "The zorptangle workspace fact is company-scoped only.",
+    );
+    // A real instance-wide global row (company_id NULL).
+    const global = await svc.createEntry({
+      companyId: null,
+      layer: "global",
+      isInstanceAdmin: true,
+      subject: "m6 instance-wide global row zorptangle",
+      body: "The zorptangle global fact spans every company.",
+      source: `global-direct:${crypto.randomUUID()}`,
+      provenance: "verified-summary",
+      verificationState: "verified",
+      confidence: 0.9,
+      authorType: "user",
+    });
+    expect(global.companyId).toBeNull();
+
+    // The global view (companyId is supplied but ignored for the global layer)
+    // surfaces the NULL-company global rows...
+    const globalList = await svc.listEntries({ companyId, layer: "global", limit: 200 });
+    const globalIds = globalList.map((e) => e.id);
+    expect(globalIds).toContain(global.id);
+    // ...every returned row is genuinely global (company_id NULL).
+    expect(globalList.every((e) => e.layer === "global" && e.companyId === null)).toBe(true);
+    // ...and the company workspace row is NOT leaked into the global view.
+    expect(globalIds).not.toContain(workspace.id);
+
+    // Per-company isolation is INTACT: the workspace layer query is still
+    // strictly eq(companyId) and does NOT pull in the global row.
+    const workspaceList = await svc.listEntries({ companyId, layer: "workspace", limit: 200 });
+    const workspaceIds = workspaceList.map((e) => e.id);
+    expect(workspaceIds).toContain(workspace.id);
+    expect(workspaceIds).not.toContain(global.id);
+    expect(workspaceList.every((e) => e.companyId === companyId)).toBe(true);
+  });
 });
 
 // ---------- M4: ETL preserves globals as company_id NULL (not re-stamped) ----------

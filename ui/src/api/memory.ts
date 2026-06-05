@@ -71,6 +71,16 @@ export const memoryApi = {
   },
   createEntry: (companyId: string, data: CreateMemoryEntry) =>
     api.post<MemoryEntry>(`/companies/${companyId}/memory/entries`, data),
+  /**
+   * M6: list the instance-wide GLOBAL layer (company_id = NULL rows). Routed
+   * through the company-scoped entries endpoint with ?layer=global, which the
+   * server resolves to the cross-company global rows. Instance-admin surface.
+   */
+  listGlobal: (companyId: string) =>
+    api.get<MemoryEntry[]>(`/companies/${companyId}/memory/entries?layer=global`),
+  /** M6: promote a verified company entry into the instance-wide global layer. */
+  promoteToGlobal: (entryId: string) =>
+    api.post<MemoryEntry>(`/memory/global/promote`, { sourceEntryId: entryId }),
   listAcceptedWorkEvents: (companyId: string, status?: string) => {
     const qs = status ? `?status=${encodeURIComponent(status)}` : "";
     return api.get<AcceptedWorkEvent[]>(`/companies/${companyId}/accepted-work/events${qs}`);

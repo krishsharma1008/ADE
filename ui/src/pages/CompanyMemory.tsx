@@ -157,7 +157,7 @@ export function CompanyMemory() {
         />
       </Tabs>
 
-      {effectiveTab === "browse" && <MemoryBrowse />}
+      {effectiveTab === "browse" && <MemoryBrowse isInstanceAdmin={isInstanceAdmin} />}
       {effectiveTab === "capture" && <MemoryCaptureReview />}
       {effectiveTab === "verify" && <MemoryVerifyQueue />}
       {effectiveTab === "conflicts" && <MemoryConflicts />}

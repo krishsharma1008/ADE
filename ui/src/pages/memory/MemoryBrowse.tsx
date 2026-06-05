@@ -67,11 +67,16 @@ function FilterSelect({
   );
 }
 
-export function MemoryBrowse() {
+export function MemoryBrowse({ isInstanceAdmin = false }: { isInstanceAdmin?: boolean }) {
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<FilterState>(INITIAL_FILTERS);
+
+  // M6: the cross-company GLOBAL layer is an instance-admin surface. When it is
+  // selected, list the instance-wide global rows (company_id = NULL) instead of
+  // the company-scoped entries; per-company layers stay company-scoped.
+  const viewingGlobal = filters.layer === "global";
 
   // Translate the UI filter state into the API filter shape. `__any__` and the
   // blank service-scope field mean "no constraint" so they are dropped.
@@ -92,13 +97,26 @@ export function MemoryBrowse() {
 
   const entriesQuery = useQuery({
     queryKey: queryKeys.memory.browse(selectedCompanyId!, apiFilters),
-    queryFn: () => memoryApi.listEntries(selectedCompanyId!, apiFilters),
+    queryFn: () =>
+      viewingGlobal
+        ? memoryApi.listGlobal(selectedCompanyId!)
+        : memoryApi.listEntries(selectedCompanyId!, apiFilters),
     enabled: !!selectedCompanyId,
   });
 
   const updateEntry = useMutation({
     mutationFn: ({ entryId, data }: { entryId: string; data: UpdateMemoryEntry }) =>
       memoryApi.updateEntry(entryId, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["memory", selectedCompanyId, "browse"] });
+    },
+  });
+
+  // M6: instance-admins can promote a verified company entry into the global
+  // layer. On success we invalidate the browse queries so both the source view
+  // and the global view refresh.
+  const promoteToGlobal = useMutation({
+    mutationFn: (entryId: string) => memoryApi.promoteToGlobal(entryId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["memory", selectedCompanyId, "browse"] });
     },
@@ -149,6 +167,8 @@ export function MemoryBrowse() {
               { value: "workspace", label: "workspace" },
               { value: "personal", label: "personal" },
               { value: "shared", label: "shared" },
+              // M6: the cross-company global layer is instance-admin only.
+              ...(isInstanceAdmin ? [{ value: "global", label: "global" }] : []),
             ]}
           />
           <FilterSelect
@@ -237,6 +257,12 @@ export function MemoryBrowse() {
               saveError={
                 updateEntry.error instanceof Error ? updateEntry.error.message : null
               }
+              // M6: the promote-to-global affordance is instance-admin only and
+              // the card itself only renders it for verified company entries.
+              onPromoteToGlobal={
+                isInstanceAdmin ? (entryId) => promoteToGlobal.mutate(entryId) : undefined
+              }
+              isPromoting={promoteToGlobal.isPending}
             />
           ))}
         </div>

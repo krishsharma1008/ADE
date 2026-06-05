@@ -1,5 +1,5 @@
 import type { MemoryEntry, UpdateMemoryEntry } from "@combyne/shared";
-import { Edit2 } from "lucide-react";
+import { Edit2, Globe } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useState } from "react";
@@ -31,15 +31,33 @@ export function MemoryEntryCard({
   onSave,
   isSaving,
   saveError,
+  /**
+   * M6: when supplied (instance-admin only), a "Promote to global" action is
+   * shown on VERIFIED workspace/shared entries. It copies the entry into the
+   * instance-wide global layer (company_id = NULL) via the promote endpoint.
+   */
+  onPromoteToGlobal,
+  isPromoting,
 }: {
   entry: MemoryEntry;
   onSave?: (entryId: string, data: UpdateMemoryEntry) => void;
   isSaving?: boolean;
   saveError?: string | null;
+  onPromoteToGlobal?: (entryId: string) => void;
+  isPromoting?: boolean;
 }) {
   const [editOpen, setEditOpen] = useState(false);
   const superseded = entry.supersededById != null;
   const editable = onSave != null && entry.layer !== "shared";
+  // Promote is offered only for already-verified, non-global, non-superseded
+  // company entries — the global layer should carry trusted facts, and a global
+  // row can't be re-promoted into itself.
+  const canPromoteToGlobal =
+    onPromoteToGlobal != null &&
+    !superseded &&
+    entry.layer !== "global" &&
+    (entry.layer === "workspace" || entry.layer === "shared") &&
+    entry.verificationState === "verified";
 
   return (
     <article
@@ -75,6 +93,18 @@ export function MemoryEntryCard({
             aria-label={`Edit ${entry.subject}`}
           >
             <Edit2 className="h-4 w-4" />
+          </Button>
+        )}
+        {canPromoteToGlobal && (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={isPromoting}
+            onClick={() => onPromoteToGlobal?.(entry.id)}
+            aria-label={`Promote ${entry.subject} to global`}
+          >
+            <Globe className="mr-1 h-3.5 w-3.5" />
+            Promote to global
           </Button>
         )}
       </div>

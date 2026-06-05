@@ -210,7 +210,13 @@ export function memoryRoutes(db: Db) {
     const ageDays = Number.isFinite(ageParsed) && ageParsed > 0 ? ageParsed : undefined;
     const list = await svc.listEntries({
       companyId,
-      layer: layer === "workspace" || layer === "personal" || layer === "shared" ? layer : undefined,
+      // M6: 'global' is honored so ?layer=global returns the instance-wide
+      // company_id=NULL rows (service scopes by isNull(companyId) for that layer).
+      // Company-scope still applies to every non-global layer.
+      layer:
+        layer === "workspace" || layer === "personal" || layer === "shared" || layer === "global"
+          ? layer
+          : undefined,
       ownerType,
       ownerId,
       status,
