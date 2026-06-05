@@ -116,15 +116,24 @@ export function cosineSimilarity(
   versionB?: string | null,
 ): number {
   if (!a || !b) return 0;
-  // Version guard: if both versions are known and differ, refuse to cross-score.
+  // Version guard: refuse to cross-score vectors from different embedding spaces.
+  //
+  // M1: a legacy row can carry a real embedding but a NULL embedding_version
+  // (pre-versioning). Treating NULL as "unknown / skip the guard" let such a row
+  // cross-score a real-model query (e.g. openai:…:1536 vs hash) — a silent
+  // cross-space score. We instead treat a NULL version as the hash space
+  // ('hash-64:64', the only thing that ever wrote a null-version vector), so a
+  // null-vs-real comparison correctly refuses (returns 0) while null-vs-null
+  // (hash vs hash) and same-version both stay allowed. The guard only fires when
+  // at least one side carries a known (passed-in) version — the legacy 2-arg call
+  // (both undefined) keeps its historical version-agnostic behaviour.
   if (
-    versionA !== undefined &&
-    versionA !== null &&
-    versionB !== undefined &&
-    versionB !== null &&
-    versionA !== versionB
+    (versionA !== undefined && versionA !== null) ||
+    (versionB !== undefined && versionB !== null)
   ) {
-    return 0;
+    const va = versionA ?? "hash-64:64";
+    const vb = versionB ?? "hash-64:64";
+    if (va !== vb) return 0;
   }
   const len = Math.min(a.length, b.length);
   if (len === 0) return 0;
@@ -775,7 +784,14 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       eq(memoryEntries.status, "active"),
     ];
     if (opts.layers && opts.layers.length > 0) {
-      filters.push(inArray(memoryEntries.layer, opts.layers));
+      // M2: a plain `inArray(layer, opts.layers)` AND'd onto the company-OR-global
+      // base filter masks the global arm — an agent path that requests explicit
+      // layers (e.g. ['workspace','shared'], omitting 'global') would lose every
+      // global row. OR 'global' back in so the cross-company global layer ALWAYS
+      // survives a layer restriction.
+      filters.push(
+        or(inArray(memoryEntries.layer, opts.layers), eq(memoryEntries.layer, "global")),
+      );
     }
     if (opts.serviceScope) {
       filters.push(eq(memoryEntries.serviceScope, opts.serviceScope));
@@ -865,7 +881,10 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       sql`embedding_version = ${queryEmbedding.version}`,
     ];
     if (opts.layers && opts.layers.length > 0) {
-      conds.push(sql`layer = ANY(${opts.layers})`);
+      // M2 (mirror of the jsonb loadCandidates fix): OR 'global' back in so a
+      // layer restriction on the ANN path never masks the cross-company global
+      // layer.
+      conds.push(sql`(layer = ANY(${opts.layers}) OR layer = 'global')`);
     }
     if (opts.serviceScope) conds.push(sql`service_scope = ${opts.serviceScope}`);
     if (opts.requireVerified) conds.push(sql`verification_state = 'verified'`);
@@ -1007,7 +1026,14 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
 
   async function buildManifest(
     companyId: string,
-    seed: { taskId?: string | null; ownerType?: MemoryOwnerType; ownerId?: string; serviceScope?: string },
+    seed: {
+      taskId?: string | null;
+      ownerType?: MemoryOwnerType;
+      ownerId?: string;
+      serviceScope?: string;
+      // M5: agent-reachable manifest route threads verified-only retrieval through.
+      requireVerified?: boolean;
+    },
     limit = 15,
   ): Promise<MemoryManifest> {
     let queryText = "";
@@ -1024,6 +1050,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       serviceScope: seed.serviceScope,
       limit,
       includeSnippets: false,
+      requireVerified: seed.requireVerified,
     });
     return {
       taskId: seed.taskId ?? null,
@@ -1302,6 +1329,33 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     if (!source) return null;
     if (source.layer !== "workspace" && source.layer !== "shared") {
       throw new Error("only workspace/shared entries can be promoted to global");
+    }
+    // B1: never launder unverified / superseded content into the cross-company
+    // global layer. Mirrors the curated-pin invariant in em-passdown.ts:207 — a
+    // promotion can't admit an agent-claim or a conflict-loser into the trust
+    // spine. The route maps these Errors to a 400.
+    if (source.verificationState !== "verified") {
+      throw new Error("only verified entries can be promoted to global");
+    }
+    if (source.supersededById) {
+      throw new Error("cannot promote a superseded entry");
+    }
+    // M3: global rows carry company_id = NULL, so the (company_id, source) partial
+    // unique index never collides (NULLs are distinct in SQL). Probe the dedicated
+    // company-agnostic global-source unique index (0057) before insert so promoting
+    // the SAME source twice is idempotent — return the existing global row.
+    const [existingGlobal] = await cdb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          isNull(memoryEntries.companyId),
+          eq(memoryEntries.source, `global-promotion:${source.id}`),
+        ),
+      )
+      .limit(1);
+    if (existingGlobal) {
+      return rowToEntry(existingGlobal);
     }
     // The createEntry write-gate writes the company-agnostic global row (company_id
     // NULL) and re-runs redact-before-embed. Instance-admin lineage is trusted, so

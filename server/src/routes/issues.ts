@@ -1274,7 +1274,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
 
-    void createHandoff(db, {
+    // M7: AWAIT the handoff write before the wakeup below. A fire-and-forget
+    // (`void`) let the sub-agent's first wake race the agent_handoffs INSERT, so a
+    // fast first wake could read NO handoff row (an empty first-wake context).
+    // Awaiting commits the row before the wake dispatches; createHandoff is its own
+    // independent write (no shared lock with wakeup) so there is no deadlock.
+    await createHandoff(db, {
       companyId: parent.companyId,
       issueId: created.id,
       fromAgentId: fromAgentId ?? null,

@@ -3,7 +3,12 @@ import { and, eq, sql } from "drizzle-orm";
 import { agents, companies, createDb, issues, memoryEntries, memoryPromotions } from "@combyne/db";
 import { memoryService, computeSubjectKey } from "../memory.js";
 import { buildExportBundle, EmptyExportError, importBundle } from "../memory-etl.js";
-import { startTestDb, stopTestDb, type TestDbHandle } from "./_test-db.js";
+import {
+  startIsolatedTestDb,
+  startTestDb,
+  stopTestDb,
+  type TestDbHandle,
+} from "./_test-db.js";
 
 describe("memory service (4-layer)", () => {
   let handle: TestDbHandle;
@@ -981,5 +986,227 @@ describe("memory ETL (export/import cutover)", () => {
         ownerRemap: new Map(),
       }),
     ).rejects.toBeInstanceOf(EmptyExportError);
+  });
+});
+
+// ---------- FINAL_REVIEW hardening: global-layer trust + reach (B1, M2, M3, M4) ----------
+
+describe("global memory layer hardening (B1/M2/M3/M4)", () => {
+  let handle: TestDbHandle;
+  let companyId: string;
+
+  beforeAll(async () => {
+    // ISOLATED database: these tests create instance-wide global rows (company_id
+    // NULL), which are cross-company-visible BY DESIGN. Sharing the singleton DB
+    // would leak those globals into sibling per-company-isolation tests, so this
+    // block owns its own physical database and tears it down itself.
+    handle = await startIsolatedTestDb();
+    const suffix = Math.random().toString(36).slice(2, 5).toUpperCase();
+    const [c] = await handle.db
+      .insert(companies)
+      .values({ name: `GlobCo-${suffix}`, issuePrefix: `G${suffix}` })
+      .returning();
+    companyId = c.id;
+  }, 60_000);
+
+  afterAll(async () => {
+    if (handle) await handle.stop();
+  });
+
+  // Helper: a verified workspace entry (the only promotable shape).
+  async function makeVerifiedWorkspace(subject: string, body: string) {
+    const svc = memoryService(handle.db);
+    return svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject,
+      body,
+      source: `human-answer:${crypto.randomUUID()}`,
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.95,
+      authorType: "user",
+    });
+  }
+
+  it("B1: an UNVERIFIED workspace entry CANNOT be promoted to global", async () => {
+    const svc = memoryService(handle.db);
+    // An agent-claim style unverified entry.
+    const unverified = await svc.createEntry({
+      companyId,
+      layer: "workspace",
+      subject: "unverified agent claim b1",
+      body: "the orders queue is orders.v9 (unconfirmed)",
+      authorType: "agent",
+    });
+    expect(unverified.verificationState).not.toBe("verified");
+    await expect(
+      svc.createGlobalFromEntry({ sourceEntryId: unverified.id, isInstanceAdmin: true }),
+    ).rejects.toThrow(/only verified entries can be promoted to global/i);
+  });
+
+  it("B1: a SUPERSEDED (conflict-loser) entry CANNOT be promoted to global", async () => {
+    const svc = memoryService(handle.db);
+    const loser = await makeVerifiedWorkspace(
+      "superseded convention b1",
+      "old: topics are bare names",
+    );
+    const winner = await makeVerifiedWorkspace(
+      "winning convention b1",
+      "new: topics are <team>.<domain>.<event>",
+    );
+    // Mark the loser superseded by the winner.
+    await handle.db
+      .update(memoryEntries)
+      .set({ supersededById: winner.id })
+      .where(eq(memoryEntries.id, loser.id));
+    await expect(
+      svc.createGlobalFromEntry({ sourceEntryId: loser.id, isInstanceAdmin: true }),
+    ).rejects.toThrow(/superseded/i);
+  });
+
+  it("B1: a VERIFIED workspace entry CAN be promoted to global", async () => {
+    const svc = memoryService(handle.db);
+    const verified = await makeVerifiedWorkspace(
+      "verified promotable convention b1",
+      "Use signed JWT cookies for sessions.",
+    );
+    const global = await svc.createGlobalFromEntry({
+      sourceEntryId: verified.id,
+      isInstanceAdmin: true,
+    });
+    expect(global).not.toBeNull();
+    expect(global!.layer).toBe("global");
+    expect(global!.companyId).toBeNull();
+  });
+
+  it("M3: promoting the SAME source twice yields exactly ONE global row (idempotent)", async () => {
+    const svc = memoryService(handle.db);
+    const verified = await makeVerifiedWorkspace(
+      "idempotent global convention m3",
+      "Resume paused runs on the next window.",
+    );
+    const first = await svc.createGlobalFromEntry({
+      sourceEntryId: verified.id,
+      isInstanceAdmin: true,
+    });
+    const second = await svc.createGlobalFromEntry({
+      sourceEntryId: verified.id,
+      isInstanceAdmin: true,
+    });
+    expect(first).not.toBeNull();
+    expect(second!.id).toBe(first!.id);
+    const rows = await handle.db
+      .select()
+      .from(memoryEntries)
+      .where(eq(memoryEntries.source, `global-promotion:${verified.id}`));
+    expect(rows).toHaveLength(1);
+  });
+
+  it("M2: an explicit layers=['workspace','shared'] (omitting global) STILL returns a global row", async () => {
+    const svc = memoryService(handle.db);
+    // Create the global row DIRECTLY (the instance-admin write path) with a unique
+    // phrase that appears in NO other row — so there is no subjectKey collision
+    // that the §3.6 conflict resolver could use to drop it, and the only thing
+    // that could exclude it from the result is the layer filter (the M2 bug).
+    const global = await svc.createEntry({
+      companyId: null,
+      layer: "global",
+      isInstanceAdmin: true,
+      subject: "m2 global-only reachability quizzaltrothex",
+      body: "The quizzaltrothex rollout uses quizzaltrothex canary windows.",
+      source: `global-direct:${crypto.randomUUID()}`,
+      provenance: "verified-summary",
+      verificationState: "verified",
+      confidence: 0.9,
+      authorType: "user",
+    });
+    expect(global.layer).toBe("global");
+    expect(global.companyId).toBeNull();
+    const res = await svc.queryRanked(companyId, "quizzaltrothex canary windows", {
+      layers: ["workspace", "shared"], // global intentionally OMITTED
+      limit: 20,
+    });
+    const ids = res.items.map((i) => i.id);
+    // With the M2 fix the global row survives the layer restriction; the bug
+    // (inArray-only) would mask it and this would fail.
+    expect(ids).toContain(global.id);
+  });
+});
+
+// ---------- M4: ETL preserves globals as company_id NULL (not re-stamped) ----------
+
+describe("memory ETL global-layer preservation (M4)", () => {
+  let handle: TestDbHandle;
+  let srcCompanyId: string;
+  let dstCompanyId: string;
+
+  beforeAll(async () => {
+    // ISOLATED database (see the global-hardening block above): this test creates
+    // a global row and round-trips it through export/import; an isolated DB keeps
+    // that cross-company global out of the shared singleton.
+    handle = await startIsolatedTestDb();
+    const suffix = Math.random().toString(36).slice(2, 5).toUpperCase();
+    const [src] = await handle.db
+      .insert(companies)
+      .values({ name: `M4Src-${suffix}`, issuePrefix: `MS${suffix}` })
+      .returning();
+    const [dst] = await handle.db
+      .insert(companies)
+      .values({ name: `M4Dst-${suffix}`, issuePrefix: `MD${suffix}` })
+      .returning();
+    srcCompanyId = src.id;
+    dstCompanyId = dst.id;
+  }, 60_000);
+
+  afterAll(async () => {
+    if (handle) await handle.stop();
+  });
+
+  it("export+import preserves a global row as company_id NULL (never re-stamped)", async () => {
+    const svc = memoryService(handle.db);
+    // A verified workspace entry on the source company, promoted to global.
+    const ws = await svc.createEntry({
+      companyId: srcCompanyId,
+      layer: "workspace",
+      subject: "m4 global convention",
+      body: "Global: never log secrets.",
+      source: `human-answer:${crypto.randomUUID()}`,
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.95,
+      authorType: "user",
+    });
+    const global = await svc.createGlobalFromEntry({
+      sourceEntryId: ws.id,
+      isInstanceAdmin: true,
+    });
+    expect(global).not.toBeNull();
+    const globalSource = `global-promotion:${ws.id}`;
+
+    // A per-company export must CARRY the dependent global row (M4 export UNION).
+    const bundle = await buildExportBundle(handle.connectionString, srcCompanyId);
+    const exportedGlobal = (bundle.memory_entries as Array<Record<string, unknown>>).find(
+      (r) => r.source === globalSource,
+    );
+    expect(exportedGlobal).toBeDefined();
+    expect(exportedGlobal!.layer).toBe("global");
+
+    // Import under the destination company: the global row must land company_id
+    // NULL (NOT re-stamped to dstCompanyId).
+    const dstDb = createDb(handle.connectionString);
+    await importBundle(dstDb, bundle, {
+      companyId: dstCompanyId,
+      ownerRemap: new Map(),
+    });
+    const rows = await dstDb
+      .select()
+      .from(memoryEntries)
+      .where(eq(memoryEntries.source, globalSource));
+    // Exactly one global row, company_id NULL — the M3 global-source uniq index
+    // means the original promotion + this import dedup to ONE row.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].layer).toBe("global");
+    expect(rows[0].companyId).toBeNull();
   });
 });

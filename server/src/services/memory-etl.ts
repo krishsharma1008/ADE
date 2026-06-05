@@ -15,7 +15,7 @@ import {
   memoryUsage,
   type Db,
 } from "@combyne/db";
-import { and, eq, sql as dsql } from "drizzle-orm";
+import { and, eq, or, sql as dsql } from "drizzle-orm";
 import { resolveContextDb } from "./context-db.js";
 
 export const MEMORY_EXPORT_VERSION = 1 as const;
@@ -55,7 +55,15 @@ export async function buildExportBundle(
   const db = createDb(url);
   const [entries, promotions, usage, agent] = await Promise.all([
     companyId
-      ? db.select().from(memoryEntries).where(eq(memoryEntries.companyId, companyId))
+      ? // M4: a per-company export must also carry the instance-wide global rows
+        // it may depend on. `eq(companyId, X)` excludes company_id NULL, dropping
+        // every global row; UNION layer='global' so dependent globals travel with
+        // the bundle (and re-import preserves them as company_id NULL via the
+        // importBundle global guard).
+        db
+          .select()
+          .from(memoryEntries)
+          .where(or(eq(memoryEntries.companyId, companyId), eq(memoryEntries.layer, "global")))
       : db.select().from(memoryEntries),
     companyId
       ? db.select().from(memoryPromotions).where(eq(memoryPromotions.companyId, companyId))
@@ -181,9 +189,14 @@ export async function importBundle(
     }
 
     // Dedup probe on the §6.5 natural key. source may be null, so we build the
-    // predicate conditionally (NULL = NULL is not true in SQL).
+    // predicate conditionally (NULL = NULL is not true in SQL). M4: a global row
+    // is company-agnostic (company_id NULL), so it must dedup against company_id
+    // IS NULL — not opts.companyId — or a re-import would slip past dedup and hit
+    // the 0057 global-source uniq index.
     const dedup = [
-      eq(memoryEntries.companyId, opts.companyId),
+      layer === "global"
+        ? dsql`${memoryEntries.companyId} IS NULL`
+        : eq(memoryEntries.companyId, opts.companyId),
       eq(memoryEntries.layer, layer),
       eq(memoryEntries.subject, subject),
       source === null
@@ -209,7 +222,12 @@ export async function importBundle(
     const [inserted] = await cdb
       .insert(memoryEntries)
       .values({
-        companyId: opts.companyId,
+        // M4: instance-wide global rows (layer='global') are company-agnostic and
+        // MUST keep company_id = NULL. Unconditionally stamping opts.companyId
+        // corrupted a global row into a company-owned one (breaking cross-company
+        // reach AND the 0057 global-source uniq index). Only per-company layers get
+        // the target company id.
+        companyId: layer === "global" ? null : opts.companyId,
         layer,
         ownerType: layer === "personal" ? ownerType : null,
         ownerId: layer === "personal" ? ownerId : null,

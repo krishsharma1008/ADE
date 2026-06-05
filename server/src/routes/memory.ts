@@ -339,6 +339,11 @@ export function memoryRoutes(db: Db) {
         serviceScope: body.serviceScope,
         limit: body.limit,
         includeSnippets: body.includeSnippets,
+        // M5: this query route is agent-reachable (an agent is admitted for its
+        // own company). Agents get the §3.2 verified-only retrieval filter so an
+        // unverified agent-claim can never be read back as fact; human/board
+        // browsing stays unfiltered.
+        requireVerified: actor.actorType === "agent",
       });
       res.json(result);
     },
@@ -365,6 +370,9 @@ export function memoryRoutes(db: Db) {
         ownerType,
         ownerId,
         serviceScope: parsed.serviceScope,
+        // M5: manifest is agent-reachable — agents get verified-only retrieval,
+        // human/board browsing stays unfiltered.
+        requireVerified: actor.actorType === "agent",
       },
       parsed.limit,
     );

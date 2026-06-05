@@ -64,6 +64,22 @@ describe("PR-11 embedding version + redact-before-embed", () => {
       expect(cosineSimilarity(apiEntry, hashQuery, API_VERSION, "hash-64:64")).toBe(0);
     });
 
+    it("M1: a NULL entry version (legacy hash row) never cross-scores a real-model query", () => {
+      // A pre-versioning row carries a real embedding but embedding_version = NULL.
+      // The fix treats NULL as the hash space, so a real-model query (API_VERSION)
+      // vs a null-version vector must refuse (return 0) — not silently cross-score.
+      const apiQuery = new Array(1536).fill(0);
+      apiQuery[0] = 1;
+      const legacyHashVec = embedText("budget pause policy"); // 64-dim, version NULL
+      expect(cosineSimilarity(apiQuery, legacyHashVec, API_VERSION, null)).toBe(0);
+      expect(cosineSimilarity(legacyHashVec, apiQuery, null, API_VERSION)).toBe(0);
+      // But null-vs-null (hash vs hash, the same space) still scores.
+      const hashB = embedText("budget pause policy");
+      expect(cosineSimilarity(legacyHashVec, hashB, null, null)).toBeGreaterThan(0.9);
+      // And an explicit hash-version vs null is allowed (both fold to hash-64:64).
+      expect(cosineSimilarity(legacyHashVec, hashB, "hash-64:64", null)).toBeGreaterThan(0.9);
+    });
+
     it("rankEntries never cross-scores a hash query against an API-version entry", () => {
       const apiVec = new Array(1536).fill(0);
       apiVec[0] = 1;
