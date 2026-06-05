@@ -338,6 +338,20 @@ function formatCitation(entry: MemoryEntry): string | null {
   return null;
 }
 
+/**
+ * Split a captured `Q: …\nA: …` human-answer body (HOOK 1 format, routes/issues.ts)
+ * back into its question and answer halves for the Questions tab (PR-16). Falls
+ * back gracefully: a body that does not match the convention yields `{question:
+ * null, answer: <body>}` so older/free-form captures still render their answer.
+ */
+function splitCapturedQa(body: string): { question: string | null; answer: string | null } {
+  const match = /^Q:\s*([\s\S]*?)\n+A:\s*([\s\S]*)$/.exec(body);
+  if (match) {
+    return { question: match[1].trim() || null, answer: match[2].trim() || null };
+  }
+  return { question: null, answer: body.trim() || null };
+}
+
 export interface CreateEntryInput {
   companyId: string;
   layer: MemoryLayer;
@@ -1260,6 +1274,52 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
   }
 
   /**
+   * Questions tab (PR-16 §3.1 — the ask-don't-hallucinate loop, made visible).
+   * Lists ALL `human-answer` provenance entries (acknowledged or not, unlike the
+   * Capture inbox which only shows the not-yet-acknowledged ones) so the loop is
+   * fully auditable: the question that was asked → the answer that was captured →
+   * the reusable entry it became. The capture hook writes the body as `Q: …\nA: …`
+   * (HOOK 1, routes/issues.ts), so we split that back out for display, and surface
+   * the source citation + the capture time (`answeredAt`).
+   */
+  async function questions(companyId: string): Promise<
+    Array<{
+      entry: MemoryEntry;
+      question: string | null;
+      answer: string | null;
+      citation: string | null;
+      answeredAt: string;
+      acknowledged: boolean;
+    }>
+  > {
+    const rows = await cdb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.status, "active"),
+          eq(memoryEntries.provenance, "human-answer"),
+          isNull(memoryEntries.supersededById),
+        ),
+      )
+      .orderBy(desc(memoryEntries.createdAt))
+      .limit(200);
+    return rows.map((row) => {
+      const entry = rowToEntry(row);
+      const { question, answer } = splitCapturedQa(entry.body);
+      return {
+        entry,
+        question,
+        answer,
+        citation: formatCitation(entry),
+        answeredAt: entry.createdAt,
+        acknowledged: entry.verifiedBy != null,
+      };
+    });
+  }
+
+  /**
    * Verify queue (§3.4 hybrid SLA, decision #3): two streams folded into one
    * list — (a) agent-claim entries with their DISTINCT-issue reuse count (the
    * §3 hybrid reuse signal a board user weighs before verifying), and (b) the
@@ -1758,6 +1818,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     listPromotions,
     decidePromotion,
     captureInbox,
+    questions,
     verifyQueue,
     verifyEntry,
     redactionQueue,

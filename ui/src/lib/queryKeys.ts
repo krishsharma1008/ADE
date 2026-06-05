@@ -91,6 +91,12 @@ export const queryKeys = {
     conflicts: (companyId: string) => ["memory", companyId, "conflicts"] as const,
     redactionQueue: (companyId: string) => ["memory", companyId, "redaction-queue"] as const,
     embeddingStatus: (companyId: string) => ["memory", companyId, "embedding-status"] as const,
+    questions: (companyId: string) => ["memory", companyId, "questions"] as const,
+    passdownPackets: (companyId: string) => ["memory", companyId, "passdown-packets"] as const,
+    // Candidate verified entries for the delegate-dialog passdown picker, keyed
+    // on the child issue's serviceScope so a scope change refetches.
+    candidates: (companyId: string, serviceScope?: string) =>
+      ["memory", companyId, "candidates", serviceScope ?? "__any__"] as const,
   },
   contextDatabase: {
     status: ["instance", "context-database"] as const,

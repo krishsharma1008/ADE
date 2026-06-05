@@ -1,5 +1,9 @@
 import { Router } from "express";
+import { and, desc, eq } from "drizzle-orm";
 import type { Db } from "@combyne/db";
+import { agentHandoffs, issues } from "@combyne/db";
+import type { MemoryPassdownPacket } from "@combyne/shared";
+import { isPassdownPacket } from "../services/em-passdown.js";
 import {
   createMemoryEntrySchema,
   updateMemoryEntrySchema,
@@ -428,6 +432,16 @@ export function memoryRoutes(db: Db) {
     res.json(items);
   });
 
+  // Questions tab (PR-16 §3.1): the ask-don't-hallucinate loop made visible —
+  // ALL human-answer entries (acknowledged or not) with their source question,
+  // citation, and capture time. Company-scoped (mirrors capture-inbox).
+  router.get("/companies/:companyId/memory/questions", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const items = await svc.questions(companyId);
+    res.json(items);
+  });
+
   // Verify queue (§3.4 hybrid SLA): agent-claims + reuse evidence + promotions.
   router.get("/companies/:companyId/memory/verify-queue", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -596,6 +610,63 @@ export function memoryRoutes(db: Db) {
     assertBoard(req);
     const status = await svc.embeddingStatus(companyId);
     res.json(status);
+  });
+
+  // Passdown audit (PR-16 §3.1 / §3.8): read-only list of recent EM passdown
+  // packets — the vetted manifest each handoff carried into a delegated child
+  // issue. Reads agent_handoffs joined to issues and parses the artifactRefs
+  // jsonb via isPassdownPacket (the same guard the heartbeat re-hydration uses).
+  // Curation lives in the delegate dialog (MemoryPassdownPicker); this is the
+  // after-the-fact audit of what was pinned/retrieved.
+  router.get("/companies/:companyId/memory/passdown-packets", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const rows = await db
+      .select({
+        handoffId: agentHandoffs.id,
+        artifactRefs: agentHandoffs.artifactRefs,
+        createdAt: agentHandoffs.createdAt,
+        issueId: issues.id,
+        issueTitle: issues.title,
+        issueIdentifier: issues.identifier,
+      })
+      .from(agentHandoffs)
+      .innerJoin(issues, eq(agentHandoffs.issueId, issues.id))
+      .where(eq(agentHandoffs.companyId, companyId))
+      .orderBy(desc(agentHandoffs.createdAt))
+      .limit(100);
+
+    const packets: MemoryPassdownPacket[] = [];
+    for (const row of rows) {
+      // artifactRefs is a jsonb manifest array; the passdown packet is the entry
+      // whose `kind === 'passdown'`. A handoff may carry zero (no vetted context).
+      const refs = Array.isArray(row.artifactRefs) ? row.artifactRefs : [];
+      const packet = refs.find((ref) => isPassdownPacket(ref));
+      if (!packet || !isPassdownPacket(packet)) continue;
+      packets.push({
+        handoffId: row.handoffId,
+        childIssueId: row.issueId,
+        childIssueTitle: row.issueTitle ?? null,
+        childIssueIdentifier: row.issueIdentifier ?? null,
+        complexity: packet.complexity,
+        serviceScope: packet.serviceScope ?? null,
+        entryCount: packet.items.length,
+        estimatedTokens: packet.estimatedTokens,
+        items: packet.items.map((item) => ({
+          entryId: item.entryId,
+          layer: item.layer,
+          subject: item.subject,
+          kind: item.kind,
+          serviceScope: item.serviceScope,
+          provenance: item.provenance,
+          confidence: item.confidence,
+          curated: item.curated,
+        })),
+        generatedAt: packet.generatedAt,
+        createdAt: row.createdAt.toISOString(),
+      });
+    }
+    res.json(packets);
   });
 
   return router;

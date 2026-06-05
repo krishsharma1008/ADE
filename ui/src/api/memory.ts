@@ -6,7 +6,9 @@ import type {
   MemoryConflictGroup,
   MemoryEntry,
   MemoryLayer,
+  MemoryPassdownPacket,
   MemoryProvenance,
+  MemoryQuestionItem,
   MemoryVerificationState,
   MemoryVerifyItem,
   UpdateMemoryEntry,
@@ -118,4 +120,10 @@ export const memoryApi = {
     api.post<MemoryEntry>(`/memory/entries/${entryId}/redaction/resolve`, { action }),
   getEmbeddingStatus: (companyId: string) =>
     api.get<MemoryEmbeddingStatus>(`/companies/${companyId}/memory/embedding-status`),
+
+  // ---------- PR-16: Questions + Passdown ----------
+  listQuestions: (companyId: string) =>
+    api.get<MemoryQuestionItem[]>(`/companies/${companyId}/memory/questions`),
+  listPassdownPackets: (companyId: string) =>
+    api.get<MemoryPassdownPacket[]>(`/companies/${companyId}/memory/passdown-packets`),
 };

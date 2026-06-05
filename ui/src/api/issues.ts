@@ -94,6 +94,10 @@ export const issuesApi = {
       complexity?: "small" | "medium" | "large";
       priority?: string;
       labelIds?: string[];
+      // PR-9 / PR-16: explicit service scope + EM-pinned curated memory ids drive
+      // the vetted passdown packet assembled server-side in createHandoff.
+      serviceScope?: string | null;
+      curatedMemoryEntryIds?: string[];
     },
   ) => api.post<{ issue: Issue }>(`/issues/${id}/delegate`, data),
   answerQuestion: (

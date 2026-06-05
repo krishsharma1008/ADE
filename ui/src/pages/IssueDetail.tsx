@@ -34,6 +34,7 @@ import { PriorityIcon } from "../components/PriorityIcon";
 import { StatusBadge } from "../components/StatusBadge";
 import { PlanEditor } from "../components/PlanEditor";
 import { Identity } from "../components/Identity";
+import { DelegateIssueDialog } from "../components/memory/DelegateIssueDialog";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
@@ -192,6 +193,7 @@ export function IssueDetail() {
   });
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [promptHistoryRunId, setPromptHistoryRunId] = useState<string | null>(null);
+  const [delegateOpen, setDelegateOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastMarkedReadIssueIdRef = useRef<string | null>(null);
 
@@ -331,6 +333,16 @@ export function IssueDetail() {
     }
     return options;
   }, [agents, orderedProjects]);
+
+  // PR-16: agents eligible as delegate targets (active, sorted) for the
+  // delegate dialog's assignee picker.
+  const delegateAgents = useMemo(
+    () =>
+      [...(agents ?? [])]
+        .filter((agent) => agent.status !== "terminated")
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [agents],
+  );
 
   const childIssues = useMemo(() => {
     if (!allIssues || !issue) return [];
@@ -1329,6 +1341,17 @@ export function IssueDetail() {
         </TabsContent>
 
         <TabsContent value="subissues">
+          <div className="mb-3 flex justify-end">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setDelegateOpen(true)}
+              data-action="delegate"
+            >
+              <UserPlus className="mr-1.5 h-4 w-4" />
+              Delegate sub-issue
+            </Button>
+          </div>
           {childIssues.length === 0 ? (
             <p className="text-xs text-muted-foreground">No sub-issues.</p>
           ) : (
@@ -1357,6 +1380,12 @@ export function IssueDetail() {
               ))}
             </div>
           )}
+          <DelegateIssueDialog
+            parent={issue}
+            agents={delegateAgents}
+            open={delegateOpen}
+            onOpenChange={setDelegateOpen}
+          />
         </TabsContent>
 
         <TabsContent value="plan">

@@ -4,6 +4,7 @@ import { Eye, EyeOff, ShieldAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ProvenanceBadge, VerificationBadge } from "./MemoryTrustBadges";
+import { MemoryStalenessNote } from "./MemoryStalenessNote";
 
 /**
  * Redaction-queue card (PR-15 §3.6 — the blocking redact-before-embed gate).
@@ -112,6 +113,8 @@ export function MemoryRedactionCard({
             Keep redacted
           </Button>
         </div>
+
+        <MemoryStalenessNote />
       </div>
     </article>
   );

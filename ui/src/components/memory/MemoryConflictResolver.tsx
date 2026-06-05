@@ -9,6 +9,7 @@ import {
   ProvenanceBadge,
   VerificationBadge,
 } from "./MemoryTrustBadges";
+import { MemoryStalenessNote } from "./MemoryStalenessNote";
 
 function formatDate(value: string | null) {
   if (!value) return "Never";
@@ -215,6 +216,8 @@ export function MemoryConflictResolver({
           </>
         )}
       </div>
+
+      <MemoryStalenessNote className="mt-3" />
     </div>
   );
 }

@@ -249,6 +249,9 @@ export type {
   MemoryVerifyItem,
   MemoryConflictGroup,
   MemoryConflictAction,
+  MemoryQuestionItem,
+  MemoryPassdownPacket,
+  MemoryPassdownPacketItem,
 } from "./memory.js";
 export {
   ACCEPTED_WORK_MEMORY_STATUSES,

@@ -24,6 +24,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { MemoryStalenessNote } from "./MemoryStalenessNote";
 
 const KINDS: MemoryKind[] = ["fact", "runbook", "convention", "pointer", "note"];
 const STATUSES: MemoryStatus[] = ["active", "archived", "deprecated"];
@@ -216,6 +217,8 @@ export function MemoryEntryEditDialog({
           </div>
 
           {error && <p className="text-xs text-destructive">{error}</p>}
+
+          <MemoryStalenessNote />
         </div>
 
         <DialogFooter>

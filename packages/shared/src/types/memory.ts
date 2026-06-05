@@ -187,3 +187,58 @@ export interface MemoryConflictGroup {
 
 export const MEMORY_CONFLICT_ACTIONS = ["override", "merge", "edit"] as const;
 export type MemoryConflictAction = (typeof MEMORY_CONFLICT_ACTIONS)[number];
+
+/**
+ * PR-16 — Questions tab (the ask-don't-hallucinate loop, made visible). A single
+ * captured human-answer entry shown as: the question that was asked → the answer
+ * that was captured → the reusable entry it became. Backed by all `human-answer`
+ * provenance entries (acknowledged or not), with the source citation the capture
+ * hook stamped and the time the answer was captured (`answeredAt`).
+ */
+export interface MemoryQuestionItem {
+  entry: MemoryEntry;
+  /** The original question text recovered from the captured `Q:/A:` body, when present. */
+  question: string | null;
+  /** The captured answer text recovered from the body, when present. */
+  answer: string | null;
+  /** Human-readable source citation, e.g. "issue #ABC-12" / "comment #9". */
+  citation: string | null;
+  /** When the answer was captured (the entry's createdAt). */
+  answeredAt: string;
+  /** True once a human has acknowledged the captured entry (verifiedBy stamped). */
+  acknowledged: boolean;
+}
+
+/**
+ * PR-16 — Passdown tab (read-only audit of EM passdown packets). One row per
+ * recent handoff carrying a non-empty passdown manifest in
+ * `agent_handoffs.artifactRefs`. Surfaces the child issue, complexity tier,
+ * entry/token budget, and the cited entries, parsed via `isPassdownPacket`.
+ */
+export interface MemoryPassdownPacketItem {
+  entryId: string;
+  layer: MemoryLayer;
+  subject: string;
+  kind: string;
+  serviceScope: string | null;
+  provenance: MemoryProvenance | null;
+  confidence: number;
+  /** True when the entry came from the EM-pinned `curatedMemoryEntryIds` union. */
+  curated: boolean;
+}
+
+export interface MemoryPassdownPacket {
+  handoffId: string;
+  childIssueId: string;
+  childIssueTitle: string | null;
+  childIssueIdentifier: string | null;
+  complexity: string;
+  serviceScope: string | null;
+  /** Number of vetted entries carried in the packet. */
+  entryCount: number;
+  /** Estimated token budget of the rendered packet body. */
+  estimatedTokens: number;
+  items: MemoryPassdownPacketItem[];
+  generatedAt: string;
+  createdAt: string;
+}

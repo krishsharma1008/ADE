@@ -18,6 +18,8 @@ import { MemoryCaptureReview } from "./memory/MemoryCaptureReview";
 import { MemoryVerifyQueue } from "./memory/MemoryVerifyQueue";
 import { MemoryConflicts } from "./memory/MemoryConflicts";
 import { MemoryRedactionQueue } from "./memory/MemoryRedactionQueue";
+import { MemoryQuestions } from "./memory/MemoryQuestions";
+import { MemoryPassdown } from "./memory/MemoryPassdown";
 import { MemoryDatabase } from "./memory/MemoryDatabase";
 import { MemorySetup } from "./memory/MemorySetup";
 
@@ -28,13 +30,17 @@ function formatDate(value: string | null) {
 
 // Path-driven tabs (mirrors Approvals.tsx). PR-13 shipped Browse; PR-14 added the
 // capture/verify/conflicts queues; PR-15 adds the redaction queue (board) and the
-// database/setup admin tabs (instance-admin only — hidden for non-admins).
+// database/setup admin tabs (instance-admin only — hidden for non-admins); PR-16
+// adds the questions (ask-don't-hallucinate loop) + passdown (EM packet audit)
+// read-only tabs, completing the eight-flow set.
 const TABS = [
   "browse",
   "capture",
   "verify",
   "conflicts",
   "redaction",
+  "questions",
+  "passdown",
   "database",
   "setup",
 ] as const;
@@ -139,6 +145,8 @@ export function CompanyMemory() {
             { value: "verify", label: "Verify" },
             { value: "conflicts", label: "Conflicts" },
             { value: "redaction", label: "Redaction" },
+            { value: "questions", label: "Questions" },
+            { value: "passdown", label: "Passdown" },
             ...(isInstanceAdmin
               ? [
                   { value: "database", label: "Database" },
@@ -154,6 +162,8 @@ export function CompanyMemory() {
       {effectiveTab === "verify" && <MemoryVerifyQueue />}
       {effectiveTab === "conflicts" && <MemoryConflicts />}
       {effectiveTab === "redaction" && <MemoryRedactionQueue />}
+      {effectiveTab === "questions" && <MemoryQuestions />}
+      {effectiveTab === "passdown" && <MemoryPassdown />}
       {effectiveTab === "database" && <MemoryDatabase />}
       {effectiveTab === "setup" && <MemorySetup />}
 
