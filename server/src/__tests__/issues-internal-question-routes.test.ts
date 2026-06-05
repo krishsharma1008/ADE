@@ -318,17 +318,30 @@ describe("issue internal question routes", () => {
       .then((rows) => rows.find((row) => row.body.includes("missing nullable default")));
     expect(comment?.id).toBeTruthy();
 
-    const childRuns = await handle.db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.agentId, devId));
-    expect(childRuns.some((run) => {
-      const context = run.contextSnapshot as Record<string, unknown> | null;
-      return context?.issueId === issue.id &&
-        context?.wakeReason === "issue_reopened" &&
-        context?.wakeCommentId === comment?.id &&
-        context?.previousStatus === "done" &&
-        context?.nextStatus === "todo";
-    })).toBe(true);
+    // The reopen enqueues the assignee wakeup FIRE-AND-FORGET (the PATCH handler
+    // does not await it), so reading heartbeatRuns immediately races the async
+    // insert. Poll until the child run lands (deterministic, up to ~1s).
+    const matched = async () => {
+      const childRuns = await handle.db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, devId));
+      return childRuns.some((run) => {
+        const context = run.contextSnapshot as Record<string, unknown> | null;
+        return (
+          context?.issueId === issue.id &&
+          context?.wakeReason === "issue_reopened" &&
+          context?.wakeCommentId === comment?.id &&
+          context?.previousStatus === "done" &&
+          context?.nextStatus === "todo"
+        );
+      });
+    };
+    let found = false;
+    for (let attempt = 0; attempt < 50 && !found; attempt++) {
+      found = await matched();
+      if (!found) await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(found).toBe(true);
   });
 });
