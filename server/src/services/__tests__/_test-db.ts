@@ -83,6 +83,21 @@ async function bootOnce(): Promise<TestDbHandle> {
       db,
       connectionString,
       stop: async () => {
+        // Drain the postgres-js pool BEFORE stopping the embedded Postgres binary.
+        // Otherwise a fire-and-forget background query still in flight (heartbeat
+        // wakeups, summarizer probes, pg type introspection) races the shutdown and
+        // surfaces as a benign-but-suite-flipping ECONNRESET / "database system is
+        // shutting down" unhandled rejection. end({timeout}) waits for in-flight
+        // queries and makes new ones reject cleanly. Best-effort: never let cleanup
+        // mask a real failure.
+        try {
+          const client = (db as unknown as {
+            $client?: { end?: (opts?: unknown) => Promise<void> };
+          }).$client;
+          if (client?.end) await client.end({ timeout: 5 }).catch(() => {});
+        } catch {
+          /* ignore */
+        }
         try {
           await pg.stop();
         } finally {

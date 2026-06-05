@@ -205,6 +205,56 @@ Agent API keys are hashed at rest and scoped to their company — no cross-compa
 
 ---
 
+## Central Context DB (memory layer)
+
+ADE includes a **central context database** — a governed, hallucination-resistant
+memory layer that captures what your team knows and feeds it back to the agents
+that need it, scoped to each task.
+
+**What it does**
+
+- **Layered memory** — per-company `workspace` / `personal` / `shared` tiers plus an
+  instance-wide **`global`** layer for org-wide conventions shared across every team.
+- **Human-gated trust** — every entry carries provenance (`human-answer`,
+  `pr-approval`, `agent-claim`, …), a verification state, and a confidence. Agent
+  claims are forced **unverified** at the write gate and are never retrieved as
+  authoritative until a human verifies or promotes them.
+- **Two write-paths** — when an agent asks a teammate a question, the **answer** is
+  captured as a verified entry; when a human EM **approves a PR**, the decision /
+  convention is captured. Both are reused automatically next time.
+- **EM passdown** — when a manager agent delegates, it hands the sub-agent a vetted,
+  size-tiered, **cited** slice of memory (small / medium / large tickets get
+  proportional context), and the sub-agent's own retrieval is verified-only too.
+- **Ask-don't-hallucinate** — when retrieved context is insufficient, the agent asks
+  the user instead of fabricating; the answer is captured so it's served from memory
+  next time. (Ships dark; enable after calibration.)
+- **Semantic retrieval** — a managed embedding model (or the built-in deterministic
+  hash fallback) with **redact-before-embed**. On a benchmark of paraphrased queries,
+  real embeddings lifted recall@1 from ~14% to ~93%.
+- **Multi-tenant** — company-scoped by default, with Postgres **row-level security**
+  authored and CI-proven for one shared instance (the `global` layer is the
+  cross-company read exception).
+
+**Use it**
+
+- Open the **Memory** tab in the dashboard: *Browse · Capture · Verify · Conflicts*
+  (merge / override) *· Redaction · Questions · Passdown*, plus admin **Database** and
+  **Setup** tabs.
+- Run the memory layer on its own database (optional): set
+  `COMBYNE_CONTEXT_DATABASE_URL`, or use the **Database** tab to test + save a
+  connection (takes effect on restart).
+- Enable semantic retrieval (optional): set a team `COMBYNE_EMBEDDING_API_KEY` (or
+  `OPENAI_API_KEY`) and `COMBYNE_VECTOR_SEARCH_ENABLED=true` — the **Setup** tab does
+  this with a privacy disclosure.
+
+Design + ops docs: [`doc/CENTRAL_CONTEXT_DB_PLAN.md`](doc/CENTRAL_CONTEXT_DB_PLAN.md),
+[`doc/MEMORY_UI_AND_QUALITY_PLAN.md`](doc/MEMORY_UI_AND_QUALITY_PLAN.md),
+[`doc/CENTRAL_DB_RUNBOOK.md`](doc/CENTRAL_DB_RUNBOOK.md) (DevOps hand-off),
+[`doc/HALLUCINATION_AT_SCALE.md`](doc/HALLUCINATION_AT_SCALE.md), and
+[`doc/PRIVACY_DISCLOSURE.md`](doc/PRIVACY_DISCLOSURE.md).
+
+---
+
 ## Configuration
 
 ### Environment Variables
@@ -226,6 +276,10 @@ ADE works out of the box with zero configuration. All settings below are **optio
 | `BETTER_AUTH_SECRET` | *(auto-generated at `~/.combyne/secrets/`)* | Session signing key. Set explicitly for Docker / multi-instance deployments so sessions survive container restarts. Generate with `openssl rand -hex 32`. |
 | `COMBYNE_MEMORY_MIN_ENTRIES` | `3` | Min transcript entries before a run gets summarized into `agent_memory` |
 | `COMBYNE_RESET_SESSION_ON_ASSIGN` | `false` | Set to `true` to reset the adapter session on every issue reassignment (rollback lever for shared-context handoff) |
+| `COMBYNE_CONTEXT_DATABASE_URL` | *(uses `DATABASE_URL`)* | Run the **context/memory** tables in a **separate** PostgreSQL from operational data (the central context DB) |
+| `COMBYNE_EMBEDDING_API_KEY` / `OPENAI_API_KEY` | *(unset → local hash fallback)* | Team-shared embedding key for semantic memory retrieval (bodies egress post-redaction — see the Setup tab disclosure) |
+| `COMBYNE_VECTOR_SEARCH_ENABLED` | `false` | Enable pgvector ANN retrieval (needs the embedding key + a pgvector-enabled DB) |
+| `COMBYNE_SUFFICIENCY_GATE_ENABLED` | `false` | Ask-don't-hallucinate gate — ships dark; enable after calibration |
 
 See [`.env.example`](.env.example) for the full env-var surface, grouped by section.
 
