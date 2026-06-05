@@ -335,6 +335,8 @@ export {
 
 export {
   createMemoryEntrySchema,
+  createGlobalMemoryEntrySchema,
+  memoryPromoteGlobalSchema,
   updateMemoryEntrySchema,
   memoryQuerySchema,
   memoryManifestQuerySchema,
@@ -345,6 +347,8 @@ export {
   memoryResolveConflictSchema,
   memoryResolveRedactionSchema,
   type CreateMemoryEntry,
+  type CreateGlobalMemoryEntry,
+  type MemoryPromoteGlobal,
   type UpdateMemoryEntry,
   type MemoryQuery,
   type MemoryManifestQuery,

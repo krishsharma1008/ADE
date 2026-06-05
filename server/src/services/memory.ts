@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   memoryEntries,
@@ -175,6 +175,9 @@ const LAYER_WEIGHT: Record<MemoryLayer, number> = {
   personal: 1.2,
   workspace: 1.0,
   shared: 0.95,
+  // Instance-wide global org conventions: weighted like shared (a peer cross-cut
+  // layer), so a global fact ranks comparably to a company's shared fact.
+  global: 1.0,
 };
 
 export interface RankInputEntry {
@@ -353,8 +356,19 @@ function splitCapturedQa(body: string): { question: string | null; answer: strin
 }
 
 export interface CreateEntryInput {
-  companyId: string;
+  /**
+   * Owning company. Required for workspace/personal/shared. For the instance-wide
+   * GLOBAL layer (0054) it is ignored and forced to NULL (global entries are
+   * company-agnostic).
+   */
+  companyId: string | null;
   layer: MemoryLayer;
+  /**
+   * GLOBAL-layer governance (0054): a layer='global' write is rejected unless the
+   * actor is an instance admin. Mirrors the shared-layer "promotion-only" gate.
+   * Threaded from the route (assertInstanceAdmin) — never from a raw request body.
+   */
+  isInstanceAdmin?: boolean;
   subject: string;
   body: string;
   kind?: string;
@@ -516,9 +530,18 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     if (input.layer === "shared") {
       throw new Error("shared entries must be created via promotion");
     }
+    // GLOBAL-layer governance (0054): an instance-wide global write requires an
+    // instance admin (mirrors the shared-layer write fence). A non-admin actor —
+    // including a company board — can never author a global row.
+    if (input.layer === "global" && !input.isInstanceAdmin) {
+      throw new Error("global entries require an instance admin");
+    }
     if (input.layer === "personal" && (!input.ownerType || !input.ownerId)) {
       throw new Error("personal entries require ownerType and ownerId");
     }
+    // Global entries are company-agnostic: company_id is NULL regardless of any
+    // company context the caller passed. Every other layer carries its company id.
+    const companyId = input.layer === "global" ? null : input.companyId;
     // PR-11: redact-before-embed + hash fallback. Writes the jsonb `embedding`
     // (oracle/fallback) + embedding_version always; the embedding_vec column is
     // written separately (best-effort) only on a real pgvector deployment.
@@ -557,7 +580,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     }
 
     const insertValues = {
-      companyId: input.companyId,
+      companyId,
       layer: input.layer,
       ownerType: input.layer === "personal" ? input.ownerType ?? null : null,
       ownerId: input.layer === "personal" ? input.ownerId ?? null : null,
@@ -613,7 +636,9 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
         .from(memoryEntries)
         .where(
           and(
-            eq(memoryEntries.companyId, input.companyId),
+            companyId === null
+              ? isNull(memoryEntries.companyId)
+              : eq(memoryEntries.companyId, companyId),
             eq(memoryEntries.source, input.source),
           ),
         )
@@ -741,7 +766,14 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     opts: QueryOptions,
     queryEmbedding?: QueryEmbedding,
   ): Promise<MemoryEntryRow[]> {
-    const filters = [eq(memoryEntries.companyId, companyId), eq(memoryEntries.status, "active")];
+    // Company scope UNION the instance-wide GLOBAL layer (0054): a query for any
+    // company surfaces its own rows AND the company-agnostic global rows
+    // (company_id = $companyId OR layer = 'global'). Per-company isolation for
+    // workspace/personal/shared is preserved — only global is cross-company.
+    const filters = [
+      or(eq(memoryEntries.companyId, companyId), eq(memoryEntries.layer, "global")),
+      eq(memoryEntries.status, "active"),
+    ];
     if (opts.layers && opts.layers.length > 0) {
       filters.push(inArray(memoryEntries.layer, opts.layers));
     }
@@ -825,7 +857,9 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     const literal = `[${queryEmbedding.vector.join(",")}]`;
     const k = Math.min(Math.max((opts.limit ?? 10) * 5, 50), 500);
     const conds = [
-      sql`company_id = ${companyId}`,
+      // Company scope UNION the instance-wide global layer (0054), mirroring the
+      // jsonb loadCandidates filter so the ANN path surfaces global rows too.
+      sql`(company_id = ${companyId} OR layer = 'global')`,
       sql`status = 'active'`,
       sql`embedding_vec IS NOT NULL`,
       sql`embedding_version = ${queryEmbedding.version}`,
@@ -947,6 +981,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       workspace: 0,
       personal: 0,
       shared: 0,
+      global: 0,
     };
     const items = topIds
       .map((r) => {
@@ -1000,20 +1035,25 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
 
   async function recordUsage(input: {
     entryId: string;
-    companyId: string;
+    // NULL for instance-wide global entries (0054): memory_usage.company_id is a
+    // NOT NULL uuid, so a company-agnostic global usage skips the per-company
+    // usage-event row but still bumps the entry's usageCount/lastUsedAt below.
+    companyId: string | null;
     issueId?: string | null;
     actorType: string;
     actorId?: string | null;
     score?: number | null;
   }): Promise<void> {
-    await cdb.insert(memoryUsage).values({
-      entryId: input.entryId,
-      companyId: input.companyId,
-      issueId: input.issueId ?? null,
-      actorType: input.actorType,
-      actorId: input.actorId ?? null,
-      score: input.score ?? null,
-    });
+    if (input.companyId !== null) {
+      await cdb.insert(memoryUsage).values({
+        entryId: input.entryId,
+        companyId: input.companyId,
+        issueId: input.issueId ?? null,
+        actorType: input.actorType,
+        actorId: input.actorId ?? null,
+        score: input.score ?? null,
+      });
+    }
     await cdb
       .update(memoryEntries)
       .set({
@@ -1237,6 +1277,52 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       contentHash: embedResult.contentHash,
     });
     return rowToEntry(row);
+  }
+
+  // ---------- 0054: instance-wide GLOBAL layer promotion ----------
+
+  /**
+   * Promote an existing company entry to the instance-wide GLOBAL layer (0054).
+   * Instance-admin only — the route gates this via assertInstanceAdmin and threads
+   * `isInstanceAdmin: true`. Copies a verified workspace/shared source row into a
+   * company-agnostic (company_id = NULL) global entry; the original is left intact.
+   * Returns null for an unknown source. Only workspace/shared (verified-tier) rows
+   * are promotable — a personal or already-global row is rejected so global stays
+   * an org-wide-conventions layer, never a leaked personal/duplicate row.
+   */
+  async function createGlobalFromEntry(input: {
+    sourceEntryId: string;
+    isInstanceAdmin: boolean;
+    createdBy?: string | null;
+  }): Promise<MemoryEntry | null> {
+    if (!input.isInstanceAdmin) {
+      throw new Error("global entries require an instance admin");
+    }
+    const source = await getEntry(input.sourceEntryId);
+    if (!source) return null;
+    if (source.layer !== "workspace" && source.layer !== "shared") {
+      throw new Error("only workspace/shared entries can be promoted to global");
+    }
+    // The createEntry write-gate writes the company-agnostic global row (company_id
+    // NULL) and re-runs redact-before-embed. Instance-admin lineage is trusted, so
+    // it lands verified/verified-summary/0.9 (mirrors the shared promotion stamp),
+    // unless a secret in the body re-quarantines it to needs_review.
+    return createEntry({
+      companyId: null,
+      layer: "global",
+      isInstanceAdmin: true,
+      subject: source.subject,
+      body: source.body,
+      kind: source.kind,
+      tags: source.tags,
+      serviceScope: source.serviceScope,
+      source: `global-promotion:${source.id}`,
+      provenance: "verified-summary",
+      verificationState: "verified",
+      confidence: 0.9,
+      authorType: "system",
+      createdBy: input.createdBy ?? null,
+    });
   }
 
   // ---------- PR-14: Capture / Verify / Conflicts ----------
@@ -1817,6 +1903,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     proposePromotion,
     listPromotions,
     decidePromotion,
+    createGlobalFromEntry,
     captureInbox,
     questions,
     verifyQueue,

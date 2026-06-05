@@ -156,7 +156,7 @@ export function passdownService(db: Db) {
     // confidence floor. This is the channel that makes the packet "vetted".
     let ranked: Awaited<ReturnType<typeof memory.queryRanked>> = {
       items: [],
-      layerCounts: { workspace: 0, personal: 0, shared: 0 },
+      layerCounts: { workspace: 0, personal: 0, shared: 0, global: 0 },
     };
     if (query.trim().length > 0) {
       ranked = await memory.queryRanked(input.companyId, query, {

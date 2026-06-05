@@ -49,7 +49,46 @@ export const createMemoryEntrySchema = z
       message:
         "shared layer entries cannot be created directly; promote a workspace/personal entry instead",
     },
+  )
+  .refine(
+    // GLOBAL (0054) is instance-wide and company-agnostic, so it cannot be
+    // authored through the per-company create endpoint. It has its own
+    // instance-admin-gated routes (POST /memory/global/entries|promote). Reject
+    // it here for a clean 400 (the service write-gate is the defense-in-depth).
+    (v) => (v.layer === "global" ? false : true),
+    {
+      message:
+        "global layer entries cannot be created via the company endpoint; use the instance-admin global routes",
+    },
   );
+
+/**
+ * Instance-wide GLOBAL layer create (0054). Global entries are company-agnostic
+ * (companyId NULL, instance-wide) and require an instance-admin actor (gated at
+ * the route via assertInstanceAdmin). They carry no ownerType/ownerId — the
+ * companyId-less shape is the whole point — so the body never references a
+ * company. Subject/body/kind/tags mirror the standard create shape.
+ */
+export const createGlobalMemoryEntrySchema = z.object({
+  subject: z.string().min(1).max(512),
+  body: z.string().min(1).max(20_000),
+  kind: z.enum(MEMORY_KINDS).optional().default("fact"),
+  tags: tagsSchema,
+  serviceScope: z.string().max(128).optional().nullable(),
+  source: z.string().max(512).optional().nullable(),
+  ttlDays: z.number().int().positive().max(3650).optional().nullable(),
+});
+export type CreateGlobalMemoryEntry = z.infer<typeof createGlobalMemoryEntrySchema>;
+
+/**
+ * Promote an existing verified workspace/shared entry to the instance-wide GLOBAL
+ * layer (0054). Instance-admin only (route-gated). The source entry is copied
+ * into a company-agnostic global row; the original is left intact.
+ */
+export const memoryPromoteGlobalSchema = z.object({
+  sourceEntryId: z.string().uuid(),
+});
+export type MemoryPromoteGlobal = z.infer<typeof memoryPromoteGlobalSchema>;
 
 export type CreateMemoryEntry = z.infer<typeof createMemoryEntrySchema>;
 

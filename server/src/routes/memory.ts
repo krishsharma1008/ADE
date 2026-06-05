@@ -6,6 +6,8 @@ import type { MemoryPassdownPacket } from "@combyne/shared";
 import { isPassdownPacket } from "../services/em-passdown.js";
 import {
   createMemoryEntrySchema,
+  createGlobalMemoryEntrySchema,
+  memoryPromoteGlobalSchema,
   updateMemoryEntrySchema,
   memoryQuerySchema,
   memoryManifestQuerySchema,
@@ -23,7 +25,7 @@ import {
 } from "@combyne/shared";
 import { validate } from "../middleware/validate.js";
 import { memoryService, logActivity } from "../services/index.js";
-import { assertCompanyAccess, getActorInfo, assertBoard } from "./authz.js";
+import { assertCompanyAccess, getActorInfo, assertBoard, assertInstanceAdmin } from "./authz.js";
 import { forbidden } from "../errors.js";
 
 export function memoryRoutes(db: Db) {
@@ -104,6 +106,73 @@ export function memoryRoutes(db: Db) {
         entityId: entry.id,
         details: { layer: entry.layer, subject: entry.subject },
       });
+      res.status(201).json(entry);
+    },
+  );
+
+  // ---------- 0054: instance-wide GLOBAL layer ----------
+
+  // Create an instance-wide GLOBAL entry (company-agnostic, company_id NULL).
+  // Instance-admin ONLY (assertInstanceAdmin) — mirrors the shared-layer write
+  // fence, but governed at the instance tier rather than the company board. A
+  // global entry is retrievable by EVERY company on the instance.
+  router.post(
+    "/memory/global/entries",
+    validate(createGlobalMemoryEntrySchema),
+    async (req, res) => {
+      assertInstanceAdmin(req);
+      const actor = getActorInfo(req);
+      const body = req.body as ReturnType<typeof createGlobalMemoryEntrySchema.parse>;
+      const entry = await svc.createEntry({
+        companyId: null,
+        layer: "global",
+        isInstanceAdmin: true,
+        subject: body.subject,
+        body: body.body,
+        kind: body.kind,
+        tags: body.tags,
+        serviceScope: body.serviceScope ?? null,
+        source: body.source ?? null,
+        ttlDays: body.ttlDays ?? null,
+        createdBy: actor.actorId,
+        // Instance-admin-authored global facts are board-tier human content.
+        provenance: "verified-summary",
+        verificationState: "verified",
+        confidence: 0.9,
+        authorType: "user",
+        authorId: actor.actorId,
+      });
+      res.status(201).json(entry);
+    },
+  );
+
+  // Promote an existing verified workspace/shared entry to the GLOBAL layer.
+  // Instance-admin ONLY. Copies the source into a company-agnostic global row;
+  // the original is left intact.
+  router.post(
+    "/memory/global/promote",
+    validate(memoryPromoteGlobalSchema),
+    async (req, res) => {
+      assertInstanceAdmin(req);
+      const actor = getActorInfo(req);
+      const body = req.body as ReturnType<typeof memoryPromoteGlobalSchema.parse>;
+      let entry;
+      try {
+        entry = await svc.createGlobalFromEntry({
+          sourceEntryId: body.sourceEntryId,
+          isInstanceAdmin: true,
+          createdBy: actor.actorId,
+        });
+      } catch (err) {
+        res.status(400).json({
+          error: err instanceof Error ? err.message : "Failed to promote to global",
+        });
+        return;
+      }
+      if (!entry) {
+        res.status(404).json({ error: "Source entry not found" });
+        return;
+      }
       res.status(201).json(entry);
     },
   );
@@ -197,9 +266,13 @@ export function memoryRoutes(db: Db) {
       if (existing.layer === "shared" && actor.actorType !== "user") {
         throw forbidden("shared entries can only be modified by a board user");
       }
+      // Instance-wide GLOBAL entries (0054) are governed at the instance tier.
+      if (existing.layer === "global") {
+        assertInstanceAdmin(req);
+      }
       const updated = await svc.updateEntry(id, req.body);
       await logActivity(db, {
-        companyId: existing.companyId,
+        companyId: existing.companyId ?? "instance",
         actorType: actor.actorType,
         actorId: actor.actorId,
         agentId: actor.agentId,
@@ -232,9 +305,13 @@ export function memoryRoutes(db: Db) {
     if (existing.layer === "shared") {
       assertBoard(req);
     }
+    // Instance-wide GLOBAL entries (0054) are governed at the instance tier.
+    if (existing.layer === "global") {
+      assertInstanceAdmin(req);
+    }
     const archived = await svc.archiveEntry(id);
     await logActivity(db, {
-      companyId: existing.companyId,
+      companyId: existing.companyId ?? "instance",
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
@@ -332,6 +409,8 @@ export function memoryRoutes(db: Db) {
       const actor = getActorInfo(req);
       const body = req.body as ReturnType<typeof memoryRecordUsageSchema.parse>;
       await svc.recordUsage({
+        // Global entries carry company_id = NULL; recordUsage skips the per-company
+        // usage-event row for those but still bumps the entry's usageCount.
         entryId: id,
         companyId: existing.companyId,
         issueId: body.issueId ?? null,
@@ -467,7 +546,7 @@ export function memoryRoutes(db: Db) {
       return;
     }
     await logActivity(db, {
-      companyId: existing.companyId,
+      companyId: existing.companyId ?? "instance",
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
@@ -568,7 +647,7 @@ export function memoryRoutes(db: Db) {
         return;
       }
       await logActivity(db, {
-        companyId: existing.companyId,
+        companyId: existing.companyId ?? "instance",
         actorType: actor.actorType,
         actorId: actor.actorId,
         agentId: actor.agentId,

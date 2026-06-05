@@ -1,4 +1,4 @@
-export const MEMORY_LAYERS = ["workspace", "personal", "shared"] as const;
+export const MEMORY_LAYERS = ["workspace", "personal", "shared", "global"] as const;
 export type MemoryLayer = (typeof MEMORY_LAYERS)[number];
 
 export const MEMORY_KINDS = ["fact", "runbook", "convention", "pointer", "note"] as const;
@@ -40,7 +40,11 @@ export type MemoryPromotionState = (typeof MEMORY_PROMOTION_STATES)[number];
 
 export interface MemoryEntry {
   id: string;
-  companyId: string;
+  /**
+   * Owning company. NULL only for instance-wide GLOBAL-layer entries (0054),
+   * which are company-agnostic. Every other layer carries a real company id.
+   */
+  companyId: string | null;
   layer: MemoryLayer;
   ownerType: MemoryOwnerType | null;
   ownerId: string | null;

@@ -15,9 +15,16 @@ export function assertInstanceAdmin(req: Request) {
   throw forbidden("Instance admin access required");
 }
 
-export function assertCompanyAccess(req: Request, companyId: string) {
+export function assertCompanyAccess(req: Request, companyId: string | null) {
   if (req.actor.type === "none") {
     throw unauthorized();
+  }
+  // Instance-wide GLOBAL entries (0054) carry company_id = NULL. They are not
+  // owned by any company, so per-company scoping does not apply — any
+  // authenticated actor may READ them (the cross-company visibility is the point).
+  // Mutating a global entry is gated separately by assertInstanceAdmin at the route.
+  if (companyId === null) {
+    return;
   }
   if (req.actor.type === "agent" && req.actor.companyId !== companyId) {
     throw forbidden("Agent key cannot access another company");

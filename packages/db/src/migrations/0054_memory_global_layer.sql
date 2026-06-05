@@ -1,0 +1,20 @@
+-- 0054 — Instance-wide GLOBAL memory layer
+-- (cross-company knowledge shared across ALL companies on the instance).
+--
+-- The GLOBAL layer sits ABOVE the per-company `shared` layer: org-wide
+-- conventions that every company on the instance should see (e.g. instance-wide
+-- engineering standards). Unlike workspace/personal/shared (which are owned by a
+-- single company via memory_entries.company_id), a global entry is owned by NO
+-- company — it is instance-wide. To represent "not owned by a company" we let a
+-- global entry carry company_id = NULL.
+--
+-- The FK from memory_entries.company_id → companies.id was already dropped in
+-- 0053 (the context-DB decouple), so company_id is a plain uuid here — this
+-- migration only needs to DROP the NOT NULL so global rows can be NULL.
+--
+-- Retrieval (loadCandidates / queryRanked) unions a querying company's rows with
+-- ALL global rows: filter becomes (company_id = $companyId OR layer = 'global').
+-- Per-company isolation for workspace/shared is unchanged; only the new global
+-- layer is cross-company. Writing a global entry requires an instance-admin
+-- (route-gated via assertInstanceAdmin).
+ALTER TABLE "memory_entries" ALTER COLUMN "company_id" DROP NOT NULL;

@@ -192,6 +192,178 @@ describe("central-db integration — A) no context bleed (single-DB)", () => {
   });
 });
 
+describe("central-db integration — G) instance-wide GLOBAL layer (cross-company + governance)", () => {
+  let handle: TestDbHandle;
+  let companyA: string;
+  let companyB: string;
+
+  beforeAll(async () => {
+    handle = await startTestDb();
+    companyA = await makeCompany(handle.db, "GlobalCoA");
+    companyB = await makeCompany(handle.db, "GlobalCoB");
+  }, 120_000);
+
+  afterAll(async () => {
+    await stopTestDb();
+  });
+
+  it("G1: an instance-admin global entry is retrievable by queryRanked for company A AND company B (cross-company visibility)", async () => {
+    const svc = memoryService(handle.db);
+    // Instance-admin creates an instance-wide global org convention (company_id NULL).
+    const globalEntry = await svc.createEntry({
+      companyId: null,
+      layer: "global",
+      isInstanceAdmin: true,
+      subject: "Globalconv quaffle org-wide commit message convention",
+      body: "All commit messages across the instance must reference a ticket id.",
+      tags: ["convention"],
+      provenance: "verified-summary",
+      verificationState: "verified",
+      confidence: 0.9,
+      authorType: "user",
+    });
+    expect(globalEntry.layer).toBe("global");
+    expect(globalEntry.companyId).toBeNull();
+
+    // Visible to company A …
+    const asA = await svc.queryRanked(companyA, "globalconv quaffle commit message convention", {
+      limit: 25,
+    });
+    expect(asA.items.map((i) => i.id)).toContain(globalEntry.id);
+
+    // … and to a DIFFERENT company B (the cross-company point).
+    const asB = await svc.queryRanked(companyB, "globalconv quaffle commit message convention", {
+      limit: 25,
+    });
+    expect(asB.items.map((i) => i.id)).toContain(globalEntry.id);
+  });
+
+  it("G2: a non-admin cannot create a global entry (governance fence)", async () => {
+    const svc = memoryService(handle.db);
+    // No isInstanceAdmin flag → rejected.
+    await expect(
+      svc.createEntry({
+        companyId: companyA,
+        layer: "global",
+        subject: "Globalconv unauthorized attempt",
+        body: "A non-admin must never write a global entry.",
+      }),
+    ).rejects.toThrow(/instance admin/i);
+    // Explicit isInstanceAdmin: false is likewise rejected.
+    await expect(
+      svc.createEntry({
+        companyId: companyA,
+        layer: "global",
+        isInstanceAdmin: false,
+        subject: "Globalconv unauthorized attempt 2",
+        body: "Still a non-admin.",
+      }),
+    ).rejects.toThrow(/instance admin/i);
+  });
+
+  it("G3: per-company isolation preserved — a company-A workspace entry is NOT visible to company B", async () => {
+    const svc = memoryService(handle.db);
+    const aWorkspace = await svc.createEntry({
+      companyId: companyA,
+      layer: "workspace",
+      subject: "Companyiso bludger company-A only deployment runbook",
+      body: "Company A deploys via the blue-green pipeline only.",
+      tags: ["deploy"],
+    });
+    // Company A sees its own workspace row.
+    const asA = await svc.queryRanked(companyA, "companyiso bludger company-A deployment runbook", {
+      limit: 25,
+    });
+    expect(asA.items.map((i) => i.id)).toContain(aWorkspace.id);
+    // Company B NEVER sees company A's workspace row (isolation intact despite the global union).
+    const asB = await svc.queryRanked(companyB, "companyiso bludger company-A deployment runbook", {
+      limit: 25,
+    });
+    expect(asB.items.map((i) => i.id)).not.toContain(aWorkspace.id);
+  });
+
+  it("G4: conflict/ranking still work with a global entry present (global ranks, dedups by subjectKey like any layer)", async () => {
+    const svc = memoryService(handle.db);
+    const subject = "Globalrank snitch retention window is fourteen days";
+    // A global verified entry and a company-A agent-claim sharing the same subjectKey.
+    const globalEntry = await svc.createEntry({
+      companyId: null,
+      layer: "global",
+      isInstanceAdmin: true,
+      subject,
+      body: "Instance-wide: the snitch retention window is 14 days.",
+      tags: ["snitch"],
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.95,
+      authorType: "user",
+    });
+    const agentClaim = await svc.createEntry({
+      companyId: companyA,
+      layer: "workspace",
+      subject,
+      body: "Agent claim: the snitch retention window is 30 days.",
+      tags: ["snitch"],
+      provenance: "agent-claim",
+      authorType: "agent",
+    });
+    // Same subjectKey → they conflict; provenance precedence keeps the global
+    // human-answer and drops the agent-claim loser, exactly like the per-company path.
+    const globalRow = await svc.getEntry(globalEntry.id);
+    const agentRow = await svc.getEntry(agentClaim.id);
+    expect(globalRow!.subjectKey).toBe(agentRow!.subjectKey);
+    expect(globalRow!.subjectKey).toBeTruthy();
+
+    const res = await svc.queryRanked(companyA, "globalrank snitch retention window fourteen days", {
+      limit: 25,
+    });
+    const ids = res.items.map((i) => i.id);
+    expect(ids).toContain(globalEntry.id);
+    expect(ids).not.toContain(agentClaim.id);
+    // The surviving global hit is counted under the 'global' layer bucket.
+    expect(res.layerCounts.global).toBeGreaterThanOrEqual(1);
+  });
+
+  it("G5: createGlobalFromEntry promotes a verified workspace entry to a company-agnostic global row (instance-admin only)", async () => {
+    const svc = memoryService(handle.db);
+    const source = await svc.createEntry({
+      companyId: companyA,
+      layer: "workspace",
+      subject: "Globalpromote thestral shared security baseline",
+      body: "Rotate all service credentials every 90 days.",
+      tags: ["security"],
+      provenance: "human-answer",
+      verificationState: "verified",
+      confidence: 0.95,
+      authorType: "user",
+    });
+    // A non-admin promote is rejected.
+    await expect(
+      svc.createGlobalFromEntry({ sourceEntryId: source.id, isInstanceAdmin: false }),
+    ).rejects.toThrow(/instance admin/i);
+
+    // Instance-admin promote lands a company-agnostic global copy; original intact.
+    const promoted = await svc.createGlobalFromEntry({
+      sourceEntryId: source.id,
+      isInstanceAdmin: true,
+    });
+    expect(promoted).toBeTruthy();
+    expect(promoted!.layer).toBe("global");
+    expect(promoted!.companyId).toBeNull();
+    expect(promoted!.verificationState).toBe("verified");
+    // The original company-A workspace row is untouched and still company-scoped.
+    const original = await svc.getEntry(source.id);
+    expect(original!.layer).toBe("workspace");
+    expect(original!.companyId).toBe(companyA);
+
+    // The promoted global row is visible cross-company (to B too).
+    const asB = await svc.queryRanked(companyB, "globalpromote thestral shared security baseline", {
+      limit: 25,
+    });
+    expect(asB.items.map((i) => i.id)).toContain(promoted!.id);
+  });
+});
+
 describe("central-db integration — A3) 2-DB mode physical separation + tenant isolation", () => {
   let main: TestDbHandle;
   let context: TestDbHandle;

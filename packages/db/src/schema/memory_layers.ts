@@ -63,8 +63,11 @@ export const memoryEntries = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     // Logical reference to companies.id in the MAIN DB (FK dropped in 0053 so the
     // memory layer can live in a separate context DB). Keeps its value, not enforced.
-    companyId: uuid("company_id").notNull(),
-    layer: text("layer").notNull(), // 'workspace' | 'personal' | 'shared'
+    // NULLABLE since 0054: instance-wide GLOBAL entries are company-agnostic and
+    // carry company_id = NULL (not owned by any single company). All other layers
+    // (workspace/personal/shared) still always carry a real company_id.
+    companyId: uuid("company_id"),
+    layer: text("layer").notNull(), // 'workspace' | 'personal' | 'shared' | 'global'
     ownerType: text("owner_type"), // 'user' | 'agent' | null (workspace/shared)
     ownerId: text("owner_id"), // principal id; not always a uuid (e.g. 'local-board')
     subject: text("subject").notNull(),

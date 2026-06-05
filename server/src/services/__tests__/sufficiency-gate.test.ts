@@ -172,7 +172,7 @@ describe("sufficiency gate — budget + dark no-op", () => {
     process.env[GATE_FLAG] = "true";
     const issue = await freshIssue("Enabled gate issue");
 
-    const ranked = { items: [], layerCounts: { workspace: 0, personal: 0, shared: 0 } };
+    const ranked = { items: [], layerCounts: { workspace: 0, personal: 0, shared: 0, global: 0 } };
     const events: SufficiencyTelemetryEvent[] = [];
     const outcome = await maybeRunSufficiencyGate(handle.db, {
       companyId,
@@ -237,7 +237,7 @@ describe("sufficiency gate — budget + dark no-op", () => {
           snippet: "",
         },
       ],
-      layerCounts: { workspace: 1, personal: 0, shared: 0 },
+      layerCounts: { workspace: 1, personal: 0, shared: 0, global: 0 },
     };
     const outcome = await maybeRunSufficiencyGate(handle.db, {
       companyId,
