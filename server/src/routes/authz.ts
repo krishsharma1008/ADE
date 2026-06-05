@@ -15,7 +15,7 @@ export function assertInstanceAdmin(req: Request) {
   throw forbidden("Instance admin access required");
 }
 
-export function assertCompanyAccess(req: Request, companyId: string | null) {
+export function assertCompanyAccess(req: Request, companyId: string | null | undefined) {
   if (req.actor.type === "none") {
     throw unauthorized();
   }
@@ -25,6 +25,14 @@ export function assertCompanyAccess(req: Request, companyId: string | null) {
   // Mutating a global entry is gated separately by assertInstanceAdmin at the route.
   if (companyId === null) {
     return;
+  }
+  // Fail-closed (PR-17): an EMPTY-STRING or undefined companyId is an
+  // unresolved/missing scope, NOT the deliberate global-layer null above. Allowing
+  // it through would let a principal — including local_implicit / isInstanceAdmin
+  // (who otherwise skip the per-company checks below) — operate with no company
+  // bound, the narrow real gap. Reject it for ALL principals before any bypass.
+  if (companyId === undefined || companyId === "") {
+    throw forbidden("Company scope is required");
   }
   if (req.actor.type === "agent" && req.actor.companyId !== companyId) {
     throw forbidden("Agent key cannot access another company");
