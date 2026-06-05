@@ -1349,6 +1349,66 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
   }
 
   /**
+   * Redaction queue (§3.6 / §1.4 — the blocking redact-before-embed gate). Lists
+   * active, non-superseded `needs_review` entries: the secret-quarantine bucket
+   * that was held OUT of retrieval because the body-text scanner found a
+   * credential-shape (or a human force-flagged it). Board-only at the route. The
+   * body is the raw (already redacted-in-storage) text; the UI masks it by
+   * default and only reveals on an explicit, audited board click.
+   */
+  async function redactionQueue(companyId: string): Promise<MemoryEntry[]> {
+    const rows = await cdb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.status, "active"),
+          eq(memoryEntries.verificationState, "needs_review"),
+          isNull(memoryEntries.supersededById),
+        ),
+      )
+      .orderBy(desc(memoryEntries.createdAt))
+      .limit(100);
+    return rows.map(rowToEntry);
+  }
+
+  /**
+   * Resolve a redaction-queue entry (§3.6). Board-only at the route.
+   *  - `approve` (approve-as-clean): a human judged the body holds no live
+   *    secret → clear the quarantine to `verified`, stamping verifiedBy/At so it
+   *    re-enters retrieval. Mirrors the verifyEntry trust stamp.
+   *  - `reject` (keep-redacted): the entry stays out of retrieval → archive it
+   *    (status='archived'), preserving the row for audit but never re-surfacing.
+   * Returns null for an unknown id or an entry not actually in needs_review.
+   */
+  async function resolveRedaction(
+    id: string,
+    action: "approve" | "reject",
+    resolvedBy: string,
+  ): Promise<MemoryEntry | null> {
+    const existing = await getEntry(id);
+    if (!existing) return null;
+    if (existing.verificationState !== "needs_review") return null;
+    if (action === "approve") {
+      const [row] = await cdb
+        .update(memoryEntries)
+        .set({
+          verificationState: "verified",
+          verifiedBy: resolvedBy,
+          verifiedAt: new Date(),
+          confidence: Math.max(existing.confidence, 0.7),
+          updatedAt: new Date(),
+        })
+        .where(eq(memoryEntries.id, id))
+        .returning();
+      return row ? rowToEntry(row) : null;
+    }
+    // reject → keep-redacted: archive so it never re-enters retrieval.
+    return archiveEntry(id);
+  }
+
+  /**
    * Detected conflicts (§3.5, decision #5 — THE first-class ask). Groups active,
    * non-superseded human-answer entries by subjectKey, keeping only the groups
    * with >1 DISTINCT body (a real disagreement, not an idempotent duplicate).
@@ -1700,6 +1760,8 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     captureInbox,
     verifyQueue,
     verifyEntry,
+    redactionQueue,
+    resolveRedaction,
     listConflicts,
     resolveConflict,
     runDecayPass,

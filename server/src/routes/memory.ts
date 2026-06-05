@@ -10,6 +10,7 @@ import {
   memoryProposePromotionSchema,
   memoryDecidePromotionSchema,
   memoryResolveConflictSchema,
+  memoryResolveRedactionSchema,
   MEMORY_PROVENANCES,
   MEMORY_VERIFICATION_STATES,
   type MemoryOwnerType,
@@ -515,6 +516,53 @@ export function memoryRoutes(db: Db) {
         details: { subjectKey },
       });
       res.json(canonical);
+    },
+  );
+
+  // ---------- PR-15: Redaction queue (§3.6, the blocking redact-before-embed gate) ----------
+
+  // Lists `needs_review` entries held OUT of retrieval (secret-quarantine).
+  // Board-only because the bodies can carry credential shapes. The UI masks the
+  // body by default and only reveals on an explicit, audited board click.
+  router.get("/companies/:companyId/memory/redaction-queue", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const entries = await svc.redactionQueue(companyId);
+    res.json(entries);
+  });
+
+  // Resolve a redaction entry: approve-as-clean (→ verified, re-enters retrieval)
+  // or reject/keep-redacted (→ archived). Board-only.
+  router.post(
+    "/memory/entries/:id/redaction/resolve",
+    validate(memoryResolveRedactionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const existing = await svc.getEntry(id);
+      if (!existing) {
+        res.status(404).json({ error: "Memory entry not found" });
+        return;
+      }
+      assertCompanyAccess(req, existing.companyId);
+      assertBoard(req);
+      const actor = getActorInfo(req);
+      const body = req.body as ReturnType<typeof memoryResolveRedactionSchema.parse>;
+      const resolved = await svc.resolveRedaction(id, body.action, actor.actorId);
+      if (!resolved) {
+        res.status(404).json({ error: "No needs_review entry for that id" });
+        return;
+      }
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: `memory.redaction.${body.action}`,
+        entityType: "memory_entry",
+        entityId: id,
+      });
+      res.json(resolved);
     },
   );
 

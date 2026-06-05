@@ -106,6 +106,18 @@ async function probeContextDb(url: string): Promise<ProbeResult> {
 
 const urlBodySchema = z.object({ url: z.string().min(1) });
 
+// PR-15 §3.7 — embedding-config write. The team-shared key is write-only: it is
+// persisted to config.json (0600 via writeConfigFile) and NEVER returned by any
+// endpoint. provider/model/dim and the disclosure-ack flag are non-secret and
+// may be echoed. disclosureAcked MUST be true — the privacy reconciliation
+// acknowledge gate (§1.0/§1.5) is blocking before any key is stored.
+const embeddingConfigSchema = z.object({
+  provider: z.string().min(1).max(64),
+  model: z.string().min(1).max(128),
+  apiKey: z.string().min(1).max(512),
+  disclosureAcked: z.literal(true),
+});
+
 export function contextDatabaseRoutes(db: Db) {
   const router = Router();
 
@@ -179,6 +191,41 @@ export function contextDatabaseRoutes(db: Db) {
         saved: true,
         restartRequired: true,
         redactedEndpoint: redactDbUrl(url),
+      });
+    },
+  );
+
+  // (4) PR-15 §3.7 — persist the team-shared embedding config (provider/model +
+  // the write-only API key + the privacy disclosure ack). instance-admin only.
+  // The key is merge-written into config.json (0600) and NEVER echoed back in
+  // the response. Restart required (mirrors the context-DB save). Validation
+  // requires disclosureAcked===true — the acknowledge gate is blocking.
+  router.post(
+    "/instance/embedding-config",
+    validate(embeddingConfigSchema),
+    async (req, res) => {
+      assertInstanceAdmin(req);
+      const { provider, model, apiKey, disclosureAcked } = req.body as {
+        provider: string;
+        model: string;
+        apiKey: string;
+        disclosureAcked: true;
+      };
+      // 0600 merge-write. The key lands as embeddingApiKey; loadConfig resolves
+      // it on next boot (env still wins). NEVER returned in any response.
+      writeConfigFile({
+        embeddingProvider: provider,
+        embeddingModel: model,
+        embeddingApiKey: apiKey,
+        embeddingDisclosureAcked: disclosureAcked,
+      });
+      res.json({
+        saved: true,
+        restartRequired: true,
+        provider,
+        model,
+        disclosureAcked,
+        // The key is intentionally absent — write-only, never echoed.
       });
     },
   );

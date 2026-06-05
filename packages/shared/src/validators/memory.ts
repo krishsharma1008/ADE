@@ -128,3 +128,15 @@ export const memoryResolveConflictSchema = z.object({
   body: z.string().min(1).max(20_000).optional(),
 });
 export type MemoryResolveConflict = z.infer<typeof memoryResolveConflictSchema>;
+
+/**
+ * PR-15 redaction-queue resolution (§3.6 — the blocking redact-before-embed
+ * gate). Board-only at the route.
+ *  - approve (approve-as-clean): clear the `needs_review` quarantine → verified,
+ *    so the entry re-enters retrieval.
+ *  - reject (keep-redacted): archive the entry so it never re-surfaces.
+ */
+export const memoryResolveRedactionSchema = z.object({
+  action: z.enum(["approve", "reject"]),
+});
+export type MemoryResolveRedaction = z.infer<typeof memoryResolveRedactionSchema>;

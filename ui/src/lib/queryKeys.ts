@@ -89,6 +89,11 @@ export const queryKeys = {
     captureInbox: (companyId: string) => ["memory", companyId, "capture-inbox"] as const,
     verifyQueue: (companyId: string) => ["memory", companyId, "verify-queue"] as const,
     conflicts: (companyId: string) => ["memory", companyId, "conflicts"] as const,
+    redactionQueue: (companyId: string) => ["memory", companyId, "redaction-queue"] as const,
+    embeddingStatus: (companyId: string) => ["memory", companyId, "embedding-status"] as const,
+  },
+  contextDatabase: {
+    status: ["instance", "context-database"] as const,
   },
   qa: {
     summary: (companyId: string) => ["qa", companyId, "summary"] as const,

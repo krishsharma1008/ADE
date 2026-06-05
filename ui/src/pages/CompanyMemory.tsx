@@ -11,21 +11,38 @@ import { useCompany } from "../context/CompanyContext";
 import { memoryApi } from "../api/memory";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
+import { databaseApi } from "../api/database";
+import { ApiError } from "../api/client";
 import { MemoryBrowse } from "./memory/MemoryBrowse";
 import { MemoryCaptureReview } from "./memory/MemoryCaptureReview";
 import { MemoryVerifyQueue } from "./memory/MemoryVerifyQueue";
 import { MemoryConflicts } from "./memory/MemoryConflicts";
+import { MemoryRedactionQueue } from "./memory/MemoryRedactionQueue";
+import { MemoryDatabase } from "./memory/MemoryDatabase";
+import { MemorySetup } from "./memory/MemorySetup";
 
 function formatDate(value: string | null) {
   if (!value) return "Never";
   return new Date(value).toLocaleString();
 }
 
-// Path-driven tabs (mirrors Approvals.tsx). PR-13 shipped Browse; PR-14 adds the
-// capture/verify/conflicts queues. Later slices (PR-15..16) add setup/redaction/
-// questions/passdown alongside them.
-const TABS = ["browse", "capture", "verify", "conflicts"] as const;
+// Path-driven tabs (mirrors Approvals.tsx). PR-13 shipped Browse; PR-14 added the
+// capture/verify/conflicts queues; PR-15 adds the redaction queue (board) and the
+// database/setup admin tabs (instance-admin only — hidden for non-admins).
+const TABS = [
+  "browse",
+  "capture",
+  "verify",
+  "conflicts",
+  "redaction",
+  "database",
+  "setup",
+] as const;
 type MemoryTab = (typeof TABS)[number];
+
+// Tabs gated to instance-admins. They are hidden from the tab bar for non-admins
+// AND their endpoints are instance-admin gated server-side (defense in depth).
+const ADMIN_TABS: ReadonlySet<MemoryTab> = new Set(["database", "setup"]);
 
 function resolveTab(segment: string | undefined): MemoryTab {
   return (TABS as readonly string[]).includes(segment ?? "") ? (segment as MemoryTab) : "browse";
@@ -62,9 +79,29 @@ export function CompanyMemory() {
     enabled: !!selectedCompanyId,
   });
 
+  // Instance-admin probe: the context-DB status endpoint is instance-admin gated
+  // and 403s for everyone else, so a successful fetch == this user can manage the
+  // instance. We use it only to decide whether to surface the Database/Setup
+  // admin tabs (the endpoints enforce the gate regardless). A 403 is a definitive
+  // "not admin" — never retried.
+  const adminProbe = useQuery({
+    queryKey: queryKeys.contextDatabase.status,
+    queryFn: () => databaseApi.getStatus(),
+    retry: (_count, error) => !(error instanceof ApiError && error.status === 403),
+    staleTime: 5 * 60 * 1000,
+  });
+  // Fail CLOSED: admin tabs stay hidden until the gated probe definitively
+  // succeeds. Loading and transient (non-403) errors keep this false, so the
+  // UI gate matches the server gate and the admin tabs never flash for a
+  // non-admin. (The endpoints are server-gated regardless; this is UX hygiene.)
+  const isInstanceAdmin = adminProbe.isSuccess;
+
   if (!selectedCompanyId) {
     return <EmptyState icon={Brain} message="Select a company to view shared memory." />;
   }
+
+  // Never render an admin-only tab's body for a non-admin, even via a deep link.
+  const effectiveTab: MemoryTab = ADMIN_TABS.has(tab) && !isInstanceAdmin ? "browse" : tab;
 
   const pendingEvents = (eventsQuery.data ?? []).filter(
     (event) => event.memoryStatus === "pending",
@@ -94,23 +131,33 @@ export function CompanyMemory() {
         </div>
       </div>
 
-      <Tabs value={tab} onValueChange={(v) => navigate(`/memory/${v}`)}>
+      <Tabs value={effectiveTab} onValueChange={(v) => navigate(`/memory/${v}`)}>
         <PageTabBar
           items={[
             { value: "browse", label: "Browse" },
             { value: "capture", label: "Capture" },
             { value: "verify", label: "Verify" },
             { value: "conflicts", label: "Conflicts" },
+            { value: "redaction", label: "Redaction" },
+            ...(isInstanceAdmin
+              ? [
+                  { value: "database", label: "Database" },
+                  { value: "setup", label: "Setup" },
+                ]
+              : []),
           ]}
         />
       </Tabs>
 
-      {tab === "browse" && <MemoryBrowse />}
-      {tab === "capture" && <MemoryCaptureReview />}
-      {tab === "verify" && <MemoryVerifyQueue />}
-      {tab === "conflicts" && <MemoryConflicts />}
+      {effectiveTab === "browse" && <MemoryBrowse />}
+      {effectiveTab === "capture" && <MemoryCaptureReview />}
+      {effectiveTab === "verify" && <MemoryVerifyQueue />}
+      {effectiveTab === "conflicts" && <MemoryConflicts />}
+      {effectiveTab === "redaction" && <MemoryRedactionQueue />}
+      {effectiveTab === "database" && <MemoryDatabase />}
+      {effectiveTab === "setup" && <MemorySetup />}
 
-      {tab === "browse" && (
+      {effectiveTab === "browse" && (
       <section>
         <div className="mb-2 flex items-center gap-2">
           <GitPullRequest className="h-4 w-4 text-muted-foreground" />

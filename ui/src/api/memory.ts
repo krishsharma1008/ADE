@@ -25,6 +25,33 @@ export interface MemoryEntryFilters {
   age?: number;
 }
 
+/**
+ * Embedding-stack ops snapshot (PR-15 §1.9 / Setup tab). Surfaced from
+ * GET /memory/embedding-status (board-scoped server-side). Mirrors the server
+ * EmbeddingStatus interface; kept local because that type is server-only.
+ */
+export interface MemoryEmbeddingStatus {
+  embedderEnabled: boolean;
+  currentVersion: string;
+  activeEntries: number;
+  /** Fraction (0..1) of active entries on the current model. */
+  versionCoveragePct: number;
+  /** Fraction (0..1) of active entries stuck on the hash-64 fallback. */
+  hashFallbackPct: number;
+  versionBreakdown: Record<string, number>;
+  /** Active entries off the current version (the re-embed backlog). */
+  reembedBacklog: number;
+  /** Active entries quarantined to needs_review (redaction-blocked). */
+  redactionBlocked: number;
+  hnswIndexPresent: boolean;
+  pgvectorPresent: boolean;
+  queryHashFallbacks: number;
+  truncations: number;
+}
+
+/** Redaction-queue resolution action (PR-15 §3.6). */
+export type MemoryRedactionResolveAction = "approve" | "reject";
+
 export const memoryApi = {
   listEntries: (companyId: string, filters?: MemoryEntryFilters) => {
     const params = new URLSearchParams();
@@ -83,4 +110,12 @@ export const memoryApi = {
       `/companies/${companyId}/memory/conflicts/${encodeURIComponent(subjectKey)}/resolve`,
       payload,
     ),
+
+  // ---------- PR-15: Redaction queue + embedding status ----------
+  listRedactionQueue: (companyId: string) =>
+    api.get<MemoryEntry[]>(`/companies/${companyId}/memory/redaction-queue`),
+  resolveRedaction: (entryId: string, action: MemoryRedactionResolveAction) =>
+    api.post<MemoryEntry>(`/memory/entries/${entryId}/redaction/resolve`, { action }),
+  getEmbeddingStatus: (companyId: string) =>
+    api.get<MemoryEmbeddingStatus>(`/companies/${companyId}/memory/embedding-status`),
 };

@@ -184,3 +184,58 @@ describe("POST /instance/context-database/save", () => {
     expect(getRes.body.configuredVia).toBe("config-file");
   });
 });
+
+describe("POST /instance/embedding-config", () => {
+  const EMBED_KEY = "sk-proj-supersecret-embedding-key-0123456789";
+
+  for (const [name, actor] of [
+    ["non-admin board", nonAdminBoardActor],
+    ["agent", agentActor],
+  ] as const) {
+    it(`rejects ${name} actor with 403`, async () => {
+      const app = makeApp(actor, stubDb());
+      const res = await request(app)
+        .post("/instance/embedding-config")
+        .send({ provider: "openai", model: "text-embedding-3-small", apiKey: EMBED_KEY, disclosureAcked: true });
+      expect(res.status).toBe(403);
+      // The rejected write must NOT have created a config file.
+      expect(fs.existsSync(process.env.COMBYNE_CONFIG as string)).toBe(false);
+    });
+  }
+
+  it("blocks the save when the disclosure is not acknowledged (400)", async () => {
+    const app = makeApp(adminActor, stubDb());
+    const res = await request(app)
+      .post("/instance/embedding-config")
+      .send({ provider: "openai", model: "text-embedding-3-small", apiKey: EMBED_KEY, disclosureAcked: false });
+    expect(res.status).toBe(400);
+    expect(fs.existsSync(process.env.COMBYNE_CONFIG as string)).toBe(false);
+  });
+
+  it("merge-writes the key into config.json (0600) and NEVER echoes the key back", async () => {
+    const configPath = process.env.COMBYNE_CONFIG as string;
+    fs.writeFileSync(configPath, JSON.stringify({ existingKey: "keep-me" }, null, 2));
+
+    const app = makeApp(adminActor, stubDb());
+    const res = await request(app)
+      .post("/instance/embedding-config")
+      .send({ provider: "openai", model: "text-embedding-3-large", apiKey: EMBED_KEY, disclosureAcked: true });
+    expect(res.status).toBe(200);
+    expect(res.body.saved).toBe(true);
+    expect(res.body.restartRequired).toBe(true);
+    expect(res.body.provider).toBe("openai");
+    expect(res.body.model).toBe("text-embedding-3-large");
+    expect(res.body.disclosureAcked).toBe(true);
+    // The key is write-only — it must NEVER appear in the response.
+    expect(JSON.stringify(res.body)).not.toContain(EMBED_KEY);
+
+    // The key IS persisted (write-only storage), and the merge preserves prior keys.
+    const written = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+    expect(written.embeddingApiKey).toBe(EMBED_KEY);
+    expect(written.embeddingProvider).toBe("openai");
+    expect(written.embeddingDisclosureAcked).toBe(true);
+    expect(written.existingKey).toBe("keep-me");
+    // 0600 perms — the key is never world-readable.
+    expect(fs.statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+});
