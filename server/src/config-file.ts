@@ -34,6 +34,42 @@ export function readConfigFileContextDatabaseUrl(): string | null {
 }
 
 /**
+ * Read the raw embedding block from the config file (bypassing the strict schema,
+ * which strips these fields). Returns the same keys `writeConfigFile` persists in
+ * the embedding-config save (`embeddingApiKey`/`embeddingProvider`/`embeddingModel`,
+ * plus an optional `embeddingDim`). Returns `null` when the file is absent/unreadable.
+ * Individual fields are `undefined` when not present so the caller can fall through.
+ * NEVER logs the apiKey value.
+ */
+export function readConfigFileEmbedding(): {
+  apiKey: string | undefined;
+  provider: string | undefined;
+  model: string | undefined;
+  dim: number | undefined;
+} | null {
+  const configPath = resolveCombyneConfigPath();
+  if (!fs.existsSync(configPath)) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+    const apiKey = typeof raw.embeddingApiKey === "string" && raw.embeddingApiKey.length > 0
+      ? raw.embeddingApiKey
+      : undefined;
+    const provider = typeof raw.embeddingProvider === "string" && raw.embeddingProvider.length > 0
+      ? raw.embeddingProvider
+      : undefined;
+    const model = typeof raw.embeddingModel === "string" && raw.embeddingModel.length > 0
+      ? raw.embeddingModel
+      : undefined;
+    const dim = typeof raw.embeddingDim === "number" && Number.isFinite(raw.embeddingDim) && raw.embeddingDim > 0
+      ? raw.embeddingDim
+      : undefined;
+    return { apiKey, provider, model, dim };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Minimal, surgical writer for the instance config.json. Merges a single field
  * into the existing raw JSON (preserving every other key, including fields the
  * strict schema would strip such as `contextDatabaseUrl`) and re-writes the file

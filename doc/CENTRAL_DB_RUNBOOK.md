@@ -697,6 +697,158 @@ Wire these as alerts, not dashboards-nobody-watches. The hallucination-guardrail
 
 ---
 
+## 7.5 Context-DB Backup & Restore (one page)
+
+The shared context DB holds the **irreplaceable, least-regenerable** data in the system: human-gated
+answers, PR-approval decisions, the trust spine, and the embeddings. The in-app automatic backup does
+**not** cover it (see "ops-only" below). Wire its DR explicitly. There are two recovery formats; run
+**both**.
+
+### Primary DR — managed automated backups + PITR (the real recovery path)
+
+On the managed context instance (Cloud SQL is the production rail; RDS/Cloud SQL in your own account
+for Option B), turn on the platform's native protection:
+
+- **Automated daily backups** — retained ≥ 7 days (longer for a team rail).
+- **Point-in-Time Recovery (PITR)** — enables WAL-based recovery to any second inside the retention
+  window. This is what saves you from a bad write/migration, not just a host loss.
+
+```bash
+# Cloud SQL example — enable automated backups + PITR on the context instance
+gcloud sql instances patch <CONTEXT_INSTANCE> \
+  --backup-start-time=03:00 \
+  --enable-point-in-time-recovery \
+  --retained-backups-count=14 \
+  --retained-transaction-log-days=7
+```
+
+**Verify:** `gcloud sql instances describe <CONTEXT_INSTANCE>` shows `backupConfiguration.enabled: true`
+and `pointInTimeRecoveryEnabled: true`. Restore drill: clone to a scratch instance from a backup and
+to a recent timestamp, then diff `select count(*) from memory_entries;` against live. A backup you have
+never restored is not a backup.
+
+### Portable recovery point — scheduled `db:memory-export` (a second, format-independent copy)
+
+Alongside the managed backups, schedule a non-destructive logical export of the memory tables against
+the **context** URL. This is provider-portable JSON (survives a platform migration; restorable into any
+fresh Postgres), and it is **safe to run against the live rail** — it only reads.
+
+```bash
+# Scheduled (cron) recovery point against the SHARED context DB — read-only, non-destructive
+DATABASE_URL="$COMBYNE_CONTEXT_DATABASE_URL" \
+  pnpm db:memory-export --out "/srv/combyne/context-backups/context-$(date +%F).json"
+```
+
+> The export script is **context-DB-aware** (it defaults to `COMBYNE_CONTEXT_DATABASE_URL`); the line
+> above sets `DATABASE_URL` to the same value explicitly so the command is unambiguous regardless of
+> which env is loaded. It dumps `memory_entries` (+ promotions, usage, `agent_memory`) preserving the
+> trust columns and the stored embedding byte-for-byte. Use the same dump for the portable restore.
+
+- **Cadence:** daily (align with the managed backup window); keep ≥ 14 daily files, prune older.
+- **Retention/offsite:** copy the JSON to object storage off the DB host so a host loss can't take
+  both copies.
+
+**Rollback / restore from the portable bundle** (e.g. recovering specific dropped entries, or migrating
+to a new instance):
+
+```bash
+DATABASE_URL="$COMBYNE_CONTEXT_DATABASE_URL" \
+  pnpm db:memory-import --in /srv/combyne/context-backups/context-2026-06-08.json
+```
+
+`db:memory-import` is idempotent on `(companyId, layer, subject, source)`, so re-importing the same
+bundle does not duplicate rows.
+
+### The in-app `runDatabaseBackup` is ops-only — by design
+
+`runDatabaseBackup` / `pnpm db:backup` is a **destructive `DROP TABLE … CASCADE` dumper** intended for
+the **local throwaway ops DB only**. It must **never** be pointed at the live shared context DB. The
+server enforces this posture: when `COMBYNE_CONTEXT_DATABASE_URL` is set, boot logs a loud warning that
+the context DB is **not** covered by the automatic backup and that the operator must wire managed
+backups/PITR or schedule `pnpm db:memory-export` (`server/src/index.ts`, "BACKUP-1"). Keep that warning
+in place; treat it as the operational reminder that context-DB DR lives **here**, not in the app's
+backup timer.
+
+**Acceptance:** managed automated backups + PITR are on for the context instance and a restore drill
+has passed; a scheduled portable `db:memory-export` is running on cadence with offsite retention; an
+operator can restore the shared rail from **either** format.
+
+---
+
+## 7.6 RLS FORCE-flip runbook (document-only — DO NOT change code here)
+
+Today the memory tables have RLS **ENABLE**d but **not FORCE**d (migrations `0055` + `0059`). The app
+and the test rig connect as the DB **owner** role, and Postgres **skips** non-forced RLS for the owner —
+so the policies are **dormant** for the running app, and isolation is currently the proven app-layer
+`WHERE company_id` fence. That is correct for the **local-first / trusted-team** case. DB-level
+enforcement is the **untrusted-multi-tenant** gate. This section is the procedure for flipping it; it is
+**document-only** — do not change code or run `FORCE` as part of these docs.
+
+**Trigger (hard gate):** flip the moment the **first untrusted team shares one instance** — i.e. 2+
+companies that do not mutually trust each other, or the first non-local authenticated multi-user, on a
+single shared context DB. Until then, do **not** flip (FORCE would break the owner-connected app and the
+green suite for no isolation gain in the trusted case).
+
+**Pre-flip state (already built — verify, don't rebuild):**
+
+- Policies authored + CI-tested against the single tenant: `0055` (`memory_entries`, `memory_promotions`,
+  `memory_usage`) and `0059` (`agent_memory`), each `ENABLE`d with a `company_id = app.current_company OR
+  company_id IS NULL` policy (the `IS NULL` arm preserves the cross-company global layer).
+- The scope-binding infra exists: `withContextScope` (`server/src/services/context-db.ts`) and
+  `withCompanyScope` (`server/src/services/rls-scope.ts`) run a `SET LOCAL app.current_company` inside a
+  transaction **on the context connection**, the pgbouncer-safe pattern (cleared at COMMIT).
+- The `BYPASSRLS` scheduler role exists (`combyne_scheduler`, created by `0055`) for instance-wide
+  background scans that must cross tenants.
+
+**The flip procedure (when the trigger fires):**
+
+1. **Add a non-owner app role.** Create a least-privilege login role that does **not** own the memory
+   tables and does **not** have `BYPASSRLS`; grant it `SELECT/INSERT/UPDATE/DELETE` on the four memory
+   tables only. (The owner role keeps owning the schema for migrations.) The app then connects to the
+   context DB as this non-owner role — that is what makes FORCE bite.
+2. **FORCE RLS on every memory table** (run via the one-shot migrate model against direct `:5432`, never
+   the txn pooler):
+   ```sql
+   ALTER TABLE memory_entries     FORCE ROW LEVEL SECURITY;
+   ALTER TABLE memory_promotions  FORCE ROW LEVEL SECURITY;
+   ALTER TABLE memory_usage       FORCE ROW LEVEL SECURITY;
+   ALTER TABLE agent_memory       FORCE ROW LEVEL SECURITY;
+   ```
+   FORCE makes the policies apply to the table owner too — so even an owner-connected path is now scoped,
+   and the non-owner app role is hard-fenced.
+3. **Route every context read/write through the scope binder.** Wrap each memory service call site so its
+   query runs inside `withContextScope` / `withCompanyScope`, binding `app.current_company` on the
+   **context connection** for that transaction. Any unscoped query then sees only the global
+   (`company_id IS NULL`) rows, never another tenant's — fail-closed, never a leak. Route RLS-scoped
+   traffic through pgbouncer **session** mode (or direct `:5432`); keep transaction mode for stateless
+   traffic only.
+4. **Wire `BYPASSRLS` to every background cross-tenant scan.** Instance-wide jobs (heartbeat global
+   scans, decay, re-embed, the summarizer, the memory ETL) must run as `combyne_scheduler`, or they
+   silently return **zero rows** under FORCE. (This is the §C2 audit — unbounded by nature; each path
+   breaks independently.)
+5. **Fail-closed on empty/undefined `companyId`** at `assertCompanyAccess` for all principals (incl.
+   `local_implicit` / instance-admin) so an unscoped request is rejected, not served.
+
+**Flip only when the cross-tenant non-owner test is green.** The merge/cutover gate is the cross-tenant
+isolation suite (`server/src/services/__tests__/cross-tenant-isolation.test.ts` and the broader §C4
+suite): a non-owner role for company B must read **zero** of company A's rows across **every** retrieval
+path, an empty `companyId` is rejected, and the `BYPASSRLS` scanner still sees all tenants. Do not FORCE
+until that suite is green against the running app — and pair it with per-tenant agent-JWT key separation
+(§C5), because RLS binds the tenant GUC from the JWT claim and a single global signing secret would let a
+forged claim defeat it.
+
+**Reversibility:** FORCE is per-table reversible (`ALTER TABLE … NO FORCE ROW LEVEL SECURITY`), but do
+**not** un-force while 2+ untrusted tenants are live — that re-opens cross-tenant reads. If FORCE causes a
+zero-rows background outage, the fix is to grant the missing path the `BYPASSRLS` scheduler role (step 4),
+**not** to un-force instance-wide. This mirrors Part C (C1–C5) — this section is the operator-facing
+summary of that gate; the engineering deliverables live there.
+
+> **Do not run any `FORCE` statement as part of reading these docs.** This runbook section is the plan;
+> execution happens only at the team-onboarding boundary, behind a green isolation suite, as tracked
+> infra work (`doc/INFRA_FIXES_PLAN.md` Phase E).
+
+---
+
 ## 8. Sign-off checklist
 
 **Pre-flight**

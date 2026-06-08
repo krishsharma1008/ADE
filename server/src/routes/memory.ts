@@ -25,7 +25,13 @@ import {
 } from "@combyne/shared";
 import { validate } from "../middleware/validate.js";
 import { memoryService, logActivity } from "../services/index.js";
-import { assertCompanyAccess, getActorInfo, assertBoard, assertInstanceAdmin } from "./authz.js";
+import {
+  assertCompanyAccess,
+  assertPinnedCompany,
+  getActorInfo,
+  assertBoard,
+  assertInstanceAdmin,
+} from "./authz.js";
 import { forbidden } from "../errors.js";
 
 export function memoryRoutes(db: Db) {
@@ -38,6 +44,7 @@ export function memoryRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      assertPinnedCompany(companyId);
       const actor = getActorInfo(req);
       const body = req.body as ReturnType<typeof createMemoryEntrySchema.parse>;
       if (body.layer === "personal") {
@@ -156,6 +163,18 @@ export function memoryRoutes(db: Db) {
       assertInstanceAdmin(req);
       const actor = getActorInfo(req);
       const body = req.body as ReturnType<typeof memoryPromoteGlobalSchema.parse>;
+      // PIN FENCE (Cond 1): global rows bypass the pin BY DESIGN (company_id NULL),
+      // so promoting an off-tenant source entry into the global layer would LAUNDER
+      // another team's memory past the fence. Load the source first and assert the
+      // promoter may access it AND that it belongs to the pinned tenant before the
+      // company→global copy. A missing source 404s (same as the service's own guard).
+      const source = await svc.getEntry(body.sourceEntryId);
+      if (!source) {
+        res.status(404).json({ error: "Source entry not found" });
+        return;
+      }
+      assertCompanyAccess(req, source.companyId);
+      assertPinnedCompany(source.companyId);
       let entry;
       try {
         entry = await svc.createGlobalFromEntry({
@@ -180,6 +199,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/entries", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     const layer = req.query.layer as string | undefined;
     const ownerType = req.query.ownerType as MemoryOwnerType | undefined;
     const ownerId = req.query.ownerId as string | undefined;
@@ -237,6 +257,7 @@ export function memoryRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, entry.companyId);
+    assertPinnedCompany(entry.companyId);
     if (entry.layer === "personal") {
       const actor = getActorInfo(req);
       const isOwner =
@@ -260,6 +281,7 @@ export function memoryRoutes(db: Db) {
         return;
       }
       assertCompanyAccess(req, existing.companyId);
+      assertPinnedCompany(existing.companyId);
       const actor = getActorInfo(req);
       if (existing.layer === "personal") {
         const isOwner =
@@ -299,6 +321,7 @@ export function memoryRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, existing.companyId);
+    assertPinnedCompany(existing.companyId);
     const actor = getActorInfo(req);
     if (existing.layer === "personal") {
       const isOwner =
@@ -334,6 +357,7 @@ export function memoryRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      assertPinnedCompany(companyId);
       const body = req.body as ReturnType<typeof memoryQuerySchema.parse>;
       const actor = getActorInfo(req);
       const ownerType = body.ownerType ?? (actor.agentId ? "agent" : "user");
@@ -358,6 +382,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/manifest", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     const parsed = memoryManifestQuerySchema.parse({
       taskId: req.query.taskId,
       ownerId: req.query.ownerId,
@@ -391,6 +416,7 @@ export function memoryRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      assertPinnedCompany(companyId);
       const body = req.body as ReturnType<typeof memoryCoreBuildSchema.parse>;
       const ctx = await svc.buildCoreContext(companyId, body.taskId);
       res.json(ctx);
@@ -403,6 +429,7 @@ export function memoryRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      assertPinnedCompany(companyId);
       const body = req.body as ReturnType<typeof memoryCoreBuildSchema.parse>;
       const ctx = await svc.refreshCoreContext(companyId, body.taskId);
       res.json(ctx);
@@ -420,6 +447,7 @@ export function memoryRoutes(db: Db) {
         return;
       }
       assertCompanyAccess(req, existing.companyId);
+      assertPinnedCompany(existing.companyId);
       const actor = getActorInfo(req);
       const body = req.body as ReturnType<typeof memoryRecordUsageSchema.parse>;
       await svc.recordUsage({
@@ -442,6 +470,7 @@ export function memoryRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      assertPinnedCompany(companyId);
       const body = req.body as ReturnType<typeof memoryProposePromotionSchema.parse>;
       const actor = getActorInfo(req);
       const promotion = await svc.proposePromotion({
@@ -475,6 +504,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/promotions", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     const state = req.query.state as
       | "pending"
       | "approved"
@@ -492,6 +522,18 @@ export function memoryRoutes(db: Db) {
       const id = req.params.id as string;
       const actor = getActorInfo(req);
       const body = req.body as ReturnType<typeof memoryDecidePromotionSchema.parse>;
+      // PIN FENCE (Cond 1): the /decide route is keyed ONLY by promotion id, but
+      // approving inserts a shared memory row for the promotion's company. Fetch the
+      // promotion FIRST and assert the board may access its tenant AND that it matches
+      // the pin, BEFORE mutating — otherwise a board user on a pinned rail could push a
+      // shared row for a different tenant. A missing promotion 404s.
+      const existingPromotion = await svc.getPromotion(id);
+      if (!existingPromotion) {
+        res.status(404).json({ error: "Promotion not found" });
+        return;
+      }
+      assertCompanyAccess(req, existingPromotion.companyId);
+      assertPinnedCompany(existingPromotion.companyId);
       const promotion = await svc.decidePromotion(id, {
         decision: body.decision,
         reviewerId: actor.actorId,
@@ -521,6 +563,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/capture-inbox", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     const items = await svc.captureInbox(companyId);
     res.json(items);
   });
@@ -531,6 +574,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/questions", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     const items = await svc.questions(companyId);
     res.json(items);
   });
@@ -539,6 +583,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/verify-queue", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     const items = await svc.verifyQueue(companyId);
     res.json(items);
   });
@@ -552,6 +597,7 @@ export function memoryRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, existing.companyId);
+    assertPinnedCompany(existing.companyId);
     assertBoard(req);
     const actor = getActorInfo(req);
     const verified = await svc.verifyEntry(id, actor.actorId);
@@ -576,6 +622,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/conflicts", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     const groups = await svc.listConflicts(companyId);
     res.json(groups);
   });
@@ -588,6 +635,7 @@ export function memoryRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      assertPinnedCompany(companyId);
       assertBoard(req);
       const subjectKey = req.params.subjectKey as string;
       const actor = getActorInfo(req);
@@ -634,6 +682,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/redaction-queue", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     assertBoard(req);
     const entries = await svc.redactionQueue(companyId);
     res.json(entries);
@@ -652,6 +701,7 @@ export function memoryRoutes(db: Db) {
         return;
       }
       assertCompanyAccess(req, existing.companyId);
+      assertPinnedCompany(existing.companyId);
       assertBoard(req);
       const actor = getActorInfo(req);
       const body = req.body as ReturnType<typeof memoryResolveRedactionSchema.parse>;
@@ -676,6 +726,7 @@ export function memoryRoutes(db: Db) {
   router.post("/companies/:companyId/memory/decay", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     assertBoard(req);
     const archived = await svc.runDecayPass(companyId);
     res.json({ archived });
@@ -684,6 +735,7 @@ export function memoryRoutes(db: Db) {
   router.post("/companies/:companyId/memory/auto-distill", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     assertBoard(req);
     const minUsage = req.body?.minUsage ? Number(req.body.minUsage) : undefined;
     const max = req.body?.max ? Number(req.body.max) : undefined;
@@ -700,6 +752,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/embedding-status", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     assertBoard(req);
     const status = await svc.embeddingStatus(companyId);
     res.json(status);
@@ -714,6 +767,7 @@ export function memoryRoutes(db: Db) {
   router.get("/companies/:companyId/memory/passdown-packets", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    assertPinnedCompany(companyId);
     const rows = await db
       .select({
         handoffId: agentHandoffs.id,

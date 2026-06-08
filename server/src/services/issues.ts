@@ -1467,6 +1467,18 @@ export function issueService(db: Db) {
         .where(eq(issueComments.id, commentId))
         .then((rows) => rows[0] ?? null),
 
+    // Phase F (INFRA_FIXES_PLAN): resolve the question comment an answer answered.
+    // markQuestionAnswered stamps the QUESTION's answered_comment_id = the answer
+    // comment id, so the question is the row pointing back at this answer comment.
+    // Used by the attachment-upload route to recover the question text for an
+    // answer-attachment extraction job's subject.
+    getQuestionAnsweredBy: (answerCommentId: string) =>
+      db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.answeredCommentId, answerCommentId))
+        .then((rows) => rows[0] ?? null),
+
     addComment: async (
       issueId: string,
       body: string,

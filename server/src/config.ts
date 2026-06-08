@@ -1,4 +1,4 @@
-import { readConfigFile, readConfigFileContextDatabaseUrl } from "./config-file.js";
+import { readConfigFile, readConfigFileContextDatabaseUrl, readConfigFileEmbedding } from "./config-file.js";
 import { existsSync, readFileSync } from "node:fs";
 import { config as loadDotenv, parse as parseDotenv } from "dotenv";
 import { resolveCombyneEnvPath } from "./paths.js";
@@ -129,10 +129,13 @@ export interface Config {
    */
   embeddingApiKey: string;
   /**
-   * ANN/vector-search master flag. COMBYNE_VECTOR_SEARCH_ENABLED === 'true'.
-   * DEFAULT false. COERCED false when embeddingApiKey is empty — so the OFF
-   * state (incl. all CI/test runs) takes the hash-64 jsonb path with no
-   * provider call and no egress.
+   * ANN/vector-search master state. ON automatically when a DELIBERATE embedding
+   * key is present — the dedicated COMBYNE_EMBEDDING_API_KEY env var or a UI-saved
+   * config.json key (privacy-disclosure acked) — UNLESS COMBYNE_VECTOR_SEARCH_ENABLED
+   * =false (kill-switch). A generic host OPENAI_API_KEY alone does NOT enable it:
+   * that requires an explicit COMBYNE_VECTOR_SEARCH_ENABLED=true so a stray key never
+   * silently egresses memory. COERCED false when no key is present (incl. all CI/test
+   * runs) so the OFF state takes the hash-64 jsonb path with no provider call.
    */
   vectorSearchEnabled: boolean;
   /** Monthly cost cap (USD) — visibility-only, no hard cutoff. '' = no cap. */
@@ -309,18 +312,42 @@ export function loadConfig(): Config {
     : 0.34;
 
   // ---- Managed-API embeddings (PR-11) ----
-  // Mirror the envVar pattern: never throw on unset. The key resolves
-  // COMBYNE_EMBEDDING_API_KEY → OPENAI_API_KEY → '' (lazy validation happens in
-  // the driver on first use, exactly like the summarizer driver).
-  const embeddingProvider = envVar("EMBEDDING_PROVIDER") ?? "openai";
-  const embeddingModel = envVar("EMBEDDING_MODEL") ?? "text-embedding-3-small";
+  // Mirror the envVar pattern: never throw on unset. Resolution is env-wins, then
+  // the UI-saved config.json block (which the strict schema strips, so we read it
+  // via the bypass reader — the SAME keys writeConfigFile persists on the embedding
+  // -config save). Net: a key set in the Memory→Setup UI activates on next restart
+  // with no env var, while any env var still takes precedence. Lazy validation
+  // happens in the driver on first use, exactly like the summarizer driver.
+  const fileEmbedding = readConfigFileEmbedding();
+  const embeddingProvider = envVar("EMBEDDING_PROVIDER") ?? fileEmbedding?.provider ?? "openai";
+  const embeddingModel = envVar("EMBEDDING_MODEL") ?? fileEmbedding?.model ?? "text-embedding-3-small";
   const embeddingDimRaw = Number(envVar("EMBEDDING_DIM"));
-  const embeddingDim = Number.isFinite(embeddingDimRaw) && embeddingDimRaw > 0 ? embeddingDimRaw : 1536;
-  const embeddingApiKey = envVar("EMBEDDING_API_KEY") ?? process.env.OPENAI_API_KEY ?? "";
-  // COERCION (closes the chatty-fallback hole): an empty key forces vector
-  // search OFF regardless of the flag, so no path can egress with no key set.
+  const embeddingDim = Number.isFinite(embeddingDimRaw) && embeddingDimRaw > 0
+    ? embeddingDimRaw
+    : (fileEmbedding?.dim ?? 1536);
+  const embeddingApiKey =
+    envVar("EMBEDDING_API_KEY") ?? process.env.OPENAI_API_KEY ?? fileEmbedding?.apiKey ?? "";
+  // A DELIBERATE embedding key is one the operator set with embedding INTENT: the
+  // dedicated COMBYNE_EMBEDDING_API_KEY env var, or a key saved through the UI
+  // Memory→Setup tab (config.json, which carries a privacy-disclosure ack). A
+  // generic host OPENAI_API_KEY (often present for the summarizer) is NOT embedding
+  // intent — it must not silently turn on remote embedding + memory egress.
+  const deliberateEmbeddingKey =
+    (envVar("EMBEDDING_API_KEY") ?? fileEmbedding?.apiKey ?? "").length > 0;
+  // ENABLE rules (egress only ever with a key present):
+  //   - flag === "false"  → OFF (kill-switch), always; no path can egress with a key.
+  //   - deliberate key    → ON automatically (UI-saved or COMBYNE_EMBEDDING_API_KEY),
+  //                         so the Setup tab / dedicated env var activates on restart
+  //                         with no flag — UNLESS the kill-switch forces it off.
+  //   - generic key only  → ON only with an EXPLICIT COMBYNE_VECTOR_SEARCH_ENABLED
+  //                         =true opt-in, so a stray OPENAI_API_KEY never egresses
+  //                         memory bodies without the operator asking for it.
+  //   - no key            → OFF (zero egress) — re-checked in memory-embedder.ts.
+  const vectorFlag = envVar("VECTOR_SEARCH_ENABLED");
   const vectorSearchEnabled =
-    envVar("VECTOR_SEARCH_ENABLED") === "true" && embeddingApiKey.length > 0;
+    embeddingApiKey.length > 0 &&
+    vectorFlag !== "false" &&
+    (deliberateEmbeddingKey || vectorFlag === "true");
   const embeddingMonthlyCapUsd = envVar("EMBEDDING_MONTHLY_CAP_USD") ?? "";
   const embeddingRpmRaw = Number(envVar("EMBEDDING_RPM"));
   const embeddingRpm = Number.isFinite(embeddingRpmRaw) && embeddingRpmRaw > 0 ? embeddingRpmRaw : 3000;
@@ -421,8 +448,11 @@ export function logEmbeddingPosture(
   >,
   logger: PostureLogger,
 ): void {
-  const requestedVector =
-    (process.env.COMBYNE_VECTOR_SEARCH_ENABLED ?? process.env.VECTOR_SEARCH_ENABLED) === "true";
+  // Read the SAME prefixed name the coercion uses (envVar prepends COMBYNE_), so a
+  // bare-flag + key deployment is diagnosed consistently rather than silently
+  // ignored. The flag is now an optional kill-switch: "true" is an explicit
+  // opt-in intent, "false" forces hash-64 even with a key.
+  const requestedVector = process.env.COMBYNE_VECTOR_SEARCH_ENABLED === "true";
   const hasKey = config.embeddingApiKey.length > 0;
   logger.info(
     {
@@ -440,4 +470,34 @@ export function logEmbeddingPosture(
         "shared-corpus ranking will be INCONSISTENT with teammates who have a key.",
     );
   }
+}
+
+/**
+ * B-PIN-5: a SET company pin (`COMBYNE_CONTEXT_COMPANY_ID`) is only useful if some
+ * LOCAL company row actually carries that id — otherwise every memory/capture
+ * request that addresses any OTHER company will 403 and the pinned tenant has no
+ * local home. This pure helper decides what boot should surface so it can be unit
+ * tested without standing up the server (the boot code does the narrow companies
+ * query and passes the ids in). Returns a `warn` string for a soft misconfig, and
+ * a `throwMsg` ONLY when strict mode (`contextRequired`) should hard-fail boot.
+ */
+export function checkPinnedCompanyAdoption(opts: {
+  contextCompanyId: string;
+  localCompanyIds: string[];
+  contextRequired: boolean;
+}): { warn?: string; throwMsg?: string } {
+  if (!opts.contextCompanyId) return {};
+  if (opts.localCompanyIds.includes(opts.contextCompanyId)) return {};
+  const warn =
+    `COMBYNE_CONTEXT_COMPANY_ID=${opts.contextCompanyId} is set but no local company has that id. ` +
+    "Memory/capture requests that address any OTHER company will 403; the pinned tenant itself still " +
+    "works once adopted. Run `pnpm db:company-pin --id <uuid> --name <name>` to adopt it locally.";
+  if (opts.contextRequired) {
+    return {
+      warn,
+      throwMsg:
+        "COMBYNE_CONTEXT_REQUIRED=true but COMBYNE_CONTEXT_COMPANY_ID does not match any local company row",
+    };
+  }
+  return { warn };
 }

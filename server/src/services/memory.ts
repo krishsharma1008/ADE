@@ -1355,6 +1355,20 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     return rows.map(promotionRowToType);
   }
 
+  /**
+   * Fetch a single promotion by id (company-agnostic lookup) so a route can read
+   * its companyId BEFORE deciding — needed to run assertCompanyAccess + the company
+   * pin on the promotion's tenant (the /decide route is keyed only by promotion id).
+   */
+  async function getPromotion(promotionId: string): Promise<MemoryPromotion | null> {
+    const [existing] = await cdb
+      .select()
+      .from(memoryPromotions)
+      .where(eq(memoryPromotions.id, promotionId))
+      .limit(1);
+    return existing ? promotionRowToType(existing) : null;
+  }
+
   async function decidePromotion(
     promotionId: string,
     input: {
@@ -2138,6 +2152,7 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
     refreshCoreContext,
     proposePromotion,
     listPromotions,
+    getPromotion,
     decidePromotion,
     createGlobalFromEntry,
     captureInbox,

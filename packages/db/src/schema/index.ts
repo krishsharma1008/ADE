@@ -30,6 +30,7 @@ export { heartbeatRunEvents } from "./heartbeat_run_events.js";
 export { agentTranscripts } from "./agent_transcripts.js";
 export { agentMemory } from "./agent_memory.js";
 export { contextCaptureOutbox } from "./context_capture_outbox.js";
+export { attachmentExtractionJobs } from "./attachment_extraction_jobs.js";
 export { agentHandoffs } from "./agent_handoffs.js";
 export { costEvents } from "./cost_events.js";
 export { approvals } from "./approvals.js";

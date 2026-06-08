@@ -104,6 +104,66 @@ COMBYNE_HOME=/custom/path COMBYNE_INSTANCE_ID=dev pnpm combyne run
 
 No Docker or external database is required for this mode.
 
+## The 2-DB Model in Dev (Local-First)
+
+Combyne is **local-first** and runs two logically separate databases (full reference:
+[`doc/DATABASE.md`](DATABASE.md) "The 2-DB model"):
+
+- **Ops DB** — local + **throwaway**: companies, agents, issues, PRs, approvals, auth, heartbeat
+  state, and the durable capture outbox. Routed by `DATABASE_URL` (unset → embedded PG `:54329`).
+  Wipe and re-migrate it anytime without touching shared context.
+- **Context DB** — the **shared rail**: `memory_entries` and the rest of the trust-spine + embeddings.
+  Routed by `COMBYNE_CONTEXT_DATABASE_URL`. **Durable** and shared between teammates.
+
+For solo local dev you need **neither** env var: leave `DATABASE_URL` unset (embedded ops PG) and
+`COMBYNE_CONTEXT_DATABASE_URL` unset (context tables live in the same embedded DB). The whole
+write → embed → retrieve → passdown loop still works against the single embedded DB — context just
+isn't shared with anyone else.
+
+### Pointing dev at a shared context DB (Docker PG)
+
+To exercise the real 2-DB split locally, point the context tables at a separate PostgreSQL. The
+simplest dev rail is a Docker Postgres with pgvector:
+
+```sh
+# A throwaway context-DB container with pgvector
+docker run -d --name ade-context-db \
+  -e POSTGRES_USER=combyne -e POSTGRES_PASSWORD=combyne -e POSTGRES_DB=combyne \
+  -p 55432:5432 pgvector/pgvector:pg17
+
+# Provision the context schema ONCE as the designated migrator (advisory-locked)
+COMBYNE_CONTEXT_DB_MIGRATE=true \
+COMBYNE_CONTEXT_DATABASE_URL="postgres://combyne:combyne@127.0.0.1:55432/combyne" \
+  pnpm db:migrate:context
+
+# Run dev against it (the ops DB stays embedded; only context routes to Docker PG)
+COMBYNE_CONTEXT_DATABASE_URL="postgres://combyne:combyne@127.0.0.1:55432/combyne" \
+COMBYNE_CONTEXT_REQUIRED=true \
+COMBYNE_CONTEXT_TRACE=1 \
+  pnpm dev
+```
+
+What the env knobs do:
+
+- `COMBYNE_CONTEXT_DATABASE_URL` — route the context/memory tables to the separate DB.
+- `COMBYNE_CONTEXT_DB_MIGRATE=true` — mark this run as the **designated migrator** so
+  `pnpm db:migrate:context` may apply the schema; **teammate boots are inspect-only** and never
+  auto-migrate the shared DB (use plain `pnpm db:migrate` for the local ops DB only).
+- `COMBYNE_CONTEXT_REQUIRED=true` — fail-loud: refuse to boot if the rail is unreachable instead of
+  silently using the ops DB.
+- `COMBYNE_CONTEXT_TRACE=1` — emit per-hop `ctxtrace:` lines so you can follow one ticket's context
+  lifecycle across both DBs (see [`doc/TWO_DB_TESTING_PLAYBOOK.md`](TWO_DB_TESTING_PLAYBOOK.md)).
+
+Optionally pin a canonical company id so a second local instance (or a teammate) shares the same
+tenant partition on the rail: set `COMBYNE_CONTEXT_COMPANY_ID=<uuid>` and seed the local company with
+that explicit id (`pnpm db:company-pin`). See
+[`doc/LOCAL_FIRST_SHARED_CONTEXT_PLAYBOOK.md`](LOCAL_FIRST_SHARED_CONTEXT_PLAYBOOK.md).
+
+> Smoke-check the wiring before running tickets: the boot log should say `Shared context DB reachable;
+> memory layer routing to the shared rail` with the Docker host (not `:54329`), and the embedding
+> status should show your model (not the hash-64 fallback). For the production rail (Cloud SQL), follow
+> [`doc/CENTRAL_DB_RUNBOOK.md`](CENTRAL_DB_RUNBOOK.md).
+
 ## Storage in Dev (Auto-Handled)
 
 For local development, the default storage provider is `local_disk`, which persists uploaded images/attachments at:
@@ -159,16 +219,24 @@ The script writes `em-autonomy-audit-report.md` and `.json` in the audit root. I
 
 ## Reset Local Dev Database
 
-To wipe local dev data and start fresh:
+To wipe the **local ops DB** (throwaway) and start fresh:
 
 ```sh
 rm -rf ~/.combyne-ai/instances/default/db
 pnpm dev
 ```
 
+This re-inits and re-migrates the ops DB from `0001 → latest`. The **shared context DB is never
+touched** by this — that's the whole point of the local-first split: blow away ops anytime without
+losing shared memory.
+
 ## Optional: Use External Postgres
 
-If you set `DATABASE_URL`, the server will use that instead of embedded PostgreSQL.
+If you set `DATABASE_URL`, the server will use that for the **ops DB** instead of embedded PostgreSQL.
+The **context/memory** tables are controlled separately by `COMBYNE_CONTEXT_DATABASE_URL` (see
+"The 2-DB Model in Dev" above); when it is unset, context lives in whichever ops DB `DATABASE_URL`
+selects. Migrate them with the matching commands: `pnpm db:migrate` (ops) and `pnpm db:migrate:context`
+(shared context, designated migrator only).
 
 ## Automatic DB Backups
 

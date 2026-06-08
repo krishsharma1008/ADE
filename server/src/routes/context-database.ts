@@ -211,8 +211,10 @@ export function contextDatabaseRoutes(db: Db) {
         apiKey: string;
         disclosureAcked: true;
       };
-      // 0600 merge-write. The key lands as embeddingApiKey; loadConfig resolves
-      // it on next boot (env still wins). NEVER returned in any response.
+      // 0600 merge-write. The key lands as embeddingApiKey and is activated on the
+      // NEXT restart — loadConfig reads it via the config.json bypass reader
+      // (readConfigFileEmbedding), where any env var (EMBEDDING_API_KEY /
+      // OPENAI_API_KEY) still wins. NEVER returned in any response.
       writeConfigFile({
         embeddingProvider: provider,
         embeddingModel: model,

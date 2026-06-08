@@ -243,13 +243,25 @@ that need it, scoped to each task.
 - Run the memory layer on its own database (optional): set
   `COMBYNE_CONTEXT_DATABASE_URL`, or use the **Database** tab to test + save a
   connection (takes effect on restart).
-- Enable semantic retrieval (optional): set a team `COMBYNE_EMBEDDING_API_KEY` (or
-  `OPENAI_API_KEY`) and `COMBYNE_VECTOR_SEARCH_ENABLED=true` — the **Setup** tab does
-  this with a privacy disclosure.
+- Enable semantic retrieval (optional): set a **dedicated** `COMBYNE_EMBEDDING_API_KEY`,
+  or save a key via the **Setup** tab (privacy disclosure) — either is treated as
+  embedding intent and turns vector search on automatically (no flag needed). A generic
+  host `OPENAI_API_KEY` alone does **not** enable it (so a stray key never silently
+  egresses memory bodies) — pair it with `COMBYNE_VECTOR_SEARCH_ENABLED=true` to opt in
+  explicitly. Set `COMBYNE_VECTOR_SEARCH_ENABLED=false` to force the local hash fallback
+  even with a key (kill-switch).
+
+The memory layer runs on the **2-DB model**: a local, throwaway **ops DB** (issues/agents/PRs) and a
+durable, **shared context DB** (`COMBYNE_CONTEXT_DATABASE_URL`) that is the only shared rail. See
+[`doc/DATABASE.md`](doc/DATABASE.md) for the model and the `db:migrate` (ops) vs `db:migrate:context`
+(shared rail) migration split.
 
 Design + ops docs: [`doc/CENTRAL_CONTEXT_DB_PLAN.md`](doc/CENTRAL_CONTEXT_DB_PLAN.md),
 [`doc/MEMORY_UI_AND_QUALITY_PLAN.md`](doc/MEMORY_UI_AND_QUALITY_PLAN.md),
 [`doc/CENTRAL_DB_RUNBOOK.md`](doc/CENTRAL_DB_RUNBOOK.md) (DevOps hand-off),
+[`doc/LOCAL_FIRST_SHARED_CONTEXT_PLAYBOOK.md`](doc/LOCAL_FIRST_SHARED_CONTEXT_PLAYBOOK.md) (architecture + stand-up),
+[`doc/TWO_DB_TESTING_PLAYBOOK.md`](doc/TWO_DB_TESTING_PLAYBOOK.md) (2-DB test procedure),
+[`doc/IMPROVEMENT_PLAN.md`](doc/IMPROVEMENT_PLAN.md) + [`doc/INFRA_FIXES_PLAN.md`](doc/INFRA_FIXES_PLAN.md) (roadmap),
 [`doc/HALLUCINATION_AT_SCALE.md`](doc/HALLUCINATION_AT_SCALE.md), and
 [`doc/PRIVACY_DISCLOSURE.md`](doc/PRIVACY_DISCLOSURE.md).
 
@@ -277,8 +289,9 @@ ADE works out of the box with zero configuration. All settings below are **optio
 | `COMBYNE_MEMORY_MIN_ENTRIES` | `3` | Min transcript entries before a run gets summarized into `agent_memory` |
 | `COMBYNE_RESET_SESSION_ON_ASSIGN` | `false` | Set to `true` to reset the adapter session on every issue reassignment (rollback lever for shared-context handoff) |
 | `COMBYNE_CONTEXT_DATABASE_URL` | *(uses `DATABASE_URL`)* | Run the **context/memory** tables in a **separate** PostgreSQL from operational data (the central context DB) |
-| `COMBYNE_EMBEDDING_API_KEY` / `OPENAI_API_KEY` | *(unset → local hash fallback)* | Team-shared embedding key for semantic memory retrieval (bodies egress post-redaction — see the Setup tab disclosure) |
-| `COMBYNE_VECTOR_SEARCH_ENABLED` | `false` | Enable pgvector ANN retrieval (needs the embedding key + a pgvector-enabled DB) |
+| `COMBYNE_EMBEDDING_API_KEY` | *(unset → local hash fallback)* | **Dedicated** team embedding key. Treated as embedding intent → auto-enables vector search (bodies egress post-redaction). |
+| `OPENAI_API_KEY` | *(generic host key)* | Usable as the embedding key, but does **not** auto-enable vector search — needs `COMBYNE_VECTOR_SEARCH_ENABLED=true` so a stray key never silently egresses memory. |
+| `COMBYNE_VECTOR_SEARCH_ENABLED` | *(auto-on with a dedicated/UI key)* | `true` = explicit opt-in (required for a generic `OPENAI_API_KEY`); `false` = kill-switch forcing the hash fallback even with a key. |
 | `COMBYNE_SUFFICIENCY_GATE_ENABLED` | `false` | Ask-don't-hallucinate gate — ships dark; enable after calibration |
 
 See [`.env.example`](.env.example) for the full env-var surface, grouped by section.
@@ -420,8 +433,9 @@ ADE/
 | `pnpm test:e2e` | Run Playwright E2E tests |
 | `pnpm test:e2e:headed` | Run E2E tests with visible browser |
 | `pnpm db:generate` | Generate a new database migration |
-| `pnpm db:migrate` | Apply pending database migrations |
-| `pnpm db:backup` | Run a manual database backup |
+| `pnpm db:migrate` | Apply pending migrations to the **ops** DB (`DATABASE_URL` / embedded) |
+| `pnpm db:migrate:context` | Apply pending migrations to the **shared context** DB (`COMBYNE_CONTEXT_DATABASE_URL`) — designated migrator only, advisory-locked |
+| `pnpm db:backup` | Run a manual backup of the **ops** DB (ops-only by design — see the runbook for context-DB DR) |
 | `pnpm combyne run` | One-command setup + diagnostics + start |
 | `pnpm combyne doctor` | Run diagnostics and optionally repair |
 | `pnpm combyne onboard` | Interactive first-time setup |
@@ -441,9 +455,13 @@ pnpm db:generate
 # 3. Verify everything compiles
 pnpm typecheck
 
-# 4. Restart dev server (migrations auto-apply)
+# 4. Restart dev server (ops-DB migrations auto-apply)
 pnpm dev
 ```
+
+> Migrations are **split** across the 2-DB model: `pnpm db:migrate` (auto-applied on dev boot)
+> targets the **ops** DB, while `pnpm db:migrate:context` targets the **shared context** DB and is run
+> once by the designated migrator (`COMBYNE_CONTEXT_DB_MIGRATE=true`). See [doc/DATABASE.md](doc/DATABASE.md).
 
 ### Verification Checklist
 
@@ -627,12 +645,17 @@ See [APP_INSTALL.md](APP_INSTALL.md) for details.
 |----------|-------------|
 | [APP_INSTALL.md](APP_INSTALL.md) | macOS standalone app guide |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guidelines |
-| [doc/DEVELOPING.md](doc/DEVELOPING.md) | Full development guide |
+| [doc/DEVELOPING.md](doc/DEVELOPING.md) | Full development guide (incl. the local-first 2-DB dev flow) |
 | [doc/SPEC.md](doc/SPEC.md) | Product specification |
-| [doc/DATABASE.md](doc/DATABASE.md) | Database schema reference |
+| [doc/DATABASE.md](doc/DATABASE.md) | Database reference — the 2-DB model + migration split |
 | [doc/CLI.md](doc/CLI.md) | CLI command reference |
 | [doc/DOCKER.md](doc/DOCKER.md) | Docker deployment guide |
 | [doc/RELEASING.md](doc/RELEASING.md) | Release process |
+| [doc/CENTRAL_DB_RUNBOOK.md](doc/CENTRAL_DB_RUNBOOK.md) | Stand up + operate the shared context DB (DevOps hand-off) |
+| [doc/LOCAL_FIRST_SHARED_CONTEXT_PLAYBOOK.md](doc/LOCAL_FIRST_SHARED_CONTEXT_PLAYBOOK.md) | Local-first + shared-context architecture and end-to-end stand-up |
+| [doc/TWO_DB_TESTING_PLAYBOOK.md](doc/TWO_DB_TESTING_PLAYBOOK.md) | 2-DB hardening test procedure + per-hop trace |
+| [doc/IMPROVEMENT_PLAN.md](doc/IMPROVEMENT_PLAN.md) | Retrieval + agent-behavior improvement roadmap |
+| [doc/INFRA_FIXES_PLAN.md](doc/INFRA_FIXES_PLAN.md) | 2-DB infra-fixes roadmap (config wiring, company-pin, backups, docs, RLS) |
 
 <br/>
 

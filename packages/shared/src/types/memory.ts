@@ -32,6 +32,10 @@ export const MEMORY_SOURCE_REF_TYPES = [
   "approval",
   "run",
   "promotion",
+  // Phase F (INFRA_FIXES_PLAN): multi-modal Q&A answer-attachment captures. The
+  // sourceRefId is the asset id of the extracted PDF/image so re-runs dedup and the
+  // Capture inbox can cite the originating attachment.
+  "attachment",
 ] as const;
 export type MemorySourceRefType = (typeof MEMORY_SOURCE_REF_TYPES)[number];
 

@@ -30,10 +30,14 @@ import {
   routeAgentQuestionsToManager,
 } from "../services/index.js";
 import { scanBody } from "../secret-scan.js";
-import { captureHumanMemoryDurable, humanAnswerSource } from "../services/memory-capture.js";
+import {
+  captureHumanMemoryDurable,
+  enqueueAttachmentExtractionJobs,
+  humanAnswerSource,
+} from "../services/memory-capture.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertCompanyAccess, assertPinnedCompany, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { createHandoff } from "../services/agent-handoff.js";
 import { captureIssueContextRefs } from "../services/issue-context-refs.js";
@@ -42,6 +46,7 @@ import { notifyParentOnChildAgentComment } from "../services/issue-parent-notifi
 
 const MAX_ATTACHMENT_BYTES = Number(process.env.COMBYNE_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
+  "application/pdf",
   "image/png",
   "image/jpeg",
   "image/jpg",
@@ -1071,6 +1076,11 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    // PIN FENCE (Cond 1): answering necessarily writes a human-answer memory entry,
+    // so it is a memory mutation and obeys the same pin as /memory/entries. 403s the
+    // whole answer when the rail is pinned to a different tenant. No-op in single-DB
+    // mode / when no pin is set, so zero change to the default local-first posture.
+    assertPinnedCompany(issue.companyId);
     const actor = getActorInfo(req);
 
     const answerComment = await svc.addComment(id, answer, {
@@ -1208,6 +1218,33 @@ export function issueRoutes(db: Db, storage: StorageService) {
           sourceRefId: answerComment.id,
           createdBy: userId,
         });
+
+        // ---- Phase F: multi-modal attachment capture (INFRA_FIXES_PLAN §F) ----
+        // The answer may carry a PDF/image attachment whose CONTENT must also reach
+        // the central DB. Enqueue ONE extraction job per supported attachment on the
+        // answer comment; a heartbeat-tick drainer runs the (slow, costly) Claude
+        // vision/document pass out of band, so the answer response stays fast.
+        // Best-effort: a failure must NEVER fail the answer (text is already captured).
+        try {
+          const attachments = await svc.listAttachments(id);
+          const onAnswer = attachments.filter((a) => a.issueCommentId === answerComment.id);
+          if (onAnswer.length > 0) {
+            await enqueueAttachmentExtractionJobs(db, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              answerCommentId: answerComment.id,
+              questionText,
+              answerText: scan.clean,
+              attachments: onAnswer.map((a) => ({
+                assetId: a.assetId,
+                contentType: a.contentType,
+                issueCommentId: a.issueCommentId,
+              })),
+            });
+          }
+        } catch (err) {
+          logger.warn({ err, issueId: id }, "failed to enqueue answer attachment extraction jobs");
+        }
       }
     }
 
@@ -1226,6 +1263,10 @@ export function issueRoutes(db: Db, storage: StorageService) {
         return;
       }
       assertCompanyAccess(req, issue.companyId);
+      // PIN FENCE (Cond 1): the manager-answer path captures a human-answer memory
+      // entry via answerInternalManagerQuestion → captureHumanMemoryDurable; gate it
+      // at the route too so an off-tenant answer is rejected up front.
+      assertPinnedCompany(issue.companyId);
 
       const actor = getActorInfo(req);
       const result = await answerInternalManagerQuestion(db, {
@@ -1847,6 +1888,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
     const companyId = req.params.companyId as string;
     const issueId = req.params.issueId as string;
     assertCompanyAccess(req, companyId);
+    // PIN FENCE (Cond 1): an answer-linked upload enqueues an attachment-extraction
+    // job whose capture lands on the shared context rail. Reject an off-tenant upload
+    // UP FRONT rather than accept it and silently drop the capture at drain time, so
+    // the user never gets a "successful" upload with no context captured. No-op in the
+    // default local-first posture (single-DB / no pin).
+    assertPinnedCompany(companyId);
     const issue = await svc.getById(issueId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
@@ -1930,6 +1977,40 @@ export function issueRoutes(db: Db, storage: StorageService) {
         byteSize: attachment.byteSize,
       },
     });
+
+    // ---- Phase F: enqueue extraction when attaching to an ANSWERED Q&A answer ----
+    // The realistic UI flow answers FIRST (creating the answer comment), then uploads
+    // the PDF/image linked to that comment — so this upload route, not the answer
+    // route, is where the attachment becomes visible on the answer. When the linked
+    // comment is an answer/manager_answer whose question is resolvable, enqueue ONE
+    // extraction job so the drainer captures the attachment content into the central
+    // DB. Best-effort: a failure must NEVER fail the upload (the text answer is
+    // already captured; the asset is stored regardless).
+    if (parsedMeta.data.issueCommentId) {
+      try {
+        const answerComment = await svc.getComment(parsedMeta.data.issueCommentId);
+        if (answerComment && (answerComment.kind === "answer" || answerComment.kind === "manager_answer")) {
+          const question = await svc.getQuestionAnsweredBy(answerComment.id);
+          const questionText = (question?.body ?? "").trim() || "(question unavailable)";
+          await enqueueAttachmentExtractionJobs(db, {
+            companyId,
+            issueId,
+            answerCommentId: answerComment.id,
+            questionText,
+            answerText: (answerComment.body ?? "").trim(),
+            attachments: [
+              {
+                assetId: attachment.assetId,
+                contentType: attachment.contentType,
+                issueCommentId: attachment.issueCommentId,
+              },
+            ],
+          });
+        }
+      } catch (err) {
+        logger.warn({ err, issueId, attachmentId: attachment.id }, "failed to enqueue attachment extraction on upload");
+      }
+    }
 
     res.status(201).json(withContentPath(attachment));
   });

@@ -1,10 +1,14 @@
 import { and, asc, eq, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
-import { agents, issueComments, issues } from "@combyne/db";
+import { agents, assets, issueAttachments, issueComments, issues } from "@combyne/db";
 import { logger } from "../middleware/logger.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { notifyParentOnChildStatus } from "./issue-parent-notifications.js";
-import { captureHumanMemoryDurable, humanAnswerSource } from "./memory-capture.js";
+import {
+  captureHumanMemoryDurable,
+  enqueueAttachmentExtractionJobs,
+  humanAnswerSource,
+} from "./memory-capture.js";
 import { scanBody } from "../secret-scan.js";
 
 const COORDINATOR_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
@@ -468,6 +472,45 @@ export async function answerInternalManagerQuestion(
       sourceRefId: answerComment.id,
       createdBy: input.actor.actorId,
     });
+
+    // ---- Phase F: multi-modal attachment capture (INFRA_FIXES_PLAN §F) ----
+    // Mirror the answer-route enqueue: a genuine (non-assumption) manager answer
+    // may carry a PDF/image whose content must reach the central DB. An ASSUMPTION
+    // is a waved-through agent claim, not a human-vouched source, so we do NOT
+    // enqueue its attachments. Best-effort: never fail the answer flow.
+    if (!isAssumption) {
+      try {
+        const onAnswer = await db
+          .select({
+            assetId: issueAttachments.assetId,
+            contentType: assets.contentType,
+            issueCommentId: issueAttachments.issueCommentId,
+          })
+          .from(issueAttachments)
+          .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
+          .where(
+            and(
+              eq(issueAttachments.companyId, input.companyId),
+              eq(issueAttachments.issueCommentId, answerComment.id),
+            ),
+          );
+        if (onAnswer.length > 0) {
+          await enqueueAttachmentExtractionJobs(db, {
+            companyId: input.companyId,
+            issueId: issue.id,
+            answerCommentId: answerComment.id,
+            questionText,
+            answerText: scan.clean,
+            attachments: onAnswer,
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id },
+          "failed to enqueue manager-answer attachment extraction jobs",
+        );
+      }
+    }
   }
 
   const remainingOpen = await db

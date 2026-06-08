@@ -25,9 +25,10 @@ import {
 } from "@combyne/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
-import { loadConfig, logEmbeddingPosture } from "./config.js";
+import { loadConfig, logEmbeddingPosture, checkPinnedCompanyAdoption } from "./config.js";
 import { resolveContextDbUrl } from "./services/context-db.js";
 import { drainContextCaptureOutbox } from "./services/memory-capture.js";
+import { drainAttachmentExtractionJobs } from "./services/attachment-extract.js";
 import { contextTrace } from "./services/context-trace.js"; // CONTEXT-TRACE
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
@@ -521,6 +522,29 @@ export async function startServer(): Promise<StartedServer> {
         schemaPresent: probe.memorySchemaPresent,
         vectorSearchEnabled: config.vectorSearchEnabled,
       });
+      // B-PIN-5: when a company pin is set, surface whether any LOCAL company row
+      // actually carries that id. Without adoption, only the pinned tenant works and
+      // every other companyId 403s. Narrow probe query; a transient read failure must
+      // not convert a soft misconfig into a boot crash, so .catch → null (no rows).
+      if (config.contextCompanyId) {
+        const localCompanyIds = await db
+          .select({ id: companies.id })
+          .from(companies)
+          .where(eq(companies.id, config.contextCompanyId))
+          .then((rows: Array<{ id: string }>) => rows.map((r) => r.id))
+          .catch(() => [] as string[]);
+        const adoption = checkPinnedCompanyAdoption({
+          contextCompanyId: config.contextCompanyId,
+          localCompanyIds,
+          contextRequired: config.contextRequired,
+        });
+        if (adoption.warn) {
+          logger.warn({ pinnedCompanyId: config.contextCompanyId }, adoption.warn);
+        }
+        if (adoption.throwMsg) {
+          throw new Error(adoption.throwMsg);
+        }
+      }
     }
   } else {
     logger.warn(
@@ -872,6 +896,15 @@ export async function startServer(): Promise<StartedServer> {
     let lastRoutineAutoCloseAt = 0;
     const ROUTINE_AUTO_CLOSE_INTERVAL_MS = 15 * 60 * 1000;
 
+    // In-flight guards (F3): the heartbeat tick (every ~30s) fires the context-capture
+    // outbox drain and the attachment-extraction drain. A drain slower than the tick
+    // (a sluggish remote context DB, or a model call) would otherwise overlap itself
+    // and re-select the SAME due rows — double-charging the Claude vision/document
+    // call. These non-tick-local flags (mirroring the usage/backup/license pollers
+    // below) let each tick skip its own drain while a prior one is still running.
+    let contextOutboxDrainInFlight = false;
+    let attachmentDrainInFlight = false;
+
     setInterval(() => {
       void heartbeat
         .tickTimers(new Date())
@@ -894,9 +927,34 @@ export async function startServer(): Promise<StartedServer> {
       // Drain the durable context-capture outbox: replay any human-answer /
       // PR-approval memory writes that failed when the remote context DB was
       // unreachable, so an irreplaceable human-sourced answer is never lost (I4).
-      void drainContextCaptureOutbox(db as any).catch((err) => {
-        logger.error({ err }, "context capture outbox drain failed");
-      });
+      if (!contextOutboxDrainInFlight) {
+        contextOutboxDrainInFlight = true;
+        void drainContextCaptureOutbox(db as any)
+          .catch((err) => {
+            logger.error({ err }, "context capture outbox drain failed");
+          })
+          .finally(() => {
+            contextOutboxDrainInFlight = false;
+          });
+      }
+
+      // Phase F (INFRA_FIXES_PLAN): drain the multi-modal Q&A attachment-extraction
+      // queue. For each due job, fetch the PDF/image bytes and run the Claude
+      // vision/document pass OUT OF BAND (kept off the answer route so it stays
+      // fast), then capture the extracted content into the central DB. Best-effort
+      // and self-contained (never throws); a no-key deploy skips gracefully. Guarded
+      // so a drain slower than the 30s tick never overlaps itself and double-charges
+      // the model on the same job (F3).
+      if (!attachmentDrainInFlight) {
+        attachmentDrainInFlight = true;
+        void drainAttachmentExtractionJobs(db as any, { storage: storageService })
+          .catch((err) => {
+            logger.error({ err }, "attachment extraction drain failed");
+          })
+          .finally(() => {
+            attachmentDrainInFlight = false;
+          });
+      }
 
       // Round 3 Phase 8 — companion issue-side sweep. Cheap LEFT JOIN on
       // issues with non-null execution_run_id; catches the lock-leak mode
