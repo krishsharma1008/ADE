@@ -693,7 +693,7 @@ Wire these as alerts, not dashboards-nobody-watches. The hallucination-guardrail
 | `COMBYNE_RUN_MIGRATIONS_ON_BOOT` | new gate (planned at the external branch, `index.ts:277`) | `false` → app does NOT migrate on boot (use one-shot job) | **[TO BE BUILT — Phase 1]** |
 | `COMBYNE_DB_DISABLE_PREPARE` | new in `pgOptions` (`client.ts:14-17`) | `true` → `prepare:false` for self-hosted pgbouncer (today only port 6543 triggers it) | **[TO BE BUILT — Phase 2]** |
 | `COMBYNE_DB_POOL_MAX` | new in `createDb` (`client.ts:50-53`) | Explicit postgres-js `max` (today silent default 10) | **[TO BE BUILT — Phase 2]** |
-| `COMBYNE_VECTOR_SEARCH_ENABLED` | new, `memory.ts` swap point | Gate pgvector ANN vs the hash-64 test oracle | **[TO BE BUILT — Phase 4]** |
+| `COMBYNE_VECTOR_SEARCH_ENABLED` | `config.ts` (resolved posture) | Gate pgvector ANN vs the hash-64 fallback. **[SHIPPED]** Now AUTO-ON for a deliberate key (UI-saved config.json or the dedicated `COMBYNE_EMBEDDING_API_KEY`); a generic `OPENAI_API_KEY` alone does NOT enable it (needs `=true`); `=false` is the kill-switch; empty key always OFF (no egress). | exists |
 
 ---
 

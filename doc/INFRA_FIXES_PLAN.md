@@ -1,7 +1,15 @@
 # Infra-Fixes Plan — close the 2-DB discovery gaps & keep docs current
 
+> **STATUS (2026-06-08): Phases A, B, D, F SHIPPED on `central-db`.** Vector-search activation, the
+> company-pin enforcement + `db:company-pin` adoption glue, the docs alignment, and the multi-modal
+> Q&A attachment capture are all merged with the full gate green (948 server + 26 UI tests, all
+> package typechecks, custom lints). Phase C is operational/doc (Cloud SQL backups). Phase E (RLS
+> FORCE) remains the documented, deliberately-deferred future gate. The plan text below is preserved
+> as the design record; where runtime since diverged (e.g. vector-search now gates on key INTENT, not
+> any non-empty key), the inline notes call it out.
+
 Branch `central-db`. Closes the five gaps from the discovery review, each surgical, each keeping the
-server suite (892) + UI suite (26) + lint gates green. Ordered by leverage; phases A–D are independently
+server suite + UI suite (26) + lint gates green. Ordered by leverage; phases A–D are independently
 shippable, E is a documented future gate (not implemented now).
 
 **Confirmed decisions (2026-06-08):** embedding config = **UI canonical** (Phase A as written); central DB
@@ -24,7 +32,10 @@ are the remaining asymmetry. There's also a misleading comment at `context-datab
 - `config.ts` (env-wins, then config.json):
   - `embeddingApiKey = envVar("EMBEDDING_API_KEY") ?? process.env.OPENAI_API_KEY ?? readConfigFileEmbedding()?.apiKey ?? ""`
   - same fall-through for `embeddingProvider` / `embeddingModel` / `embeddingDim`.
-  - `vectorSearchEnabled` then naturally flips true once the resolved key is non-empty (existing coercion).
+  - `vectorSearchEnabled` then flips on for a **deliberate** key. **[SHIPPED — refined]** A UI-saved
+    config.json key or the dedicated `COMBYNE_EMBEDDING_API_KEY` auto-enables it; a generic host
+    `OPENAI_API_KEY` does **not** (it needs an explicit `COMBYNE_VECTOR_SEARCH_ENABLED=true`) so a stray
+    key never silently egresses memory. `COMBYNE_VECTOR_SEARCH_ENABLED=false` is the kill-switch.
 - `context-database.ts:214`: delete the inaccurate "loadConfig resolves the key" comment; replace with the
   truth ("activated on next restart; env still wins").
 - (Optional, cleaner long-term) add the embedding block to `combyneConfigSchema` so the strict reader keeps
@@ -32,6 +43,8 @@ are the remaining asymmetry. There's also a misleading comment at `context-datab
 
 **Test:** extend `config-context-db.test.ts` — write a `config.json` with the embedding block, no env →
 `loadConfig().embeddingApiKey` resolves it and `vectorSearchEnabled === true`; env still overrides.
+**[SHIPPED]** plus the key-INTENT cases: a generic `OPENAI_API_KEY` alone stays `false`, the dedicated
+`COMBYNE_EMBEDDING_API_KEY` alone is `true`, and the `=false` kill-switch wins.
 **Acceptance:** set the key in the UI Memory→Setup tab → restart → boot logs `hasKey:true` + vector ON with
 **no env var set**. **Effort: S.**
 
@@ -107,7 +120,16 @@ remote connection; flip with the cross-tenant non-owner test green. Track as a s
 
 ---
 
-## Phase F — Multi-modal Q&A answer capture (PDF / image → processed → central DB)  ·  *new feature*
+## Phase F — Multi-modal Q&A answer capture (PDF / image → processed → central DB)  ·  *SHIPPED*
+> **SHIPPED on `central-db`.** Built as `services/attachment-extract.ts` (injectable Anthropic
+> vision/document driver + `drainAttachmentExtractionJobs` on the heartbeat tick) + the
+> `attachment_extraction_jobs` queue (migration `0060`) + the answer-route enqueue. The trust posture
+> below was adopted as recommended (PDF transcription → `human-answer`/`verified`; image description →
+> `verified-summary`/`verified`). The processor is durable + bounded: terminal status at MAX_ATTEMPTS,
+> bounded empty-extraction, a preflight byteSize cap (no 413 loop), redact-before-capture over the WHOLE
+> composed body, in-flight drain guard, the company-pin fence, and a durable-delete gate (delete only on
+> written / durably-queued / terminal-skip). Tests in `__tests__/attachment-extraction.test.ts`.
+
 **Requirement:** when a human answers a Q&A question with a **PDF or image** (attached to the answer), the
 attachment's **content** must be processed and captured into the central DB — embedded + retrievable — not
 left as an opaque "see attached".
