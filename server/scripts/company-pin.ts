@@ -16,7 +16,9 @@
 // The company row lives in the OPS DB (DATABASE_URL), not the context DB — only
 // the memory/context tables live remotely. So this targets DATABASE_URL, and when
 // DATABASE_URL is unset it targets the DEFAULT EMBEDDED ops Postgres (the standard
-// local-first setup) so the script works out of the box.
+// local-first setup). NOTE: the embedded DB's lifecycle is owned by the app, not this
+// script — have `pnpm dev` (or `pnpm start`) running so it is up, or pass --db <url>.
+// If it isn't reachable, the script exits with an actionable message (not a raw error).
 //
 // Flags:
 //   --id <uuid>       The canonical company UUID to adopt (the shared pin). Required.
