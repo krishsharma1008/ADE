@@ -241,7 +241,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
   }
 
   async function normalizeIssueIdentifier(rawId: string): Promise<string> {
-    if (/^[A-Z]+-\d+$/i.test(rawId)) {
+    if (/^[A-Z0-9]+-\d+$/i.test(rawId)) {
       const issue = await svc.getByIdentifier(rawId);
       if (issue) {
         return issue.id;
@@ -1741,6 +1741,18 @@ export function issueRoutes(db: Db, storage: StorageService) {
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
     });
+
+    // Keep the standalone comment endpoint in parity with PATCH /issues/:id:
+    // if an agent asks questions in a plain comment, surface them as structured
+    // question comments so the UI renders answer cards instead of prose only.
+    if (actor.agentId && currentIssue.status !== "done" && currentIssue.status !== "cancelled") {
+      await extractAndPostQuestions(db, {
+        companyId: currentIssue.companyId,
+        agentId: actor.agentId,
+        issueId: currentIssue.id,
+        sourceText: comment.body,
+      });
+    }
 
     await notifyParentOnChildAgentComment(db, {
       child: currentIssue,

@@ -50,7 +50,7 @@ export function activityRoutes(db: Db) {
   // Resolve issue identifiers (e.g. "PAP-39") to UUIDs
   router.param("id", async (req, res, next, rawId) => {
     try {
-      if (/^[A-Z]+-\d+$/i.test(rawId)) {
+      if (/^[A-Z0-9]+-\d+$/i.test(rawId)) {
         const issue = await issueSvc.getByIdentifier(rawId);
         if (issue) {
           req.params.id = issue.id;

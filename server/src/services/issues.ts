@@ -37,6 +37,9 @@ const ALL_ISSUE_STATUSES = [
 ];
 
 const COORDINATOR_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
+/** Distinguishes a uuid primary key from a human identifier (e.g. "PINB405-3") so
+ * issue lookups can accept either shape without a uuid-cast 500. */
+const ISSUE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CHILD_TERMINAL_STATUSES = new Set(["done", "cancelled"]);
 const VERIFICATION_COMMENT_RE = /\b(verified|verification|reviewed|qa passed|checks? passed|tests? passed|validated)\b/i;
 
@@ -741,10 +744,14 @@ export function issueService(db: Db) {
     },
 
     getById: async (id: string) => {
+      // Accept EITHER a uuid or a human identifier (e.g. "PINB405-3"). The UI
+      // routes by identifier, so a uuid-only lookup throws an invalid-uuid cast
+      // error (500) on identifier input. Match the column to the input shape.
+      const isUuid = ISSUE_UUID_RE.test(id);
       const row = await db
         .select()
         .from(issues)
-        .where(eq(issues.id, id))
+        .where(isUuid ? eq(issues.id, id) : eq(issues.identifier, id.toUpperCase()))
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
       const [enriched] = await withIssueLabels(db, [row]);

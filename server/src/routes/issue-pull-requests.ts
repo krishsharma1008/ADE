@@ -18,7 +18,7 @@ export function issuePullRequestRoutes(db: Db) {
   const acceptedWork = acceptedWorkService(db);
 
   async function getIssueByIdOrIdentifier(rawIssueId: string) {
-    if (/^[A-Z]+-\d+$/i.test(rawIssueId)) {
+    if (/^[A-Z0-9]+-\d+$/i.test(rawIssueId)) {
       const byIdentifier = await db
         .select()
         .from(issues)
