@@ -264,6 +264,20 @@ export function issuePullRequestService(db: Db) {
         return null;
       });
     await recordExternalMergeAcceptedWork(row, pr);
+    // Resolve the merge approval so the inbox stops showing it under "needing action".
+    // The in-app merge() path already does this (approvalsSvc.approve at the PR panel),
+    // but an EXTERNAL GitHub merge detected by reconcile previously left the approval in
+    // pending/revision_requested — so the card lingered after the PR was already merged
+    // (the inbox counts revision_requested as actionable, ui Approvals.tsx). The merge is
+    // the final decision, so mark it approved. Best-effort + idempotent: approve() no-ops
+    // (throws, swallowed here) on an already-terminal approval, so a re-reconcile is safe.
+    if (row.approvalId) {
+      await approvalsSvc
+        .approve(row.approvalId, "issue-pr-reconcile", "PR merged on GitHub")
+        .catch((err) =>
+          logger.debug({ err, approvalId: row.approvalId }, "issue_pr.external_merge_approval_resolve_skipped"),
+        );
+    }
   }
 
   async function requireGitHubConfig(companyId: string): Promise<GitHubConfig> {

@@ -734,6 +734,16 @@ describe("HOOK 2 — EM PR-approval capture (deterministic, no LLM)", () => {
       expect(afterReconcile.status).toBe("done");
       expect(afterReconcile.completedAt).not.toBeNull();
 
+      // APPROVAL PARITY: the external merge must also RESOLVE the merge approval, so the
+      // inbox stops listing it under "needing action" (which counts pending +
+      // revision_requested). Previously reconcile closed the issue but left the approval
+      // pending, so the merged PR's card lingered in the inbox.
+      const [resolvedApproval] = await handle.db
+        .select()
+        .from(approvals)
+        .where(eq(approvals.id, tracked.approvalId!));
+      expect(resolvedApproval.status).toBe("approved");
+
       // Reconciling again must NOT duplicate (transition guard + (companyId, source) dedup)
       // and the done-transition no-ops.
       await svc.reconcile(tracked.id);
