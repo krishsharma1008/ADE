@@ -1512,6 +1512,19 @@ export function IssueDetail() {
                       <span className={cn("font-medium", gateClass(pr.mergeStatus))}>{pr.mergeStatus}</span>
                     </div>
                   </div>
+                  {hasLiveRuns && (
+                    <div className="flex items-center gap-2 rounded-md border border-cyan-500/30 bg-cyan-500/5 px-3 py-2 text-xs text-cyan-300">
+                      <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                      <span>
+                        <span className="font-medium">
+                          {(liveRuns ?? [])[0]?.agentName ?? activeRun?.agentName ?? "An agent"}
+                        </span>{" "}
+                        is working on this PR right now — addressing the requested review/changes. This
+                        view refreshes automatically (every few seconds); you don't need to do anything
+                        until it's done, then the gates below update and Merge unlocks.
+                      </span>
+                    </div>
+                  )}
                   {blockers.length > 0 && (
                     <div className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-300">
                       {blockers.slice(0, 4).map((blocker) => (
@@ -1519,7 +1532,7 @@ export function IssueDetail() {
                       ))}
                     </div>
                   )}
-                  {awaitingHuman && (
+                  {awaitingHuman && !hasLiveRuns && (
                     <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-300">
                       Review changes were requested. Agents are holding for your review and
                       won't touch the code until you choose <span className="font-medium">Let agents fix</span>{" "}
