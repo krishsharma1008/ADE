@@ -1,5 +1,5 @@
 import type { MemoryEntry, UpdateMemoryEntry } from "@combyne/shared";
-import { Edit2, Globe } from "lucide-react";
+import { Check, Edit2, Globe } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useState } from "react";
@@ -38,6 +38,9 @@ export function MemoryEntryCard({
    */
   onPromoteToGlobal,
   isPromoting,
+  alreadyPromoted,
+  justPromoted,
+  promoteError,
 }: {
   entry: MemoryEntry;
   onSave?: (entryId: string, data: UpdateMemoryEntry) => void;
@@ -45,6 +48,12 @@ export function MemoryEntryCard({
   saveError?: string | null;
   onPromoteToGlobal?: (entryId: string) => void;
   isPromoting?: boolean;
+  /** This source already has a global-layer copy — show a settled "In global" state. */
+  alreadyPromoted?: boolean;
+  /** The most recent promote of THIS entry just succeeded — transient confirmation. */
+  justPromoted?: boolean;
+  /** A failed promote of THIS entry, surfaced inline (the action was otherwise silent). */
+  promoteError?: string | null;
 }) {
   const [editOpen, setEditOpen] = useState(false);
   const superseded = entry.supersededById != null;
@@ -95,7 +104,16 @@ export function MemoryEntryCard({
             <Edit2 className="h-4 w-4" />
           </Button>
         )}
-        {canPromoteToGlobal && (
+        {alreadyPromoted || justPromoted ? (
+          <Badge
+            variant="outline"
+            className="gap-1 border-green-600/40 text-green-600"
+            aria-label={`${entry.subject} is in the global layer`}
+          >
+            <Check className="h-3.5 w-3.5" />
+            In global
+          </Badge>
+        ) : canPromoteToGlobal ? (
           <Button
             variant="outline"
             size="sm"
@@ -104,10 +122,15 @@ export function MemoryEntryCard({
             aria-label={`Promote ${entry.subject} to global`}
           >
             <Globe className="mr-1 h-3.5 w-3.5" />
-            Promote to global
+            {isPromoting ? "Promoting…" : "Promote to global"}
           </Button>
-        )}
+        ) : null}
       </div>
+      {promoteError && (
+        <p className="mt-1 text-xs text-destructive" role="alert">
+          Promote failed: {promoteError}
+        </p>
+      )}
 
       <p
         className={cn(

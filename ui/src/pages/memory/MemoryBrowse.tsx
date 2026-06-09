@@ -119,8 +119,34 @@ export function MemoryBrowse({ isInstanceAdmin = false }: { isInstanceAdmin?: bo
     mutationFn: (entryId: string) => memoryApi.promoteToGlobal(entryId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["memory", selectedCompanyId, "browse"] });
+      // Refresh the global-layer view so the "In global" state settles for this source.
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.memory.entries(selectedCompanyId!, "global"),
+      });
     },
   });
+
+  // M6: which company entries already have a global copy. The promote endpoint is
+  // idempotent (re-promoting returns the existing global row), so the source entry
+  // looks unchanged after a promote — without this the button gives no signal it
+  // worked. Global rows carry `source = "global-promotion:<sourceEntryId>"`, so we
+  // map them back to the sources that are already promoted. Instance-admin only.
+  const globalEntriesQuery = useQuery({
+    queryKey: queryKeys.memory.entries(selectedCompanyId!, "global"),
+    queryFn: () => memoryApi.listGlobal(selectedCompanyId!),
+    enabled: isInstanceAdmin && !!selectedCompanyId,
+    staleTime: 60_000,
+  });
+  const promotedSourceIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const g of globalEntriesQuery.data ?? []) {
+      const match = /^global-promotion:(.+)$/.exec(g.source ?? "");
+      if (match) ids.add(match[1]);
+    }
+    return ids;
+  }, [globalEntriesQuery.data]);
+  const promoteErrorMessage =
+    promoteToGlobal.error instanceof Error ? promoteToGlobal.error.message : "Promotion failed";
 
   // `kind` has no server-side filter param, so it is applied client-side along
   // with the free-text search.
@@ -262,7 +288,18 @@ export function MemoryBrowse({ isInstanceAdmin = false }: { isInstanceAdmin?: bo
               onPromoteToGlobal={
                 isInstanceAdmin ? (entryId) => promoteToGlobal.mutate(entryId) : undefined
               }
-              isPromoting={promoteToGlobal.isPending}
+              isPromoting={
+                promoteToGlobal.isPending && promoteToGlobal.variables === entry.id
+              }
+              alreadyPromoted={promotedSourceIds.has(entry.id)}
+              justPromoted={
+                promoteToGlobal.isSuccess && promoteToGlobal.variables === entry.id
+              }
+              promoteError={
+                promoteToGlobal.isError && promoteToGlobal.variables === entry.id
+                  ? promoteErrorMessage
+                  : null
+              }
             />
           ))}
         </div>
