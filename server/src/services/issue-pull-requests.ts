@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, asc, eq, ne } from "drizzle-orm";
+import { and, asc, eq, ne, notInArray } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { approvals, issueApprovals, issueComments, issuePullRequests, issues } from "@combyne/db";
 import type {
@@ -17,6 +17,7 @@ import { createSonarQubeClient } from "./sonarqube.js";
 import { issueService } from "./issues.js";
 import { approvalService } from "./approvals.js";
 import { heartbeatService } from "./heartbeat.js";
+import { acceptedWorkService } from "./accepted-work.js";
 import type { CreateEntryInput } from "./memory.js";
 import { captureHumanMemoryDurable, prApprovalSource } from "./memory-capture.js";
 import { contextTrace } from "./context-trace.js"; // CONTEXT-TRACE
@@ -190,6 +191,80 @@ export function issuePullRequestService(db: Db) {
   const integrations = integrationService(db);
   const issuesSvc = issueService(db);
   const approvalsSvc = approvalService(db);
+  const acceptedWorkSvc = acceptedWorkService(db);
+
+  // Shared accepted-work upsert + manager wake for an externally-observed merge.
+  // Mirrors the in-app merge route's wakeAcceptedWorkManager (routes/issue-pull-requests.ts)
+  // but is callable from reconcile() so the EM is woken on a GitHub-direct merge even when
+  // heartbeats are OFF (manual wake) — the heartbeat-coupled poller never runs in that mode.
+  // resolveManager prefers the PARENT issue's assignee (the EM), so the wake carries a
+  // merged-PR brief to the coordinator. Best-effort: a wake failure must never fail reconcile.
+  async function recordExternalMergeAcceptedWork(
+    row: typeof issuePullRequests.$inferSelect,
+    pr: { title: string; body?: string | null; headBranch?: string | null; mergeCommitSha?: string | null; mergedAt?: string | null; htmlUrl?: string | null; user?: string | null; baseBranch?: string | null },
+  ): Promise<void> {
+    try {
+      const accepted = await acceptedWorkSvc.upsertMergedPull({
+        companyId: row.companyId,
+        issueId: row.issueId,
+        repo: row.repo,
+        pullNumber: row.pullNumber,
+        pullUrl: pr.htmlUrl ?? row.pullUrl,
+        title: pr.title ?? row.title,
+        body: pr.body ?? null,
+        headBranch: pr.headBranch ?? row.headBranch ?? null,
+        mergedSha: pr.mergeCommitSha ?? row.mergeCommitSha ?? null,
+        mergedAt: pr.mergedAt ?? new Date().toISOString(),
+        // Distinguish the reconcile-observed external merge from the in-app dashboard merge.
+        detectionSource: "github_reconcile",
+        metadata: { githubUser: pr.user ?? null, baseBranch: pr.baseBranch ?? row.baseBranch ?? null, issuePullRequestId: row.id },
+      });
+      // shouldWakeManager is guarded by upsertMergedPull on (memoryStatus pending,
+      // managerAgentId present, no prior wakeupRequestedAt) — idempotent against the
+      // dashboard-merge path and the heartbeat poller, so a double-fire is safe.
+      if (accepted.shouldWakeManager && accepted.event.managerAgentId) {
+        await heartbeatService(db).wakeup(accepted.event.managerAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "accepted_work_merged_pr",
+          payload: { acceptedWorkEventId: accepted.event.id },
+          requestedByActorType: "system",
+          requestedByActorId: "accepted-work",
+          contextSnapshot: { acceptedWorkEventId: accepted.event.id, source: "accepted_work.merged_pr" },
+        });
+        await acceptedWorkSvc.markWakeRequested(accepted.event.id);
+      }
+    } catch (err) {
+      // A wake/accepted-work failure must never fail the reconcile/poll.
+      logger.debug({ err, issuePullRequestId: row.id }, "issue_pr.external_merge_wake_failed");
+    }
+  }
+
+  // Close-out parity with the in-app merge() path for an externally-observed merge:
+  // transition the tracked issue to "done" (which fires notifyParentOnChildStatus ->
+  // wakes the parent coordinator/EM) and wake the EM via the accepted-work manager-wake.
+  // DESIGN BOUNDARY: this CLOSES the child and INFORMS the EM — it deliberately does NOT
+  // auto-start the next phase. Next-phase initiation vs. asking the human is a judgment
+  // call the codebase intentionally leaves to the woken coordinator (e.g. PINB405 phases
+  // 2-3 are gated on an open FE-readiness question), so auto-advancing here would be wrong.
+  // Best-effort throughout: a delegation-policy rejection or wake failure must never fail
+  // the caller (reconcile/poll/sweep).
+  async function closeMergedTrackedIssue(
+    row: typeof issuePullRequests.$inferSelect,
+    pr: { title: string; body?: string | null; headBranch?: string | null; mergeCommitSha?: string | null; mergedAt?: string | null; htmlUrl?: string | null; user?: string | null; baseBranch?: string | null },
+  ): Promise<void> {
+    await issuesSvc
+      .update(
+        row.issueId,
+        { status: "done" },
+        { parentNotificationActor: { actorType: "system", actorId: "issue-pr-reconcile" } },
+      )
+      .catch((err) => {
+        logger.debug({ err, issueId: row.issueId }, "issue_pr.external_merge_close_failed");
+        return null;
+      });
+    await recordExternalMergeAcceptedWork(row, pr);
+  }
 
   async function requireGitHubConfig(companyId: string): Promise<GitHubConfig> {
     const row = await integrations.getByProvider(companyId, "github");
@@ -345,24 +420,46 @@ export function issuePullRequestService(db: Db) {
     // transition (old row not yet merged) so we capture once, not on every poll;
     // and even a double-fire is idempotent via the (company_id, source) dedup, so
     // an in-app merge() that already captured is never duplicated here.
-    if (pr.merged && row.mergeStatus !== "merged" && updated.approvalId) {
-      const approvalMemoryEntryId = await captureApprovalMemory({
-        row: updated,
-        status: { feedback, reviews } as IssuePullRequestStatus,
-        approvalId: updated.approvalId,
-        decisionNote: null, // external merge: no in-app decision note
-        decidedByUserId: null, // merged outside ADE
-      });
-      if (approvalMemoryEntryId) {
-        contextTrace("context_write", {
-          provenance: "pr-approval",
-          companyId: updated.companyId,
-          source: `pr-approval:${updated.provider}:${updated.repo}#${updated.pullNumber}`,
-          issueId: updated.issueId,
-          entryId: approvalMemoryEntryId,
-          via: "reconcile_external_merge",
+    if (pr.merged && row.mergeStatus !== "merged") {
+      // The MEMORY capture stays gated on an existing approvalId (a verified pr-approval
+      // requires the merge_pr approval row), but the STATUS close-out and EM wake must
+      // fire on the merged transition regardless — even on the rare approval-less merge.
+      if (updated.approvalId) {
+        const approvalMemoryEntryId = await captureApprovalMemory({
+          row: updated,
+          status: { feedback, reviews } as IssuePullRequestStatus,
+          approvalId: updated.approvalId,
+          decisionNote: null, // external merge: no in-app decision note
+          decidedByUserId: null, // merged outside ADE
         });
+        if (approvalMemoryEntryId) {
+          contextTrace("context_write", {
+            provenance: "pr-approval",
+            companyId: updated.companyId,
+            source: `pr-approval:${updated.provider}:${updated.repo}#${updated.pullNumber}`,
+            issueId: updated.issueId,
+            entryId: approvalMemoryEntryId,
+            via: "reconcile_external_merge",
+          });
+        }
       }
+
+      // CLOSE-OUT PARITY with the in-app merge() path. merge() sets the tracked issue to
+      // "done" (firing notifyParentOnChildStatus -> waking the parent coordinator) and runs
+      // the accepted-work manager-wake. An external GitHub-direct merge previously captured
+      // memory but LEFT THE ISSUE in "in_review" and never woke the EM — so a merged sub-task
+      // froze and the parent's next phase was never raised. closeMergedTrackedIssue mirrors
+      // that close-out (transition + EM wake) and works even when heartbeats are OFF.
+      await closeMergedTrackedIssue(updated, {
+        title: pr.title,
+        body: pr.body,
+        headBranch: pr.headBranch,
+        mergeCommitSha: pr.mergeCommitSha,
+        mergedAt: pr.mergedAt,
+        htmlUrl: pr.htmlUrl,
+        user: pr.user,
+        baseBranch: pr.baseBranch,
+      });
     }
 
     const refreshed = await getById(row.id);
@@ -565,7 +662,75 @@ export function issuePullRequestService(db: Db) {
     return { pullRequest: await getById(row.id), dispatched };
   }
 
+  // BACKSTOP sweep (belt-and-suspenders on top of the in-line reconcile close-out).
+  // dispatchFeedbackForCompany filters OUT merged PRs (mergeStatus != 'merged'), so once a
+  // PR is merged the company poller never looks at it again. If the in-line reconcile
+  // close-out was ever missed — e.g. a PR that was already merged on GitHub BEFORE this fix
+  // shipped (PINB405-5) — the tracked issue would stay stuck (in_review) forever. This sweep
+  // finds merged PRs whose linked issue is still open (NOT done/cancelled) and runs the same
+  // idempotent done-transition + EM wake. Scoped per-company, batch-limited, soft-fail per
+  // row. The done-transition no-ops if already terminal; the manager-wake is dedup-guarded —
+  // so a row that was already closed in-line is harmless here.
+  async function sweepMergedOpenIssues(companyId: string): Promise<{ scanned: number; closed: number }> {
+    const rows = await db
+      .select({
+        prId: issuePullRequests.id,
+        issueId: issuePullRequests.issueId,
+        repo: issuePullRequests.repo,
+        pullNumber: issuePullRequests.pullNumber,
+        pullUrl: issuePullRequests.pullUrl,
+        title: issuePullRequests.title,
+        headBranch: issuePullRequests.headBranch,
+        baseBranch: issuePullRequests.baseBranch,
+        mergeCommitSha: issuePullRequests.mergeCommitSha,
+        mergedAt: issuePullRequests.mergedAt,
+        issueStatus: issues.status,
+      })
+      .from(issuePullRequests)
+      .innerJoin(issues, eq(issues.id, issuePullRequests.issueId))
+      .where(
+        and(
+          eq(issuePullRequests.companyId, companyId),
+          eq(issuePullRequests.mergeStatus, "merged"),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(asc(issuePullRequests.mergedAt))
+      .limit(50);
+
+    let closed = 0;
+    for (const row of rows) {
+      try {
+        const prRow = await getById(row.prId);
+        if (!prRow) continue;
+        await closeMergedTrackedIssue(prRow, {
+          title: row.title,
+          headBranch: row.headBranch,
+          baseBranch: row.baseBranch,
+          mergeCommitSha: row.mergeCommitSha,
+          mergedAt: row.mergedAt ? row.mergedAt.toISOString() : null,
+          htmlUrl: row.pullUrl,
+        });
+        // One-time visibility for the retroactive bulk transition of historically-merged
+        // issues, so the sweep's writes are observable in logs the first time it runs.
+        logger.info(
+          { companyId, issueId: row.issueId, repo: row.repo, pullNumber: row.pullNumber, fromStatus: row.issueStatus },
+          "issue_pr.swept_merged_open_issue_to_done",
+        );
+        closed++;
+      } catch (err) {
+        // Soft-fail per row so one bad issue doesn't kill the sweep.
+        logger.debug({ err, issuePullRequestId: row.prId }, "issue_pr.sweep_merged_open_failed");
+      }
+    }
+    return { scanned: rows.length, closed };
+  }
+
   async function dispatchFeedbackForCompany(companyId: string) {
+    // Run the merged-but-open backstop first so a stuck merged sub-task is reconciled even
+    // though the feedback query below intentionally excludes merged PRs.
+    const swept = await sweepMergedOpenIssues(companyId).catch(() => ({ scanned: 0, closed: 0 }));
+
     const rows = await db
       .select({ id: issuePullRequests.id })
       .from(issuePullRequests)
@@ -590,13 +755,13 @@ export function issuePullRequestService(db: Db) {
         // blocking feedback dispatch for the rest of the company.
       }
     }
-    return { scanned, sent, woken };
+    return { scanned, sent, woken, sweptMerged: swept.scanned, closedMerged: swept.closed };
   }
 
   async function maybeDispatchFeedbackForCompany(companyId: string) {
     const last = prFeedbackReconcileThrottle.get(companyId) ?? 0;
     if (Date.now() - last < PR_FEEDBACK_RECONCILE_INTERVAL_MS) {
-      return { skipped: true as const, scanned: 0, sent: 0, woken: 0 };
+      return { skipped: true as const, scanned: 0, sent: 0, woken: 0, sweptMerged: 0, closedMerged: 0 };
     }
     prFeedbackReconcileThrottle.set(companyId, Date.now());
     return { skipped: false as const, ...(await dispatchFeedbackForCompany(companyId)) };
@@ -823,6 +988,7 @@ export function issuePullRequestService(db: Db) {
     setFeedbackOptIn,
     dispatchFeedbackForCompany,
     maybeDispatchFeedbackForCompany,
+    sweepMergedOpenIssues,
     merge,
   };
 }

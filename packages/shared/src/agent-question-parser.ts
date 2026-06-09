@@ -120,15 +120,46 @@ function extractDedicatedQuestionSectionItems(lines: string[]): ExtractedAgentQu
       continue;
     }
     if (!insideSection) continue;
-    // Under a DEDICATED question-section header, a line is a question if it CONTAINS
-    // a '?', not only if it ENDS with one — agents routinely append a clarifying
-    // clause after the question mark (e.g. "...still calling these endpoints? Phase 2
-    // removal is blocked on this confirmation."). The header already signals intent,
-    // so contains-'?' is safe here; the header-less fallback path stays strict.
-    const item = stripBullet(line) || (line.includes("?") ? stripMarkdownEmphasis(line) : "");
-    if (item && item.includes("?")) out.push({ body: item, choices: null });
+    // Under a DEDICATED question-section header, a line is a question if it contains a
+    // SENTENCE-TERMINATING '?', not only if it ENDS with one — agents routinely append a
+    // clarifying clause after the question mark (e.g. "...still calling these endpoints?
+    // Phase 2 removal is blocked on this confirmation."). The header already signals
+    // intent. But a bare contains-'?' over-matches on non-questions whose text merely
+    // embeds a '?': URL query strings ("...at /v1/intent?fields=id before removing it")
+    // and parenthetical asides ("...shipped the replacement (was it ever called? unclear)").
+    // hasSentenceQuestion treats a '?' as terminating only when it is followed by
+    // whitespace/end AND is not inside a URL query string or an unclosed '(' on the line.
+    const item = stripBullet(line) || (hasSentenceQuestion(line) ? stripMarkdownEmphasis(line) : "");
+    if (item && hasSentenceQuestion(item)) out.push({ body: item, choices: null });
   }
   return out;
+}
+
+// True when `line` contains a '?' that reads as a sentence terminator rather than an
+// incidental embedded '?'. Used only on lines already under a dedicated question header.
+// Rejects: URL query strings (e.g. "...intent?fields=id"), and a '?' that sits inside an
+// unclosed parenthetical aside (e.g. "...(was it ever called? unclear from logs)"). A
+// trailing '?' (endsWith) always qualifies. Residual ambiguity like "rollback tested? yes"
+// is accepted — distinguishing that needs NLP and is low-frequency.
+function hasSentenceQuestion(line: string): boolean {
+  const text = line.trim();
+  if (!text) return false;
+  if (text.endsWith("?")) return true;
+  for (let i = text.indexOf("?"); i !== -1; i = text.indexOf("?", i + 1)) {
+    const next = text[i + 1];
+    // Must be sentence-terminating: end of line or whitespace after the '?'. This rejects
+    // "intent?fields=" (next char is a letter) and other glued query/qualifier strings.
+    if (next !== undefined && !/\s/.test(next)) continue;
+    // Reject a '?' that is the tail of a URL query string somewhere before it on the line.
+    if (/:\/\/\S*\?/.test(text.slice(0, i + 1))) continue;
+    // Reject a '?' inside an unclosed parenthetical aside (more '(' than ')' before it).
+    const before = text.slice(0, i);
+    const opens = (before.match(/\(/g) ?? []).length;
+    const closes = (before.match(/\)/g) ?? []).length;
+    if (opens > closes) continue;
+    return true;
+  }
+  return false;
 }
 
 function extractFallbackQuestionItems(lines: string[]): ExtractedAgentQuestion[] {

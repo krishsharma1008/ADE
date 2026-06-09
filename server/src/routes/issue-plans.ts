@@ -18,7 +18,10 @@ export function issuePlanRoutes(db: Db) {
     }
     assertCompanyAccess(req, issue.companyId);
 
-    const plan = await planSvc.getPlan(issueId);
+    // Use the resolved UUID (issue.id), never the raw param: issuePlans.issueId is a uuid
+    // FK, so passing a human identifier (e.g. "PINB405-3") past getById would throw an
+    // "invalid input syntax for type uuid" 500 in the plan query.
+    const plan = await planSvc.getPlan(issue.id);
     if (!plan) {
       res.status(404).json({ error: "No plan found for this issue" });
       return;
@@ -44,7 +47,9 @@ export function issuePlanRoutes(db: Db) {
     assertCompanyAccess(req, issue.companyId);
 
     const actor = getActorInfo(req);
-    const existing = await planSvc.getPlan(issueId);
+    // Resolve to the uuid for all plan-service calls (issuePlans.issueId is a uuid FK).
+    const resolvedIssueId = issue.id;
+    const existing = await planSvc.getPlan(resolvedIssueId);
 
     let plan;
     if (existing) {
@@ -58,11 +63,11 @@ export function issuePlanRoutes(db: Db) {
         action: "issue_plan.updated",
         entityType: "issue_plan",
         entityId: plan.id,
-        details: { issueId, version: plan.version },
+        details: { issueId: resolvedIssueId, version: plan.version },
       });
     } else {
       plan = await planSvc.createPlan({
-        issueId,
+        issueId: resolvedIssueId,
         companyId: issue.companyId,
         content,
         authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
@@ -77,7 +82,7 @@ export function issuePlanRoutes(db: Db) {
         action: "issue_plan.created",
         entityType: "issue_plan",
         entityId: plan.id,
-        details: { issueId },
+        details: { issueId: resolvedIssueId },
       });
     }
 
@@ -94,7 +99,7 @@ export function issuePlanRoutes(db: Db) {
     }
     assertCompanyAccess(req, issue.companyId);
 
-    const existing = await planSvc.getPlan(issueId);
+    const existing = await planSvc.getPlan(issue.id);
     if (!existing) {
       res.status(404).json({ error: "No plan found for this issue" });
       return;
@@ -111,7 +116,7 @@ export function issuePlanRoutes(db: Db) {
       action: "issue_plan.submitted",
       entityType: "issue_plan",
       entityId: plan.id,
-      details: { issueId, approvalId: plan.approvalId },
+      details: { issueId: issue.id, approvalId: plan.approvalId },
     });
 
     res.json(plan);
@@ -128,7 +133,7 @@ export function issuePlanRoutes(db: Db) {
     }
     assertCompanyAccess(req, issue.companyId);
 
-    const existing = await planSvc.getPlan(issueId);
+    const existing = await planSvc.getPlan(issue.id);
     if (!existing) {
       res.status(404).json({ error: "No plan found for this issue" });
       return;
@@ -144,7 +149,7 @@ export function issuePlanRoutes(db: Db) {
       action: "issue_plan.approved",
       entityType: "issue_plan",
       entityId: plan.id,
-      details: { issueId },
+      details: { issueId: issue.id },
     });
 
     res.json(plan);
@@ -161,7 +166,7 @@ export function issuePlanRoutes(db: Db) {
     }
     assertCompanyAccess(req, issue.companyId);
 
-    const existing = await planSvc.getPlan(issueId);
+    const existing = await planSvc.getPlan(issue.id);
     if (!existing) {
       res.status(404).json({ error: "No plan found for this issue" });
       return;
@@ -178,7 +183,7 @@ export function issuePlanRoutes(db: Db) {
       action: "issue_plan.rejected",
       entityType: "issue_plan",
       entityId: plan.id,
-      details: { issueId, note },
+      details: { issueId: issue.id, note },
     });
 
     res.json(plan);

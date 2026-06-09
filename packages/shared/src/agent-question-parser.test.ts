@@ -123,4 +123,47 @@ Build finished.
     expect(out[0]).toContain("Has FE confirmed they are no longer calling the repayment intent endpoints");
     expect(out[0]).toContain("Phase 2 removal is blocked");
   });
+
+  it("does NOT treat a URL query string under a question header as a question", () => {
+    // The '?fields=' in the endpoint URL must not be read as a sentence-terminating '?'.
+    const out = extractAgentQuestionsFromText(`
+## Open questions
+
+- Check the schema at https://api.example.com/v1/intent?fields=id,status before removing it.
+`);
+    expect(out).toEqual([]);
+  });
+
+  it("does NOT treat a parenthetical aside under a question header as a question", () => {
+    // The '?' sits inside an unclosed '(' on the line — a rhetorical aside, not a question.
+    const out = extractAgentQuestionsFromText(`
+## Open questions
+
+- We removed the legacy endpoint (was it ever called? unclear from logs) and shipped the replacement.
+`);
+    expect(out).toEqual([]);
+  });
+
+  it("captures only the real question and drops embedded-'?' notes in a mixed section", () => {
+    const out = extractAgentQuestionsFromText(`
+## Open questions
+
+- Should we drop the repayment_intent table in this migration, or defer it to a follow-up?
+- Done: dropped FK (was it referenced anywhere? no).
+- See the dashboard at https://grafana.internal/d/abc?from=now-7d for traffic before cutover.
+`);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toContain("Should we drop the repayment_intent table");
+  });
+
+  it("still captures a real question whose closed-paren clause precedes a trailing '?'", () => {
+    // Parens are balanced before the '?', so the question is NOT mistaken for an aside.
+    const out = extractAgentQuestionsFromText(`
+## Open questions
+
+- Have we confirmed the new flow (add-credit migration) is live in prod before deprecation?
+`);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toContain("Have we confirmed the new flow");
+  });
 });

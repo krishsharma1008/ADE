@@ -1422,7 +1422,7 @@ export function IssueDetail() {
             </div>
           </div>
           <div className="divide-y divide-border">
-            {pullRequests.map((pr) => {
+            {pullRequests.map((pr, prIndex) => {
               const metadata = asRecord(pr.metadata);
               const blockers = Array.isArray(metadata?.blockers)
                 ? metadata.blockers.filter((value): value is string => typeof value === "string")
@@ -1512,16 +1512,24 @@ export function IssueDetail() {
                       <span className={cn("font-medium", gateClass(pr.mergeStatus))}>{pr.mergeStatus}</span>
                     </div>
                   </div>
-                  {hasLiveRuns && (
+                  {/* Live-run indicator. hasLiveRuns is issue-scoped (ANY queued/running
+                      run on this issue) and is NOT correlated to a specific PR or to
+                      PR-feedback work — the run could be Phase-2 implementation, answering
+                      a manager question, etc. So (a) render this ONCE per issue (on the
+                      first PR card only) to avoid claiming "working on THIS PR" on every
+                      card when there are multiple PRs, and (b) keep the copy NEUTRAL ("on
+                      this issue") instead of asserting it is addressing this PR's review —
+                      which would be wrong, and would contradict an awaiting_human hold that
+                      is merely suppressed by an unrelated run. */}
+                  {hasLiveRuns && prIndex === 0 && (
                     <div className="flex items-center gap-2 rounded-md border border-cyan-500/30 bg-cyan-500/5 px-3 py-2 text-xs text-cyan-300">
                       <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
                       <span>
                         <span className="font-medium">
                           {(liveRuns ?? [])[0]?.agentName ?? activeRun?.agentName ?? "An agent"}
                         </span>{" "}
-                        is working on this PR right now — addressing the requested review/changes. This
-                        view refreshes automatically (every few seconds); you don't need to do anything
-                        until it's done, then the gates below update and Merge unlocks.
+                        is currently running on this issue. This view refreshes automatically
+                        (every few seconds); the PR gates below update as the work progresses.
                       </span>
                     </div>
                   )}
@@ -1532,7 +1540,14 @@ export function IssueDetail() {
                       ))}
                     </div>
                   )}
-                  {awaitingHuman && !hasLiveRuns && (
+                  {/* This PR's review feedback is held for the human. Previously this was
+                      suppressed whenever ANY run was active (!hasLiveRuns), which could hide
+                      the truthful "agents are holding" message when the active run was actually
+                      unrelated work on the issue (e.g. Phase 2) — telling the user the opposite
+                      of reality. The cyan indicator above is now neutral ("running on this
+                      issue"), so the two banners no longer contradict; show this whenever the
+                      PR is genuinely awaiting_human. */}
+                  {awaitingHuman && (
                     <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-300">
                       Review changes were requested. Agents are holding for your review and
                       won't touch the code until you choose <span className="font-medium">Let agents fix</span>{" "}
