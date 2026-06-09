@@ -17,7 +17,7 @@ describe("pgOptions remote-aware pooling (RDB-1/PASS-3)", () => {
   });
 
   it("tunes a REMOTE pool: TLS required, bounded pool + connect timeout", () => {
-    const opts = resolvePgOptionsForTest("postgresql://u:p@34.171.242.104:5432/postgres") as Record<
+    const opts = resolvePgOptionsForTest("postgresql://u:p@203.0.113.10:5432/postgres") as Record<
       string,
       unknown
     >;
@@ -29,7 +29,7 @@ describe("pgOptions remote-aware pooling (RDB-1/PASS-3)", () => {
 
   it("HONORS an explicit sslmode in the URL (operator override not overwritten)", () => {
     const opts = resolvePgOptionsForTest(
-      "postgresql://u:p@34.171.242.104:5432/postgres?sslmode=verify-full",
+      "postgresql://u:p@203.0.113.10:5432/postgres?sslmode=verify-full",
     ) as Record<string, unknown>;
     expect(opts.ssl).toBe("verify-full");
   });
@@ -42,7 +42,7 @@ describe("pgOptions remote-aware pooling (RDB-1/PASS-3)", () => {
   });
 
   it("deep-merges connection so a context pool can add statement_timeout without losing remote SSL", () => {
-    const opts = resolvePgOptionsForTest("postgresql://u:p@34.171.242.104:5432/postgres", {
+    const opts = resolvePgOptionsForTest("postgresql://u:p@203.0.113.10:5432/postgres", {
       connection: { statement_timeout: 5000 },
     } as never) as Record<string, unknown>;
     expect(opts.ssl).toBe("require");
