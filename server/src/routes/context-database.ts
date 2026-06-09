@@ -78,16 +78,20 @@ async function readMemoryEntryCount(db: Db): Promise<number> {
  * resolves to `{ ok: false, error }` — it never throws, so the caller returns
  * 200 with ok:false rather than a 500.
  */
-async function probeContextDb(url: string): Promise<ProbeResult> {
-  // Tolerate a slow/lossy remote rail: a Cloud SQL public IP across a high-latency
-  // link can take >10s to TLS-handshake (the createDb default) and occasionally
-  // drops a connect outright. Use a generous connect_timeout and ONE retry with a
-  // fresh throwaway connection so the status surface reports the rail accurately
-  // instead of a false "unreachable / schema missing" on a transient blip.
-  const PROBE_ATTEMPTS = 2;
+async function probeContextDb(
+  url: string,
+  opts?: { connectTimeout?: number; attempts?: number },
+): Promise<ProbeResult> {
+  // INTERACTIVE default (the /test + /teams + /join routes a user drives): fail FAST
+  // so a bad URL never hangs onboarding ~60s. connect_timeout 15 still tolerates the
+  // slow Cloud SQL TLS handshake (~14s observed) on a VALID rail, while an unreachable
+  // host fails in ~15s. The BOOT probe (index.ts) passes the tolerant 30s x 2 instead —
+  // boot can afford to wait and prefers an accurate reading over speed.
+  const connectTimeout = opts?.connectTimeout ?? 15;
+  const PROBE_ATTEMPTS = opts?.attempts ?? 1;
   let lastErr: unknown;
   for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
-    const probe = createDb(url, { connect_timeout: 30 });
+    const probe = createDb(url, { connect_timeout: connectTimeout });
     try {
       const serverVersion = await readServerVersion(probe);
       const memorySchemaPresent = await readMemorySchemaPresent(probe);
@@ -131,10 +135,11 @@ interface ListCompaniesResult {
  * 200 with ok:false rather than a 500. The credential is NEVER echoed in `error`.
  */
 async function listContextCompanies(url: string): Promise<ListCompaniesResult> {
-  const ATTEMPTS = 2;
+  // Interactive (onboarding "list teams"): fail FAST on a bad URL (see probeContextDb).
+  const ATTEMPTS = 1;
   let lastErr: unknown;
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-    const probe = createDb(url, { connect_timeout: 30 });
+    const probe = createDb(url, { connect_timeout: 15 });
     try {
       const rows = (await probe.execute(
         sql`SELECT id, name FROM public.companies ORDER BY name`,
