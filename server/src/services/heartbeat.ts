@@ -475,20 +475,85 @@ export async function computeMaxTurnsProgress(
       issueTitle: "",
     });
   } catch {
-    return empty;
+    state = null;
   }
-  if (!state || !state.isGitRepo) return empty;
-  const filesChanged = state.dirtyFileCount + state.untrackedFileCount;
-  const headSha = readNonEmptyString(state.headSha);
+  // Single-repo cwd — the original fast path.
+  if (state && state.isGitRepo) {
+    return progressSignalFor(
+      state.dirtyFileCount + state.untrackedFileCount,
+      readNonEmptyString(state.headSha),
+      prevHeadSha,
+    );
+  }
+  // Multi-repo parent — the cwd is NOT itself a git repo but may hold one or more
+  // cloned service repos as immediate children (e.g. a shared project workspace
+  // containing `fs-bnpl-service/` and `fs-brick-service/`). The agent's edits live
+  // one directory down, so inspecting only the parent reads "no progress" and would
+  // FALSELY decline a continuation — leaving the task blocked at the per-run cap for
+  // exactly the multi-repo workspace layout this engine exists to keep moving.
+  // Aggregate progress across the child repos instead.
+  return (await computeMultiRepoProgress(resolvedCwd, prevHeadSha)) ?? empty;
+}
+
+/** Build a progress signal from a single repo's change count + HEAD vs the prior round. */
+function progressSignalFor(
+  filesChanged: number,
+  headSha: string | null,
+  prevHeadSha: string | null | undefined,
+): MaxTurnsProgressSignal {
   const headAdvanced =
     Boolean(headSha) &&
     Boolean(readNonEmptyString(prevHeadSha)) &&
     headSha !== readNonEmptyString(prevHeadSha);
-  return {
-    filesChanged,
-    headSha,
-    progressed: filesChanged > 0 || headAdvanced,
-  };
+  return { filesChanged, headSha, progressed: filesChanged > 0 || headAdvanced };
+}
+
+// Aggregate git progress across the IMMEDIATE child directories of a non-repo
+// parent workspace. Returns null when no child is a git repo, so the caller
+// degrades to the empty/"no progress" signal (unchanged for a plain, repo-less dir).
+//
+// The cross-round "headSha" returned is a STABLE multi-repo signature (`name:sha`
+// per child repo, sorted) so a commit in ANY child advances it; filesChanged sums
+// the dirty+untracked counts across all child repos so an uncommitted edit in any
+// child also counts as progress. Bounded to the first MAX_SCANNED_CHILDREN entries.
+async function computeMultiRepoProgress(
+  parentCwd: string,
+  prevHeadSha: string | null | undefined,
+): Promise<MaxTurnsProgressSignal | null> {
+  const MAX_SCANNED_CHILDREN = 50;
+  let childDirs: string[];
+  try {
+    const entries = await fs.readdir(parentCwd, { withFileTypes: true });
+    childDirs = entries
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+      .map((entry) => entry.name)
+      .sort()
+      .slice(0, MAX_SCANNED_CHILDREN);
+  } catch {
+    return null;
+  }
+
+  let totalFilesChanged = 0;
+  const signatureParts: string[] = [];
+  let repoCount = 0;
+  for (const name of childDirs) {
+    let childState: Awaited<ReturnType<typeof inspectGitStateForIssue>> = null;
+    try {
+      childState = await inspectGitStateForIssue({
+        cwd: path.join(parentCwd, name),
+        issueIdentifier: null,
+        issueTitle: "",
+      });
+    } catch {
+      childState = null;
+    }
+    if (!childState || !childState.isGitRepo) continue;
+    repoCount += 1;
+    totalFilesChanged += childState.dirtyFileCount + childState.untrackedFileCount;
+    signatureParts.push(`${name}:${readNonEmptyString(childState.headSha) ?? "-"}`);
+  }
+  if (repoCount === 0) return null;
+  return progressSignalFor(totalFilesChanged, signatureParts.join(";"), prevHeadSha);
 }
 
 // Resume backoff ceiling — never wait more than 5 minutes between resume

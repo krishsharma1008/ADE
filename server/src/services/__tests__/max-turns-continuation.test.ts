@@ -223,6 +223,47 @@ describe("max-turns continuation engine", () => {
     expect((await computeMaxTurnsProgress(plainDir, null)).progressed).toBe(false);
   });
 
+  it("(h) computeMaxTurnsProgress: MULTI-REPO parent aggregates child-repo progress (the real workspace layout)", async () => {
+    // The user's actual layout: a shared project workspace that is NOT itself a
+    // git repo but holds cloned service repos (fs-bnpl-service/, fs-brick-service/)
+    // as children. The agent edits one child; the gate must read that as progress
+    // instead of falsely declining the continuation and blocking the task at the cap.
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "combyne-mtc-multi-"));
+    tmpDirs.push(parent);
+    const initRepo = async (sub: string): Promise<string> => {
+      const dir = path.join(parent, sub);
+      await fs.mkdir(dir);
+      await execFileAsync("git", ["-C", dir, "init", "-q"]);
+      await execFileAsync("git", ["-C", dir, "config", "user.email", "t@t.io"]);
+      await execFileAsync("git", ["-C", dir, "config", "user.name", "Tester"]);
+      await fs.writeFile(path.join(dir, "seed.txt"), "seed\n");
+      await execFileAsync("git", ["-C", dir, "add", "."]);
+      await execFileAsync("git", ["-C", dir, "commit", "-q", "-m", "seed"]);
+      return dir;
+    };
+    const bnpl = await initRepo("fs-bnpl-service");
+    await initRepo("fs-brick-service");
+    await fs.mkdir(path.join(parent, "agents")); // a non-repo sibling must be ignored, not crash
+
+    // A clean parent yields a non-null combined signature and no progress yet.
+    const clean = await computeMaxTurnsProgress(parent, null);
+    expect(clean.headSha).not.toBeNull();
+    expect(clean.filesChanged).toBe(0);
+
+    // An untracked edit in ONE child repo registers as progress at the parent.
+    await fs.writeFile(path.join(bnpl, "LendingTwoFAController.ts"), "export class C {}\n");
+    const dirty = await computeMaxTurnsProgress(parent, clean.headSha);
+    expect(dirty.progressed).toBe(true);
+    expect(dirty.filesChanged).toBeGreaterThan(0);
+
+    // A COMMIT in a child advances the multi-repo signature -> progress even when clean.
+    await execFileAsync("git", ["-C", bnpl, "add", "."]);
+    await execFileAsync("git", ["-C", bnpl, "commit", "-q", "-m", "controller"]);
+    const committed = await computeMaxTurnsProgress(parent, clean.headSha);
+    expect(committed.progressed).toBe(true);
+    expect(committed.headSha).not.toBe(clean.headSha);
+  });
+
   // ── (a) progress + under budget -> CONTINUE ───────────────────────────────
 
   it("(a) max_turns + progress + under budget -> CONTINUE, window bumps, session persisted, issue NOT blocked", async () => {
