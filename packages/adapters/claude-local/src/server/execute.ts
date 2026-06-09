@@ -27,6 +27,7 @@ import {
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
   isClaudeUsageLimitReached,
+  resolveAdapterErrorCode,
 } from "./parse.js";
 import { recordUsageLimitObservation } from "./quota.js";
 
@@ -710,7 +711,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : exitZero
         ? null
         : describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`;
-    const errorCode = authErrorCode ?? (loginMeta.requiresLogin ? "claude_auth_required" : null);
+    // Precedence: a genuine MCP/integration 401 (authErrorCode) always wins; a
+    // max-turns exit gets its OWN first-class code so it never inherits a
+    // falsely-tripped `claude_auth_required` (partial output can match the auth
+    // regex). Only then does a real login-required exit map to claude_auth_required.
+    // `clearSessionForMaxTurns` is exactly isClaudeMaxTurnsResult(parsed) (line above).
+    const errorCode = resolveAdapterErrorCode({
+      authErrorCode,
+      isMaxTurns: clearSessionForMaxTurns,
+      requiresLogin: loginMeta.requiresLogin,
+    });
     const authErrorMeta = mcpAuth.requiresAuth
       ? {
           ...(errorMeta ?? {}),
@@ -736,7 +746,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
       resultJson: parsed,
       summary: parsedStream.summary || asString(parsed.result, ""),
-      clearSession: clearSessionForMaxTurns || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
+      // Do NOT clearSession on a max-turns exit when the session is resolvable —
+      // the continuation engine resumes this exact warm conversation. Only the
+      // missing-session fallback nulls the session (mirrors the usage-limit branch).
+      clearSession: Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
     };
   };
 

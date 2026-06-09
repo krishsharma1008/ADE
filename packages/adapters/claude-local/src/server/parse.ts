@@ -167,6 +167,31 @@ export function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | 
   return /max(?:imum)?\s+turns?/i.test(resultText);
 }
 
+/**
+ * Resolve the adapter `errorCode` for a finished Claude run with strict
+ * precedence:
+ *   1. a genuine MCP / integration auth failure (`authErrorCode`, e.g.
+ *      `integration_auth_required:linear`) ALWAYS wins — it's the only reliable
+ *      signal that a 401 happened even at exit 0;
+ *   2. a max-turns exit gets its OWN first-class `claude_max_turns` code so it
+ *      never inherits a falsely-tripped `claude_auth_required` (partial output
+ *      can match the auth regex);
+ *   3. a real login-required exit maps to `claude_auth_required`;
+ *   4. otherwise null.
+ *
+ * Pure so the precedence is unit-testable without driving a child process.
+ */
+export function resolveAdapterErrorCode(input: {
+  authErrorCode: string | null;
+  isMaxTurns: boolean;
+  requiresLogin: boolean;
+}): string | null {
+  if (input.authErrorCode) return input.authErrorCode;
+  if (input.isMaxTurns) return "claude_max_turns";
+  if (input.requiresLogin) return "claude_auth_required";
+  return null;
+}
+
 export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): boolean {
   const resultText = asString(parsed.result, "").trim();
   const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]

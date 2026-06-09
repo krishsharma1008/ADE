@@ -84,3 +84,4 @@ export { memoryEntries, memoryPromotions, memoryUsage } from "./memory_layers.js
 export { acceptedWorkEvents } from "./accepted_work_events.js";
 export { issuePullRequests } from "./issue_pull_requests.js";
 export { usagePauseWindows } from "./usage_pause_windows.js";
+export { maxTurnsContinuationWindows } from "./max_turns_continuation_windows.js";

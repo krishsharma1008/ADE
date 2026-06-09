@@ -23,6 +23,7 @@ import {
   projectWorkspaces,
   qaFeedbackEvents,
   usagePauseWindows,
+  maxTurnsContinuationWindows,
 } from "@combyne/db";
 import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -375,6 +376,119 @@ export async function maybeRunSufficiencyGate(
  */
 export function usagePauseEnabled(): boolean {
   return process.env.COMBYNE_USAGE_PAUSE_ENABLED === "true";
+}
+
+/**
+ * Max-turns continuation engine — feature flag (default OFF).
+ *
+ * When OFF (the default), a `claude_max_turns` exit is handled exactly as today:
+ * the run fails and the issue is blocked via markIssueBlockedAfterFailedRun. The
+ * adapter error-code fix ships regardless (max-turns gets its own first-class
+ * code instead of mis-flagging as claude_auth_required), but with the flag off
+ * that code still routes straight to the block path.
+ *
+ * When ON, a max-turns run that made git-measured progress and is under a
+ * per-TASK round/turn budget re-enqueues a warm continuation run on the same
+ * issue instead of blocking it. Read live (not cached) so it can be flipped in
+ * env without a code change, matching usagePauseEnabled().
+ */
+export function maxTurnsContinuationEnabled(): boolean {
+  return process.env.COMBYNE_MAX_TURNS_CONTINUATION_ENABLED === "true";
+}
+
+// Per-TASK round budget defaults. The PER-RUN turn cap
+// (withSmallCodingTaskControls) is unchanged cost control; these bound how many
+// continuation ROUNDS a single task may spawn and the absolute cumulative-turn
+// ceiling across all rounds. HARD_MAX_ROUNDS is the ceiling the complexity
+// heuristic can scale up to but never beyond.
+const MAX_TURNS_DEFAULT_ROUNDS = 3;
+const MAX_TURNS_HARD_MAX_ROUNDS = 5;
+const MAX_TURNS_DEFAULT_MAX_TOTAL = 200;
+
+function maxTurnsMaxRoundsDefault(): number {
+  return Math.min(
+    MAX_TURNS_HARD_MAX_ROUNDS,
+    envPositiveInt("COMBYNE_MAX_TURNS_MAX_ROUNDS", MAX_TURNS_DEFAULT_ROUNDS),
+  );
+}
+
+function maxTurnsMaxTotalTurns(): number {
+  return envPositiveInt("COMBYNE_MAX_TURNS_MAX_TOTAL", MAX_TURNS_DEFAULT_MAX_TOTAL);
+}
+
+/**
+ * Cheap, LLM-free complexity heuristic. Counts the artifacts that correlate
+ * with a large-but-mechanically-simple task — acceptance-criteria / checklist
+ * bullets, numbered list items, and "endpoint"/"DTO"/"controller" mentions —
+ * and scales the per-task ROUND budget within [DEFAULT_ROUNDS, HARD_MAX_ROUNDS].
+ * Empty / short text yields the default. Used ONLY to set a fresh window's
+ * maxRounds; it can never raise the per-round turn cap or the hard total ceiling.
+ */
+export function maxTurnsRoundBudget(
+  issueText: string | null | undefined,
+  opts?: { defaultRounds?: number; hardMax?: number },
+): number {
+  const defaultRounds = opts?.defaultRounds ?? MAX_TURNS_DEFAULT_ROUNDS;
+  const hardMax = opts?.hardMax ?? MAX_TURNS_HARD_MAX_ROUNDS;
+  const text = (issueText ?? "").trim();
+  if (!text) return defaultRounds;
+
+  let signals = 0;
+  // Checklist / acceptance-criteria bullets: "- ", "* ", "[ ]" / "[x]".
+  signals += (text.match(/^\s*(?:[-*]\s+|\[[ xX]\]\s*)/gm) ?? []).length;
+  // Numbered list items: "1. ", "2) ", etc.
+  signals += (text.match(/^\s*\d+[.)]\s+/gm) ?? []).length;
+  // Endpoint / DTO / controller / route mentions — mechanical surface area.
+  signals += (text.match(/\b(endpoint|DTO|controller|route|handler)s?\b/gi) ?? []).length;
+
+  // Every ~4 signals buys one extra round above the default, clamped to hardMax.
+  const extra = Math.floor(signals / 4);
+  return Math.max(defaultRounds, Math.min(hardMax, defaultRounds + extra));
+}
+
+export interface MaxTurnsProgressSignal {
+  filesChanged: number;
+  headSha: string | null;
+  progressed: boolean;
+}
+
+/**
+ * Deterministic, LLM-free progress signal for the max-turns continuation gate.
+ * Compares the resolved cwd's current git state against the prior round's HEAD
+ * sha: progress = any dirty/untracked file OR a HEAD advance since the last
+ * round. Degrades to progressed=false (→ block) when the cwd is unresolved, not
+ * a git repo, or git throws — guaranteeing a genuinely stuck/looping task always
+ * terminates.
+ */
+export async function computeMaxTurnsProgress(
+  cwd: string | null | undefined,
+  prevHeadSha: string | null | undefined,
+): Promise<MaxTurnsProgressSignal> {
+  const empty: MaxTurnsProgressSignal = { filesChanged: 0, headSha: null, progressed: false };
+  const resolvedCwd = readNonEmptyString(cwd);
+  if (!resolvedCwd) return empty;
+  let state: Awaited<ReturnType<typeof inspectGitStateForIssue>> = null;
+  try {
+    state = await inspectGitStateForIssue({
+      cwd: resolvedCwd,
+      issueIdentifier: null,
+      issueTitle: "",
+    });
+  } catch {
+    return empty;
+  }
+  if (!state || !state.isGitRepo) return empty;
+  const filesChanged = state.dirtyFileCount + state.untrackedFileCount;
+  const headSha = readNonEmptyString(state.headSha);
+  const headAdvanced =
+    Boolean(headSha) &&
+    Boolean(readNonEmptyString(prevHeadSha)) &&
+    headSha !== readNonEmptyString(prevHeadSha);
+  return {
+    filesChanged,
+    headSha,
+    progressed: filesChanged > 0 || headAdvanced,
+  };
 }
 
 // Resume backoff ceiling — never wait more than 5 minutes between resume
@@ -3615,6 +3729,280 @@ export function heartbeatService(db: Db) {
     await db.delete(usagePauseWindows).where(eq(usagePauseWindows.runId, runId));
   }
 
+  // ── Max-turns continuation engine ─────────────────────────────────────────
+  //
+  // Gated by maxTurnsContinuationEnabled() (default OFF) at the call site. The
+  // helpers themselves are defensive but assume the caller checked the flag.
+  // Unlike the usage-pause engine (which PARKS the same run and resumes it), a
+  // max-turns continuation FINALIZES the current run and re-enqueues a fresh
+  // warm continuation run on the same issue — so the decision is made here, the
+  // caller's normal finalization releases the issue lock, and the caller then
+  // enqueues the continuation wake AFTER the release (so it isn't coalesced into
+  // the still-locked finishing run).
+
+  /** Drop a task's continuation window (on terminal success or decline). */
+  async function cleanupMaxTurnsContinuationWindowForIssue(issueId: string): Promise<void> {
+    await db
+      .delete(maxTurnsContinuationWindows)
+      .where(eq(maxTurnsContinuationWindows.issueId, issueId));
+  }
+
+  /**
+   * Decide whether a `claude_max_turns` run should CONTINUE (re-enqueue a warm
+   * round) or DECLINE (fall through to the normal block path).
+   *
+   * On CONTINUE: upserts/bumps the per-issue budget window, persists the POST
+   * (max-turns) session into the task session so the continuation resumes the
+   * warm conversation, logs the round, and returns {continue:true}. The CALLER
+   * must let the run finalize normally (releasing the issue lock) and then
+   * enqueue the continuation wake.
+   *
+   * On DECLINE (no git progress / budget exhausted / no resumable session):
+   * deletes the window and returns {continue:false} so the caller falls through
+   * to markIssueBlockedAfterFailedRun unchanged.
+   */
+  async function handleMaxTurnsContinuation(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    adapterResult: AdapterExecutionResult;
+    sessionIdToResume: string | null;
+    sessionCwd: string | null;
+    taskKey: string | null;
+    // The POST (max-turns) session the adapter produced, already resolved by the
+    // caller (which owns the sessionCodec). Persisted into the task session so
+    // the continuation resumes the warm conversation.
+    nextSessionParams: Record<string, unknown> | null;
+    nextSessionDisplayId: string | null;
+    seq: number;
+  }): Promise<{ continue: boolean; issueId: string | null }> {
+    const {
+      run,
+      agent,
+      adapterResult,
+      sessionIdToResume,
+      sessionCwd,
+      taskKey,
+      nextSessionParams,
+      nextSessionDisplayId,
+      seq,
+    } = input;
+    const issueId = resolveRunIssueId(run);
+
+    // Continuation is a TASK-level lever — it only applies to issue/task-scoped
+    // runs (the same scope withSmallCodingTaskControls caps). Without an issue
+    // we have nowhere to durably store the budget; decline.
+    if (!issueId) {
+      return { continue: false, issueId: null };
+    }
+    // Without a resumable session we cannot continue the warm conversation; the
+    // continuation would replay the PRE-run session and lose progress. Decline.
+    if (!sessionIdToResume) {
+      logger.warn(
+        { runId: run.id, agentId: agent.id, issueId },
+        "max_turns_continuation.declined_no_session",
+      );
+      return { continue: false, issueId };
+    }
+
+    const now = new Date();
+    const lastErrorMessage = adapterResult.errorMessage ?? "Reached maximum number of turns";
+
+    // Read any existing window for this task to get the prior round's HEAD sha
+    // and the running counters.
+    const existing = await db
+      .select()
+      .from(maxTurnsContinuationWindows)
+      .where(eq(maxTurnsContinuationWindows.issueId, issueId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    // Idempotency: if the window already records THIS exact run as its last
+    // round, a duplicate completion event reached us — the round was already
+    // counted. Re-affirm continue WITHOUT re-bumping the budget or re-enqueuing
+    // (the caller's idempotencyKey per round backstops the wake too).
+    if (existing && existing.runId === run.id) {
+      logger.debug(
+        { runId: run.id, issueId, roundCount: existing.roundCount },
+        "max_turns_continuation.duplicate_completion_noop",
+      );
+      return { continue: true, issueId };
+    }
+
+    // Deterministic, LLM-free progress signal vs the prior round's HEAD sha.
+    const progress = await computeMaxTurnsProgress(
+      sessionCwd,
+      existing?.headShaAtLastRound ?? null,
+    );
+
+    // num_turns from this round's result, summed into the cumulative ceiling.
+    const resultJson = parseObject(adapterResult.resultJson ?? null);
+    const turnsThisRound = Math.max(0, Math.floor(asNumber(resultJson.num_turns, 0)));
+
+    // Budget for a FRESH window is scaled by a cheap complexity heuristic over
+    // the issue text; an existing window keeps its already-decided maxRounds.
+    let issueText = "";
+    if (!existing) {
+      const issueRow = await db
+        .select({ title: issues.title, description: issues.description })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null);
+      issueText = [issueRow?.title ?? "", issueRow?.description ?? ""].join("\n");
+    }
+    const maxRounds = existing?.maxRounds ?? maxTurnsRoundBudget(issueText);
+    const maxTotalTurns = existing?.maxTotalTurns ?? maxTurnsMaxTotalTurns();
+    const priorRoundCount = existing?.roundCount ?? 0;
+    const priorCumulativeTurns = existing?.cumulativeTurns ?? 0;
+    const nextRoundCount = priorRoundCount + 1;
+    const nextCumulativeTurns = priorCumulativeTurns + turnsThisRound;
+
+    // DECISION: continue only if the task made real progress AND we are under
+    // both the round budget and the hard cumulative-turn ceiling.
+    const underRoundBudget = priorRoundCount < maxRounds;
+    const underTurnCeiling = priorCumulativeTurns < maxTotalTurns;
+    const shouldContinue = progress.progressed && underRoundBudget && underTurnCeiling;
+
+    if (!shouldContinue) {
+      // Stuck / looping / exhausted — drop any window and let the caller block.
+      await cleanupMaxTurnsContinuationWindowForIssue(issueId).catch(() => {});
+      logger.info(
+        {
+          runId: run.id,
+          agentId: agent.id,
+          issueId,
+          progressed: progress.progressed,
+          filesChanged: progress.filesChanged,
+          roundCount: priorRoundCount,
+          maxRounds,
+          cumulativeTurns: priorCumulativeTurns,
+          maxTotalTurns,
+          reason: !progress.progressed
+            ? "no_progress"
+            : !underRoundBudget
+              ? "round_budget_exhausted"
+              : "turn_ceiling_exhausted",
+        },
+        "max_turns_continuation.declined",
+      );
+      return { continue: false, issueId };
+    }
+
+    // CONTINUE: upsert/bump the budget window (idempotent on issueId). The
+    // ON CONFLICT path only bumps if the run id differs, so a duplicate
+    // completion event for the SAME run can't double-count a round.
+    await db
+      .insert(maxTurnsContinuationWindows)
+      .values({
+        companyId: run.companyId,
+        agentId: agent.id,
+        issueId,
+        runId: run.id,
+        sessionIdToResume,
+        sessionCwd: sessionCwd ?? null,
+        roundCount: nextRoundCount,
+        maxRounds,
+        cumulativeTurns: nextCumulativeTurns,
+        maxTotalTurns,
+        headShaAtLastRound: progress.headSha ?? existing?.headShaAtLastRound ?? null,
+        lastErrorMessage,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: maxTurnsContinuationWindows.issueId,
+        set: {
+          runId: run.id,
+          sessionIdToResume,
+          sessionCwd: sessionCwd ?? null,
+          roundCount: nextRoundCount,
+          cumulativeTurns: nextCumulativeTurns,
+          headShaAtLastRound: progress.headSha ?? existing?.headShaAtLastRound ?? null,
+          lastErrorMessage,
+          updatedAt: now,
+        },
+        // Idempotency backstop: if a duplicate completion event for THIS exact
+        // run reaches us, the window already points at run.id — skip the bump.
+        setWhere: ne(maxTurnsContinuationWindows.runId, run.id),
+      });
+
+    // Persist the POST (max-turns) session into the task session so the warm
+    // Claude conversation survives into the continuation run. Mirrors the
+    // usage-pause upsert — without this the resume replays the PRE-run session.
+    if (taskKey && (nextSessionParams || nextSessionDisplayId)) {
+      await upsertTaskSession({
+        companyId: agent.companyId,
+        agentId: agent.id,
+        adapterType: agent.adapterType,
+        taskKey,
+        sessionParamsJson: nextSessionParams,
+        sessionDisplayId: nextSessionDisplayId,
+        lastRunId: run.id,
+        lastError: lastErrorMessage,
+      }).catch((err) => {
+        logger.warn(
+          { err, runId: run.id, taskKey, issueId },
+          "max_turns_continuation.task_session_persist_failed",
+        );
+      });
+    }
+
+    const continuedRun = await getRun(run.id);
+    if (continuedRun) {
+      await appendRunEvent(continuedRun, seq, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: `max-turns continuation scheduled (round ${nextRoundCount}/${maxRounds})`,
+        payload: {
+          issueId,
+          roundCount: nextRoundCount,
+          maxRounds,
+          turnsThisRound,
+          cumulativeTurns: nextCumulativeTurns,
+          maxTotalTurns,
+          filesChanged: progress.filesChanged,
+        },
+      });
+    }
+
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "max-turns-continuation-engine",
+      action: "max_turns_continuation",
+      entityType: "issue",
+      entityId: issueId,
+      agentId: agent.id,
+      runId: run.id,
+      details: {
+        roundCount: nextRoundCount,
+        maxRounds,
+        turnsThisRound,
+        cumulativeTurns: nextCumulativeTurns,
+        maxTotalTurns,
+        filesChanged: progress.filesChanged,
+      },
+    }).catch((err) => {
+      logger.debug({ err, runId: run.id }, "max_turns_continuation activity log failed");
+    });
+
+    logger.info(
+      {
+        runId: run.id,
+        agentId: agent.id,
+        companyId: run.companyId,
+        issueId,
+        roundCount: nextRoundCount,
+        maxRounds,
+        turnsThisRound,
+        cumulativeTurns: nextCumulativeTurns,
+        filesChanged: progress.filesChanged,
+      },
+      "run.max_turns_continuation",
+    );
+
+    return { continue: true, issueId };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; hardCapMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     // Round 3 Phase 8 — wall-clock hard cap. A run that started >hardCapMs ago
@@ -5410,6 +5798,48 @@ export function heartbeatService(db: Db) {
         }
       }
 
+      // Max-turns continuation. If the adapter exited at its per-run turn cap
+      // (`claude_max_turns`) AND the feature is enabled AND this is an
+      // issue/task-scoped run (NOT acceptedWork — same scope the per-run cap
+      // applies to) AND the run wasn't cancelled, decide whether the task made
+      // git-measured progress under its per-task budget. Unlike the usage-pause
+      // guard above, we do NOT return early here: the run FINALIZES normally
+      // (releasing the issue lock), and only AFTER the release do we enqueue a
+      // warm continuation wake — so it can't be coalesced into the still-locked
+      // finishing run. `maxTurnsContinuationPlanned` carries the decision down
+      // to the failed-outcome block (skip the block) and the post-release
+      // enqueue. When the helper declines (no progress / budget exhausted /
+      // flag off), behavior is byte-identical to today: block + notify.
+      let maxTurnsContinuationPlanned = false;
+      let maxTurnsContinuationIssueId: string | null = null;
+      if (
+        maxTurnsContinuationEnabled() &&
+        adapterResult.errorCode === "claude_max_turns" &&
+        !readNonEmptyString(context.acceptedWorkEventId)
+      ) {
+        const cancelledNow = await getRun(run.id);
+        if (cancelledNow?.status !== "cancelled") {
+          const sessionIdToResume =
+            nextSessionState.legacySessionId ??
+            nextSessionState.displayId ??
+            runtimeForAdapter.sessionId ??
+            null;
+          const decision = await handleMaxTurnsContinuation({
+            run,
+            agent,
+            adapterResult,
+            sessionIdToResume,
+            sessionCwd: readNonEmptyString(resolvedWorkspace.cwd),
+            taskKey,
+            nextSessionParams: nextSessionState.params,
+            nextSessionDisplayId: nextSessionState.displayId,
+            seq: seq++,
+          });
+          maxTurnsContinuationPlanned = decision.continue;
+          maxTurnsContinuationIssueId = decision.issueId;
+        }
+      }
+
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
       if (latestRun?.status === "cancelled") {
@@ -5560,6 +5990,22 @@ export function heartbeatService(db: Db) {
         });
       }
 
+      // Max-turns continuation — when an issue-scoped run reaches terminal
+      // SUCCESS, the task is done, so drop its continuation budget window (keyed
+      // by issueId). A `failed` outcome with a planned continuation is left
+      // intact: that window is the live budget the next round resumes against.
+      if (maxTurnsContinuationEnabled() && outcome === "succeeded") {
+        const succeededIssueId = resolveRunIssueId(run);
+        if (succeededIssueId) {
+          await cleanupMaxTurnsContinuationWindowForIssue(succeededIssueId).catch((err) => {
+            logger.debug(
+              { err, runId: run.id, issueId: succeededIssueId },
+              "max_turns_continuation window cleanup failed",
+            );
+          });
+        }
+      }
+
       const finalizedRun = await getRun(run.id);
       if (finalizedRun) {
         if (adapterResult.resultJson || stdoutExcerpt) {
@@ -5606,6 +6052,10 @@ export function heartbeatService(db: Db) {
             }).catch((err) => {
               logger.debug({ err, runId: finalizedRun.id }, "integration-auth pause failed");
             });
+          } else if (maxTurnsContinuationPlanned) {
+            // Max-turns with progress under budget — do NOT block. The warm
+            // continuation wake is enqueued AFTER releaseIssueExecutionAndPromote
+            // below (so it isn't coalesced into this still-locked finishing run).
           } else {
             await markIssueBlockedAfterFailedRun(db, {
               run: finalizedRun,
@@ -5618,6 +6068,40 @@ export function heartbeatService(db: Db) {
           }
         }
         await releaseIssueExecutionAndPromote(finalizedRun);
+
+        // Max-turns continuation — the issue lock is now released by the
+        // finishing run, so enqueue the warm continuation wake. It re-acquires
+        // the lock through the normal queued → startNextQueuedRunForAgent
+        // pipeline and resumes the warm task session (shouldResetTaskSessionForWake
+        // is false for an issue-scoped automation wake). Idempotent: keyed per
+        // round so a duplicate completion can't double-enqueue.
+        if (maxTurnsContinuationPlanned && maxTurnsContinuationIssueId) {
+          const continuationIssueId = maxTurnsContinuationIssueId;
+          const window = await db
+            .select({ roundCount: maxTurnsContinuationWindows.roundCount })
+            .from(maxTurnsContinuationWindows)
+            .where(eq(maxTurnsContinuationWindows.issueId, continuationIssueId))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          const roundCount = window?.roundCount ?? 0;
+          await enqueueWakeup(agent.id, {
+            source: "automation",
+            reason: "max_turns_continuation",
+            payload: { issueId: continuationIssueId, taskId: continuationIssueId },
+            idempotencyKey: `max_turns_continuation:${continuationIssueId}:${roundCount}`,
+            contextSnapshot: {
+              issueId: continuationIssueId,
+              taskId: continuationIssueId,
+              taskKey: continuationIssueId,
+              wakeReason: "max_turns_continuation",
+            },
+          }).catch((err) => {
+            logger.warn(
+              { err, runId: finalizedRun.id, issueId: continuationIssueId },
+              "max_turns_continuation.enqueue_failed",
+            );
+          });
+        }
         void summarizeRunAndPersist(db, {
           runId: finalizedRun.id,
           companyId: finalizedRun.companyId,
@@ -6950,6 +7434,14 @@ export function heartbeatService(db: Db) {
       failUsagePausedRun,
       attemptResumeExecution,
       cleanupUsagePauseWindowForRun,
+    },
+    // Max-turns continuation engine — internal functions exposed ONLY for the
+    // engine test suite (max-turns-continuation.test.ts). Lets the tests
+    // exercise the REAL continue/decline decision directly without driving a
+    // live adapter. Not part of the public control-plane surface.
+    __maxTurnsContinuationTestApi: {
+      handleMaxTurnsContinuation,
+      cleanupMaxTurnsContinuationWindowForIssue,
     },
     reopenIssuesAutoClosedAfterTokenPause: (opts?: { limit?: number }) =>
       reopenIssuesAutoClosedAfterTokenPause(db, opts),

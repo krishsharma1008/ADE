@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { detectMcpToolAuthError, isClaudeUsageLimitReached } from "./parse.js";
+import {
+  detectMcpToolAuthError,
+  isClaudeMaxTurnsResult,
+  isClaudeUsageLimitReached,
+  resolveAdapterErrorCode,
+} from "./parse.js";
 
 // Build the final stream-json `result` block the CLI emits, with optional
 // errors[] entries. This is the shape parseClaudeStreamJson returns as `parsed`.
@@ -542,5 +547,69 @@ describe("isClaudeUsageLimitReached", () => {
       resetsAt: null,
       message: null,
     });
+  });
+});
+
+describe("resolveAdapterErrorCode (max-turns precedence)", () => {
+  it("emits claude_max_turns for a max-turns exit", () => {
+    const parsed = resultBlock({
+      subtype: "error_max_turns",
+      isError: true,
+      result: "Reached maximum number of turns (50)",
+    });
+    expect(isClaudeMaxTurnsResult(parsed)).toBe(true);
+    const code = resolveAdapterErrorCode({
+      authErrorCode: null,
+      isMaxTurns: isClaudeMaxTurnsResult(parsed),
+      requiresLogin: false,
+    });
+    expect(code).toBe("claude_max_turns");
+  });
+
+  it("does NOT mis-flag a max-turns exit as claude_auth_required even when the text trips the auth regex", () => {
+    // The partial output of a max-turns run can mention auth-ish phrasing
+    // ("authentication required" in some printed log line) which would trip
+    // detectClaudeLoginRequired. Max-turns must still win over a false
+    // requiresLogin so it gets its own first-class code.
+    const parsed = resultBlock({
+      subtype: "error_max_turns",
+      isError: true,
+      result: "Reached maximum number of turns (50). Note: authentication required for one tool.",
+    });
+    expect(isClaudeMaxTurnsResult(parsed)).toBe(true);
+    const code = resolveAdapterErrorCode({
+      authErrorCode: null,
+      isMaxTurns: isClaudeMaxTurnsResult(parsed),
+      requiresLogin: true, // falsely tripped by the embedded phrase
+    });
+    expect(code).toBe("claude_max_turns");
+    expect(code).not.toBe("claude_auth_required");
+  });
+
+  it("keeps a genuine MCP/integration 401 at top precedence over max-turns", () => {
+    const code = resolveAdapterErrorCode({
+      authErrorCode: "integration_auth_required:linear",
+      isMaxTurns: true,
+      requiresLogin: true,
+    });
+    expect(code).toBe("integration_auth_required:linear");
+  });
+
+  it("falls back to claude_auth_required for a genuine login-required exit (no max-turns)", () => {
+    const code = resolveAdapterErrorCode({
+      authErrorCode: null,
+      isMaxTurns: false,
+      requiresLogin: true,
+    });
+    expect(code).toBe("claude_auth_required");
+  });
+
+  it("returns null for an ordinary non-auth, non-max-turns failure", () => {
+    const code = resolveAdapterErrorCode({
+      authErrorCode: null,
+      isMaxTurns: false,
+      requiresLogin: false,
+    });
+    expect(code).toBeNull();
   });
 });

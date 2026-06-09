@@ -45,6 +45,16 @@ describe("resolveAgentErrorCode", () => {
     expect(resolveAgentErrorCode("openclaw_gateway_wait_timeout")?.severity).toBe("retry");
   });
 
+  it("resolves claude_max_turns to a real retry-severity card (not the unknown fallback)", () => {
+    const entry = resolveAgentErrorCode("claude_max_turns");
+    expect(entry).not.toBeNull();
+    expect(entry!.code).toBe("claude_max_turns");
+    expect(entry!.severity).toBe("retry");
+    // Must be a real entry, not unknownEntry() (which titles "Run failed: `...`").
+    expect(entry!.title).not.toMatch(/^Run failed:/);
+    expect(KNOWN_AGENT_ERROR_CODES).toContain("claude_max_turns");
+  });
+
   it("flags generic / gateway-side errors as investigate", () => {
     expect(resolveAgentErrorCode("adapter_failed")?.severity).toBe("investigate");
     expect(resolveAgentErrorCode("timeout")?.severity).toBe("investigate");
@@ -69,6 +79,7 @@ describe("resolveAgentErrorCode", () => {
       "adapter_failed",
       "agent_not_found",
       "cancelled",
+      "claude_max_turns",
       "claude_usage_limit_reached",
       "usage_pause_max_retries",
       "openclaw_gateway_agent_error",

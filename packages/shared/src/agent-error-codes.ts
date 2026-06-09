@@ -83,6 +83,15 @@ const ENTRIES: AgentErrorCodeEntry[] = [
     docsUrl: "https://docs.claude.com/claude-code",
   },
   {
+    code: "claude_max_turns",
+    title: "Agent reached its per-run turn cap",
+    body: "The run hit Claude's per-run `--max-turns` cap mid-task — it ran out of turns for this round, not because anything failed. On a large-but-simple task this is expected: the work was progressing but didn't fit in one round. The warm session is preserved.",
+    remediation:
+      "If max-turns continuation is enabled, Combyne auto-continues a progressing task on the same warm session for another round (up to a per-task round/turn budget) and only blocks the issue once the budget is exhausted or no progress is detected. Otherwise, split the issue into smaller tasks or raise the agent's per-run turn cap. Repeated max-turns with no progress means the agent is stuck/looping — review the run log.",
+    severity: "retry",
+    docsUrl: "https://docs.claude.com/claude-code",
+  },
+  {
     code: "usage_pause_max_retries",
     title: "Usage-paused run gave up after repeated limits",
     body: "A run that was paused on a Claude usage / subscription-window limit was retried automatically once the window was believed to have reset, but it kept hitting the limit (or could not resume) past the retry budget. The run was finally failed and the issue handed back so a human can decide what to do.",
