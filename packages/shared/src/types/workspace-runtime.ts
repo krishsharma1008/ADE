@@ -1,6 +1,10 @@
 export type ExecutionWorkspaceStrategyType =
   | "project_primary"
   | "git_worktree"
+  // Multi-repo parent isolation: the project workspace cwd is NOT itself a git
+  // repo but holds N child git repos; we realize one git worktree per child
+  // under a single isolated task dir (see workspace-runtime.ts).
+  | "multi_repo_worktree"
   | "adapter_managed"
   | "cloud_sandbox";
 
@@ -21,6 +25,9 @@ export type ExecutionWorkspaceMode =
 export type ExecutionWorkspaceProviderType =
   | "local_fs"
   | "git_worktree"
+  // Isolated task dir that contains one linked git worktree per child repo of a
+  // multi-repo parent workspace. Cleanup removes every child worktree.
+  | "multi_repo_worktree"
   | "adapter_managed"
   | "cloud_sandbox";
 

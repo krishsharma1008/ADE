@@ -119,8 +119,10 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_COORDINATOR_MAX_CONCURRENT_RUNS_DEFAULT = 3;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const COORDINATOR_HEARTBEAT_ROLES = new Set(["ceo", "cto", "cmo", "cfo", "pm", "em", "manager"]);
-const DEFERRED_WAKE_CONTEXT_KEY = "_combyneWakeContext";
-const SMALL_TASK_MAX_TURNS_DEFAULT = 50;
+// Exported so cost-control tests can build the nested deferred-wake form
+// (issue scope carried under this key) and assert against the canonical cap.
+export const DEFERRED_WAKE_CONTEXT_KEY = "_combyneWakeContext";
+export const SMALL_TASK_MAX_TURNS_DEFAULT = 50;
 const SMALL_TASK_TIMEOUT_SEC_DEFAULT = 20 * 60;
 const SMALL_TASK_TOKEN_PAUSE_THRESHOLD_DEFAULT = 1_000_000;
 const startLocksByAgent = new Map<string, Promise<void>>();
@@ -567,9 +569,23 @@ type ResumeOutcome = "resumed" | "deferred" | "failed";
 
 function runIssueIdFromContext(run: typeof heartbeatRuns.$inferSelect): string | null {
   const snapshot = parseObject(run.contextSnapshot);
-  const direct = readNonEmptyString(snapshot.issueId) ?? readNonEmptyString(snapshot.taskId);
+  return issueScopeFromContext(snapshot);
+}
+
+// Canonical issue-scope resolver for a parsed context snapshot. Mirrors
+// runIssueIdFromContext / resolveRunIssueId: an issue-scoped run can carry its
+// scope EITHER at the top level OR nested under the deferred-wake key (a wake
+// that was deferred behind an active run and later promoted/coalesced retains
+// the nested `_combyneWakeContext`). Cost-control gates that read the context
+// object directly (withSmallCodingTaskControls, evaluateSmallTaskTokenBudget)
+// must use this so they bind on the SAME set of runs the rest of the engine
+// treats as issue-scoped — otherwise the small-task cap silently skips runs
+// whose scope lives only in the nested form (observed: assignment run ran 63
+// turns because top-level issueId was absent at config resolution).
+function issueScopeFromContext(context: Record<string, unknown>): string | null {
+  const direct = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
   if (direct) return direct;
-  const wake = parseObject(snapshot[DEFERRED_WAKE_CONTEXT_KEY]);
+  const wake = parseObject(context[DEFERRED_WAKE_CONTEXT_KEY]);
   return readNonEmptyString(wake.issueId) ?? readNonEmptyString(wake.taskId) ?? null;
 }
 
@@ -1527,7 +1543,8 @@ function envPositiveInt(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
-function withSmallCodingTaskControls(
+// Exported for focused unit coverage of the small-task turn/timeout cap.
+export function withSmallCodingTaskControls(
   agent: typeof agents.$inferSelect,
   config: Record<string, unknown>,
   context: Record<string, unknown>,
@@ -1535,7 +1552,10 @@ function withSmallCodingTaskControls(
   if (agent.adapterType !== "claude_local") return config;
   if ((agent.adapterConfig as Record<string, unknown> | null)?.smallCodingTaskProfile === false) return config;
   if (config.smallCodingTaskProfile === false) return config;
-  if (!readNonEmptyString(context.issueId) && !readNonEmptyString(context.taskId)) return config;
+  // Use the canonical issue-scope resolver (top-level OR nested deferred-wake
+  // form) so the cap binds consistently — a top-level-only check skipped
+  // assignment/promoted runs whose scope lived under `_combyneWakeContext`.
+  if (!issueScopeFromContext(context)) return config;
   if (readNonEmptyString(context.acceptedWorkEventId)) return config;
 
   const maxTurnsLimit = envPositiveInt("COMBYNE_SMALL_TASK_MAX_TURNS", SMALL_TASK_MAX_TURNS_DEFAULT);
@@ -1610,7 +1630,9 @@ export function evaluateSmallTaskTokenBudget(input: {
   const usage = computeSmallTaskTokenUsage(input.usage);
   const applies =
     input.adapterType === "claude_local" &&
-    Boolean(readNonEmptyString(input.context.issueId) ?? readNonEmptyString(input.context.taskId));
+    // Same canonical issue-scope resolver as withSmallCodingTaskControls so the
+    // token budget and the turn cap apply to exactly the same set of runs.
+    Boolean(issueScopeFromContext(input.context));
   const exceeded = applies && mode !== "off" && usage.activeTokens >= threshold;
   return {
     applies,
@@ -1994,7 +2016,13 @@ export async function resolveWorkspaceForHeartbeatRun(
             recorder: null,
           });
 
-          if (realized.strategy === "git_worktree") {
+          // Persist for both the single-repo worktree strategy and the
+          // multi-repo task-dir strategy (one worktree per child repo). The two
+          // differ only in the strategy/provider type tag and whether we record
+          // the per-child worktree list — everything else (branch, reuse,
+          // issue linkage) is identical.
+          if (realized.strategy === "git_worktree" || realized.strategy === "multi_repo_worktree") {
+            const isMultiRepo = realized.strategy === "multi_repo_worktree";
             const strategy = parseObject(adapterConfig.workspaceStrategy);
             const baseRef = readNonEmptyString(strategy.baseRef) ?? workspace.repoRef ?? null;
             const executionProjectId = workspaceProjectId ?? resolvedProjectId;
@@ -2021,14 +2049,18 @@ export async function resolveWorkspaceForHeartbeatRun(
               projectWorkspaceId: workspace.id,
               sourceIssueId: issueRow.id,
               mode: "isolated_workspace" as const,
-              strategyType: "git_worktree" as const,
+              strategyType: (isMultiRepo ? "multi_repo_worktree" : "git_worktree") as
+                | "git_worktree"
+                | "multi_repo_worktree",
               name: `${issueRow.identifier ?? "Issue"} execution workspace`,
               status: "active" as const,
               cwd: realized.cwd,
               repoUrl: workspace.repoUrl,
               baseRef,
               branchName: realized.branchName,
-              providerType: "git_worktree" as const,
+              providerType: (isMultiRepo ? "multi_repo_worktree" : "git_worktree") as
+                | "git_worktree"
+                | "multi_repo_worktree",
               providerRef: realized.worktreePath,
               lastUsedAt: now,
               metadata: {
@@ -2042,6 +2074,11 @@ export async function resolveWorkspaceForHeartbeatRun(
                 agentId: agent.id,
                 projectWorkspaceId: workspace.id,
                 workspaceStrategy: strategy,
+                // Authoritative per-child worktree list so cleanup can remove
+                // every child worktree even after the server restarts.
+                ...(isMultiRepo && realized.childWorktrees
+                  ? { childWorktrees: realized.childWorktrees }
+                  : {}),
               },
               updatedAt: now,
             };

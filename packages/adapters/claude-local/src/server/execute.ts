@@ -30,6 +30,7 @@ import {
   resolveAdapterErrorCode,
 } from "./parse.js";
 import { recordUsageLimitObservation } from "./quota.js";
+import { jiraDisallowedMcpTools } from "./jira-readonly-policy.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const COMBYNE_SKILLS_CANDIDATES = [
@@ -493,6 +494,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : [];
     for (const dir of projectDirs) {
       args.push("--add-dir", dir);
+    }
+    // Jira read-only policy (COMBYNE_JIRA_AGENT_READONLY, default ON). Connected
+    // Jira users reported agents "intruding" by mutating the board, so we block
+    // the Atlassian/Jira WRITE MCP tools (create/edit/transition/comment/worklog/
+    // createIssueLink + Confluence writes) while leaving the READ tools
+    // (get/search/fetch) available. This is the clearest enforcement point: the
+    // Atlassian MCP tools are exposed directly to the CLI with no server proxy in
+    // the hot path. Passed BEFORE extraArgs so an operator opt-out (flag=false →
+    // empty list) or an explicit extraArgs override still wins.
+    const jiraDisallowed = jiraDisallowedMcpTools(env);
+    if (jiraDisallowed.length > 0) {
+      args.push("--disallowedTools", jiraDisallowed.join(","));
     }
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;

@@ -13,6 +13,19 @@ export {
   recordUsageLimitObservation,
   __resetUsageLimitObservation,
 } from "./quota.js";
+export {
+  JIRA_AGENT_READONLY_ENV,
+  JIRA_AGENT_MAX_SEARCH_RESULTS_ENV,
+  DEFAULT_JIRA_AGENT_MAX_SEARCH_RESULTS,
+  JIRA_WRITE_OPERATIONS,
+  JIRA_WRITE_MCP_TOOLS,
+  isAtlassianTool,
+  isJiraWriteOperation,
+  isJiraReadOperation,
+  isJiraReadOnlyEnabled,
+  resolveJiraAgentMaxSearchResults,
+  jiraDisallowedMcpTools,
+} from "./jira-readonly-policy.js";
 export type { McpToolAuthErrorResult, ClaudeUsageLimitResult } from "./parse.js";
 import type { AdapterSessionCodec } from "@combyne/adapter-utils";
 

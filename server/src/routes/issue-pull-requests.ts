@@ -10,6 +10,29 @@ import { and, eq, isNull } from "drizzle-orm";
 import { validate } from "../middleware/validate.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { acceptedWorkService, heartbeatService, issuePullRequestService, logActivity } from "../services/index.js";
+import {
+  ALLOWED_PUSH_REMOTE_PATTERNS_ENV,
+  isRemoteAllowed,
+  parseAllowedRemotePatterns,
+} from "../services/push-remote-allowlist.js";
+
+// Server-side backstop for the production-remote guardrail: even if an agent's
+// per-workspace pre-push hook is bypassed (different clone, hook removed, push
+// from outside a realized workspace), we refuse to TRACK a PR whose repo is not
+// on the allowlist. This keeps a production repo's PRs out of the merge/approval
+// machinery entirely.
+//
+// The backstop only ENGAGES when an allowlist is explicitly configured. With no
+// allowlist set it fails OPEN here — the per-workspace pre-push hook is the
+// primary guard, and a hard block would break PR tracking for every existing
+// deployment that hasn't adopted the env. Set COMBYNE_ALLOWED_PUSH_REMOTE_PATTERNS
+// to make this backstop strict too (recommended; it then blocks production repos
+// the same way the hook does).
+function isTrackedRepoAllowed(repo: string): boolean {
+  const patterns = parseAllowedRemotePatterns(process.env[ALLOWED_PUSH_REMOTE_PATTERNS_ENV] ?? null);
+  if (patterns.length === 0) return true;
+  return isRemoteAllowed(repo, patterns);
+}
 
 export function issuePullRequestRoutes(db: Db) {
   const router = Router();
@@ -69,6 +92,16 @@ export function issuePullRequestRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    // Backstop the push/PR guardrail: reject tracking a PR for a non-allowlisted
+    // (e.g. production) repo with a clear 4xx before it enters the merge pipeline.
+    if (!isTrackedRepoAllowed(req.body.repo)) {
+      res.status(422).json({
+        error: "Repository is not an allowlisted Combyne test target",
+        repo: req.body.repo,
+        hint: `Set ${ALLOWED_PUSH_REMOTE_PATTERNS_ENV} to allow this repo.`,
+      });
+      return;
+    }
     const actor = getActorInfo(req);
     const row = await svc.upsertForIssue({
       companyId: issue.companyId,

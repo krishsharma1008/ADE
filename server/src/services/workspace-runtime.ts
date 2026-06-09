@@ -23,6 +23,10 @@ import {
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import {
+  ALLOWED_PUSH_REMOTE_PATTERNS_ENV,
+  resolveAllowedRemotePatterns,
+} from "./push-remote-allowlist.js";
 
 export interface ExecutionWorkspaceInput {
   baseCwd: string;
@@ -45,13 +49,34 @@ export interface ExecutionWorkspaceAgentRef {
   companyId: string;
 }
 
+/**
+ * One realized child worktree inside a multi_repo_worktree task dir. `repoName`
+ * is the immediate child dir name under the parent workspace; `repoRoot` is the
+ * child repo whose worktree we linked; `worktreePath` is `<taskDir>/<repoName>`.
+ */
+export interface RealizedChildWorktree {
+  repoName: string;
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string;
+  baseRef: string;
+  created: boolean;
+}
+
 export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
-  strategy: "project_primary" | "git_worktree";
+  strategy: "project_primary" | "git_worktree" | "multi_repo_worktree";
   cwd: string;
   branchName: string | null;
   worktreePath: string | null;
   warnings: string[];
   created: boolean;
+  /**
+   * Populated only for the multi_repo_worktree strategy: the per-child-repo
+   * worktrees realized under the isolated task dir (`cwd`). Empty/undefined for
+   * single-repo strategies. Persisted into the execution_workspaces metadata so
+   * cleanup can reconstruct and remove every child worktree.
+   */
+  childWorktrees?: RealizedChildWorktree[];
 }
 
 export interface RuntimeServiceRef {
@@ -622,6 +647,420 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+// Marker so we can detect (and overwrite) a hook we previously installed without
+// clobbering an unrelated, human-authored pre-push hook.
+const PUSH_GUARD_HOOK_MARKER = "# combyne-push-remote-guard v1";
+
+/**
+ * Render the per-workspace `pre-push` hook. git invokes pre-push with the remote
+ * NAME ($1) and remote URL ($2) as args, and feeds "<local ref> <local sha>
+ * <remote ref> <remote sha>" lines on stdin. We block the push (exit 1) unless
+ * the remote URL matches the STRICT allowlist embedded at install time. The
+ * allowlist is baked into the script so the guard holds even if the server
+ * process or its env is gone by the time the agent pushes.
+ */
+export function renderPushGuardHook(allowedPatterns: readonly string[]): string {
+  // Embed patterns as a newline-delimited heredoc; each line is matched with the
+  // same glob/regex semantics as the TS helper, re-implemented in POSIX sh + grep
+  // so the hook has zero runtime dependency on Node.
+  const patternBlock = allowedPatterns.join("\n");
+  return `#!/bin/sh
+${PUSH_GUARD_HOOK_MARKER}
+# Auto-installed by Combyne. Blocks 'git push' to any remote whose URL is not on
+# the allowlist below (STRICT: unknown remotes are rejected). Do not edit by hand;
+# regenerated on every workspace realization.
+set -eu
+
+remote_url="\${2:-}"
+
+# Normalize the remote URL to host/owner/repo (lower-cased, no .git, no creds).
+normalize_slug() {
+  url="$1"
+  url=$(printf '%s' "$url" | sed -E 's/\\.git$//')
+  case "$url" in
+    *://*)
+      rest=\${url#*://}
+      rest=\${rest#*@}
+      host=\${rest%%/*}
+      host=\${host%%:*}
+      pathp=\${rest#*/}
+      ;;
+    *@*:*)
+      rest=\${url#*@}
+      host=\${rest%%:*}
+      pathp=\${rest#*:}
+      ;;
+    *:*/*)
+      host=\${url%%:*}
+      pathp=\${url#*:}
+      ;;
+    */*)
+      host="github.com"
+      pathp="$url"
+      ;;
+    *)
+      printf ''
+      return
+      ;;
+  esac
+  owner=$(printf '%s' "$pathp" | cut -d/ -f1)
+  repo=$(printf '%s' "$pathp" | cut -d/ -f2)
+  if [ -z "$owner" ] || [ -z "$repo" ]; then
+    printf ''
+    return
+  fi
+  printf '%s/%s/%s' "$host" "$owner" "$repo" | tr 'A-Z' 'a-z'
+}
+
+slug=$(normalize_slug "$remote_url")
+if [ -z "$slug" ]; then
+  echo "[combyne push guard] BLOCKED: could not parse remote URL '$remote_url'." >&2
+  echo "[combyne push guard] Pushing is only permitted to allowlisted test remotes." >&2
+  exit 1
+fi
+
+# Translate one allowlist pattern to an extended-regex anchored against the slug.
+pattern_to_regex() {
+  pat="$1"
+  case "$pat" in
+    /*/)
+      # /regex/ form: strip delimiters, use as-is.
+      printf '%s' "$pat" | sed -E 's#^/##; s#/$##'
+      return
+      ;;
+  esac
+  pat=$(printf '%s' "$pat" | sed -E 's/\\.git$//' | tr 'A-Z' 'a-z')
+  # Default host/owner like the TS normalizer.
+  seps=$(printf '%s' "$pat" | sed 's/\\*\\*//g' | tr -cd '/' | wc -c | tr -d ' ')
+  if [ "$seps" = "0" ]; then
+    pat="github.com/*/$pat"
+  elif [ "$seps" = "1" ]; then
+    pat="github.com/$pat"
+  fi
+  # Stash glob wildcards as placeholders BEFORE escaping regex metachars (so the
+  # '*' chars are not themselves escaped), escape the remaining literals, then
+  # expand the placeholders into bracket expressions. Using '#' as the sed
+  # delimiter throughout avoids the '/' inside '[^/]*' clashing with the delimiter.
+  esc=$(printf '%s' "$pat" | sed 's#\\*\\*#__DBLSTAR__#g; s#\\*#__STAR__#g')
+  esc=$(printf '%s' "$esc" | sed -E 's#[.+?^$(){}|[\\]#\\\\&#g')
+  esc=$(printf '%s' "$esc" | sed 's#__DBLSTAR__#[^/]*(/[^/]*)*#g; s#__STAR__#[^/]*#g')
+  printf '^%s$' "$esc"
+}
+
+allowed=0
+while IFS= read -r pattern; do
+  [ -z "$pattern" ] && continue
+  regex=$(pattern_to_regex "$pattern")
+  [ -z "$regex" ] && continue
+  if printf '%s' "$slug" | grep -Eiq "$regex"; then
+    allowed=1
+    break
+  fi
+done <<'COMBYNE_PUSH_ALLOWLIST'
+${patternBlock}
+COMBYNE_PUSH_ALLOWLIST
+
+if [ "$allowed" != "1" ]; then
+  echo "[combyne push guard] BLOCKED push to '$remote_url' ($slug)." >&2
+  echo "[combyne push guard] This remote is not an allowlisted Combyne test target." >&2
+  echo "[combyne push guard] Allowed patterns are configured via ${ALLOWED_PUSH_REMOTE_PATTERNS_ENV}." >&2
+  exit 1
+fi
+
+exit 0
+`;
+}
+
+/**
+ * Install (or refresh) the push-guard pre-push hook into the git dir that backs
+ * `cwd`. Resolves the hooks dir via `git rev-parse --git-path hooks` so it works
+ * for both ordinary checkouts and linked worktrees (where hooks live in the
+ * common dir). Best-effort: failures are returned as warnings, never thrown, so
+ * a hook problem can never block an agent run from starting. Defense in depth —
+ * the server-side PR-tracking backstop catches anything that slips through.
+ */
+export async function installPushGuardHook(input: {
+  cwd: string;
+  repoUrls: (string | null | undefined)[];
+}): Promise<string[]> {
+  const warnings: string[] = [];
+  try {
+    const allowedPatterns = resolveAllowedRemotePatterns({
+      envValue: process.env[ALLOWED_PUSH_REMOTE_PATTERNS_ENV] ?? null,
+      repoUrls: input.repoUrls,
+    });
+    const hooksDirRaw = await runGit(["rev-parse", "--git-path", "hooks"], input.cwd).catch(() => null);
+    if (!hooksDirRaw) {
+      warnings.push("Could not resolve git hooks directory to install the push guard.");
+      return warnings;
+    }
+    const hooksDir = path.isAbsolute(hooksDirRaw) ? hooksDirRaw : path.resolve(input.cwd, hooksDirRaw);
+    const hookPath = path.join(hooksDir, "pre-push");
+
+    // Never silently overwrite a pre-push hook we did not author.
+    const existing = await fs.readFile(hookPath, "utf8").catch(() => null);
+    if (existing !== null && !existing.includes(PUSH_GUARD_HOOK_MARKER)) {
+      warnings.push(
+        `Left existing pre-push hook at "${hookPath}" untouched (not authored by Combyne); push guard not installed.`,
+      );
+      return warnings;
+    }
+
+    await fs.mkdir(hooksDir, { recursive: true });
+    await fs.writeFile(hookPath, renderPushGuardHook(allowedPatterns), { mode: 0o755 });
+    // writeFile honors mode only on create; ensure executable on overwrite too.
+    await fs.chmod(hookPath, 0o755).catch(() => undefined);
+  } catch (err) {
+    warnings.push(
+      `Failed to install push-remote guard hook: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return warnings;
+}
+
+/**
+ * Add (or reuse) a single linked git worktree for `repoRoot` at `worktreePath`,
+ * checking out a per-issue `branchName` forked from `baseRef`. This is the
+ * shared core used by BOTH single-repo isolation and each child of a multi-repo
+ * parent, so the two paths stay byte-for-byte consistent (same reuse semantics,
+ * same provision command, same push-guard install). Returns whether the
+ * worktree was freshly created (vs reused).
+ */
+async function prepareSingleRepoWorktree(input: {
+  strategy: Record<string, unknown>;
+  base: ExecutionWorkspaceInput;
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string;
+  baseRef: string;
+  issue: ExecutionWorkspaceIssueRef | null;
+  agent: ExecutionWorkspaceAgentRef;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ created: boolean; warnings: string[] }> {
+  const { repoRoot, worktreePath, branchName, baseRef } = input;
+
+  const existingWorktree = await directoryExists(worktreePath);
+  if (existingWorktree) {
+    const existingGitDir = await runGit(["rev-parse", "--git-dir"], worktreePath).catch(() => null);
+    if (existingGitDir) {
+      if (input.recorder) {
+        await input.recorder.recordOperation({
+          phase: "worktree_prepare",
+          cwd: repoRoot,
+          metadata: { repoRoot, worktreePath, branchName, baseRef, created: false, reused: true },
+          run: async () => ({
+            status: "succeeded",
+            exitCode: 0,
+            system: `Reused existing git worktree at ${worktreePath}\n`,
+          }),
+        });
+      }
+      await provisionExecutionWorktree({
+        strategy: input.strategy,
+        base: input.base,
+        repoRoot,
+        worktreePath,
+        branchName,
+        issue: input.issue,
+        agent: input.agent,
+        created: false,
+        recorder: input.recorder ?? null,
+      });
+      const reusedGuardWarnings = await installPushGuardHook({
+        cwd: worktreePath,
+        repoUrls: [input.base.repoUrl],
+      });
+      return { created: false, warnings: reusedGuardWarnings };
+    }
+    throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a git worktree.`);
+  }
+
+  try {
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_prepare",
+      args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+      cwd: repoRoot,
+      metadata: { repoRoot, worktreePath, branchName, baseRef, created: true },
+      successMessage: `Created git worktree at ${worktreePath}\n`,
+      failureLabel: `git worktree add ${worktreePath}`,
+    });
+  } catch (error) {
+    if (!gitErrorIncludes(error, "already exists")) {
+      throw error;
+    }
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_prepare",
+      args: ["worktree", "add", worktreePath, branchName],
+      cwd: repoRoot,
+      metadata: { repoRoot, worktreePath, branchName, baseRef, created: false, reusedExistingBranch: true },
+      successMessage: `Attached existing branch ${branchName} at ${worktreePath}\n`,
+      failureLabel: `git worktree add ${worktreePath}`,
+    });
+  }
+  await provisionExecutionWorktree({
+    strategy: input.strategy,
+    base: input.base,
+    repoRoot,
+    worktreePath,
+    branchName,
+    issue: input.issue,
+    agent: input.agent,
+    created: true,
+    recorder: input.recorder ?? null,
+  });
+  const createdGuardWarnings = await installPushGuardHook({
+    cwd: worktreePath,
+    repoUrls: [input.base.repoUrl],
+  });
+  return { created: true, warnings: createdGuardWarnings };
+}
+
+/**
+ * Enumerate the IMMEDIATE child directories of `parentCwd` that are themselves
+ * git repos (their own toplevel == that child dir). Mirrors the multi-repo
+ * scan in heartbeat.ts computeMultiRepoProgress so the isolation layout and the
+ * progress gate agree on what counts as a "child repo". Dot-dirs and any child
+ * that is merely INSIDE a larger repo (e.g. nested under the parent's own repo)
+ * are skipped — we only want self-contained sibling repos. Bounded for safety.
+ */
+export async function enumerateChildGitRepos(parentCwd: string): Promise<Array<{ name: string; root: string }>> {
+  const MAX_SCANNED_CHILDREN = 50;
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(parentCwd, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const names = entries
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+    .map((entry) => entry.name)
+    .sort()
+    .slice(0, MAX_SCANNED_CHILDREN);
+
+  const repos: Array<{ name: string; root: string }> = [];
+  for (const name of names) {
+    const childPath = path.join(parentCwd, name);
+    // Resolve the child's OWN toplevel; only accept it when the toplevel is the
+    // child dir itself (a real, self-contained repo), not an ancestor — so we
+    // never treat a plain subfolder of one big repo as a separate child repo.
+    const top = await runGit(["rev-parse", "--show-toplevel"], childPath).catch(() => null);
+    if (!top) continue;
+    // Compare via realpath: git reports the canonical (symlink-resolved) path,
+    // so a plain path.resolve would spuriously mismatch on platforms where the
+    // workspace dir contains a symlink (e.g. macOS /tmp -> /private/tmp).
+    const [topReal, childReal] = await Promise.all([
+      fs.realpath(top).catch(() => path.resolve(top)),
+      fs.realpath(childPath).catch(() => path.resolve(childPath)),
+    ]);
+    if (topReal !== childReal) continue;
+    // Keep the non-realpath child path as the worktree's parent so the layout
+    // stays anchored under the project workspace cwd the caller passed in.
+    repos.push({ name, root: path.resolve(childPath) });
+  }
+  return repos;
+}
+
+/**
+ * Multi-repo parent isolation. The project workspace `baseCwd` is NOT itself a
+ * git repo but holds N child git repos (e.g. `fs-bnpl-service/`,
+ * `fs-brick-service/`). We realize a SINGLE isolated task dir and, inside it,
+ * one linked git worktree per child repo named after the repo, each on the same
+ * per-issue branch forked from that repo's base. The task dir becomes the run
+ * cwd; the (already multi-repo-aware) progress gate then measures the agent's
+ * edits across the child worktrees correctly. Returns null when the parent has
+ * NO child git repos so the caller can fall back to the project-primary path.
+ */
+async function realizeMultiRepoWorktree(input: {
+  strategy: Record<string, unknown>;
+  base: ExecutionWorkspaceInput;
+  branchName: string;
+  issue: ExecutionWorkspaceIssueRef | null;
+  agent: ExecutionWorkspaceAgentRef;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<RealizedExecutionWorkspace | null> {
+  const parentCwd = path.resolve(input.base.baseCwd);
+  const childRepos = await enumerateChildGitRepos(parentCwd);
+  if (childRepos.length === 0) return null;
+
+  // The isolated task dir holds every child worktree. Keep it OUTSIDE any single
+  // child repo (a sibling under the parent's `.combyne-ai/tasks`) so removing one
+  // child worktree never tangles with another, and so it is git-ignored per child
+  // via the same exclude marker we use for single-repo worktrees.
+  const configuredParentDir = asString(input.strategy.worktreeParentDir, "");
+  const taskParentDir = configuredParentDir
+    ? resolveConfiguredPath(configuredParentDir, parentCwd)
+    : path.join(parentCwd, ".combyne-ai", "tasks");
+  const taskDir = path.join(taskParentDir, input.branchName);
+  await fs.mkdir(taskDir, { recursive: true });
+
+  const warnings: string[] = [];
+  const childWorktrees: RealizedChildWorktree[] = [];
+  let anyCreated = false;
+
+  const configuredBaseRef =
+    typeof input.strategy.baseRef === "string" && input.strategy.baseRef.length > 0
+      ? input.strategy.baseRef
+      : input.base.repoRef ?? null;
+
+  for (const child of childRepos) {
+    const childWorktreePath = path.join(taskDir, child.name);
+    // Each child repo may have a different default branch, so resolve per-repo.
+    const baseRef = configuredBaseRef ?? (await detectDefaultBranch(child.root)) ?? "HEAD";
+    // Exclude the task dir from each child repo's status (best-effort) so the
+    // worktree files never appear as untracked noise in the child checkout.
+    await ensureCombyneWorktreeParentExcluded(child.root, taskParentDir).catch(() => {});
+    try {
+      const prepared = await prepareSingleRepoWorktree({
+        strategy: input.strategy,
+        base: { ...input.base, baseCwd: child.root },
+        repoRoot: child.root,
+        worktreePath: childWorktreePath,
+        branchName: input.branchName,
+        baseRef,
+        issue: input.issue,
+        agent: input.agent,
+        recorder: input.recorder ?? null,
+      });
+      anyCreated = anyCreated || prepared.created;
+      warnings.push(...prepared.warnings);
+      childWorktrees.push({
+        repoName: child.name,
+        repoRoot: child.root,
+        worktreePath: childWorktreePath,
+        branchName: input.branchName,
+        baseRef,
+        created: prepared.created,
+      });
+    } catch (err) {
+      // One bad child must not sink the whole task dir — record a warning and
+      // continue so the agent still gets the other repos' worktrees.
+      warnings.push(
+        `Could not prepare worktree for child repo "${child.name}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  if (childWorktrees.length === 0) {
+    // Every child failed to realize — surface as a hard failure so the caller's
+    // catch falls back to the shared project workspace rather than handing the
+    // agent an empty task dir.
+    throw new Error(
+      `Multi-repo isolation found ${childRepos.length} child repo(s) under "${parentCwd}" but failed to realize any worktree.`,
+    );
+  }
+
+  return {
+    ...input.base,
+    strategy: "multi_repo_worktree",
+    cwd: taskDir,
+    branchName: input.branchName,
+    worktreePath: taskDir,
+    warnings,
+    created: anyCreated,
+    childWorktrees,
+  };
+}
+
 export async function realizeExecutionWorkspace(input: {
   base: ExecutionWorkspaceInput;
   config: Record<string, unknown>;
@@ -632,18 +1071,23 @@ export async function realizeExecutionWorkspace(input: {
   const rawStrategy = parseObject(input.config.workspaceStrategy);
   const strategyType = asString(rawStrategy.type, "project_primary");
   if (strategyType !== "git_worktree") {
+    // Even when the agent works directly in the project primary checkout, install
+    // the push guard so a `git push` to a production remote is hard-blocked.
+    const guardWarnings = await installPushGuardHook({
+      cwd: input.base.baseCwd,
+      repoUrls: [input.base.repoUrl],
+    });
     return {
       ...input.base,
       strategy: "project_primary",
       cwd: input.base.baseCwd,
       branchName: null,
       worktreePath: null,
-      warnings: [],
+      warnings: guardWarnings,
       created: false,
     };
   }
 
-  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
   const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
   const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
     issue: input.issue,
@@ -652,6 +1096,43 @@ export async function realizeExecutionWorkspace(input: {
     repoRef: input.base.repoRef,
   });
   const branchName = sanitizeBranchName(renderedBranch);
+
+  // Resolve the base cwd's own git toplevel. When it IS a single repo we take the
+  // original per-repo worktree path. When it is NOT a repo (a multi-repo parent
+  // workspace holding child repos), we fan out to one worktree per child under a
+  // single isolated task dir. This keeps single-repo isolation byte-for-byte
+  // unchanged while letting the multi-repo parent layout engage isolation at all.
+  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd).catch(() => null);
+  if (!repoRoot) {
+    const multiRepo = await realizeMultiRepoWorktree({
+      strategy: rawStrategy,
+      base: input.base,
+      branchName,
+      issue: input.issue,
+      agent: input.agent,
+      recorder: input.recorder ?? null,
+    });
+    if (multiRepo) return multiRepo;
+    // No child git repos either — fall through to project_primary so the agent
+    // at least runs in the parent dir (and gets a best-effort push guard).
+    const guardWarnings = await installPushGuardHook({
+      cwd: input.base.baseCwd,
+      repoUrls: [input.base.repoUrl],
+    });
+    return {
+      ...input.base,
+      strategy: "project_primary",
+      cwd: input.base.baseCwd,
+      branchName: null,
+      worktreePath: null,
+      warnings: [
+        `Isolated workspace requested but "${input.base.baseCwd}" is neither a git repo nor a multi-repo parent; running in the project workspace.`,
+        ...guardWarnings,
+      ],
+      created: false,
+    };
+  }
+
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
@@ -667,97 +1148,15 @@ export async function realizeExecutionWorkspace(input: {
   await fs.mkdir(worktreeParentDir, { recursive: true });
   await ensureCombyneWorktreeParentExcluded(repoRoot, worktreeParentDir);
 
-  const existingWorktree = await directoryExists(worktreePath);
-  if (existingWorktree) {
-    const existingGitDir = await runGit(["rev-parse", "--git-dir"], worktreePath).catch(() => null);
-    if (existingGitDir) {
-      if (input.recorder) {
-        await input.recorder.recordOperation({
-          phase: "worktree_prepare",
-          cwd: repoRoot,
-          metadata: {
-            repoRoot,
-            worktreePath,
-            branchName,
-            baseRef,
-            created: false,
-            reused: true,
-          },
-          run: async () => ({
-            status: "succeeded",
-            exitCode: 0,
-            system: `Reused existing git worktree at ${worktreePath}\n`,
-          }),
-        });
-      }
-      await provisionExecutionWorktree({
-        strategy: rawStrategy,
-        base: input.base,
-        repoRoot,
-        worktreePath,
-        branchName,
-        issue: input.issue,
-        agent: input.agent,
-        created: false,
-        recorder: input.recorder ?? null,
-      });
-      return {
-        ...input.base,
-        strategy: "git_worktree",
-        cwd: worktreePath,
-        branchName,
-        worktreePath,
-        warnings: [],
-        created: false,
-      };
-    }
-    throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a git worktree.`);
-  }
-
-  try {
-    await recordGitOperation(input.recorder, {
-      phase: "worktree_prepare",
-      args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
-      cwd: repoRoot,
-      metadata: {
-        repoRoot,
-        worktreePath,
-        branchName,
-        baseRef,
-        created: true,
-      },
-      successMessage: `Created git worktree at ${worktreePath}\n`,
-      failureLabel: `git worktree add ${worktreePath}`,
-    });
-  } catch (error) {
-    if (!gitErrorIncludes(error, "already exists")) {
-      throw error;
-    }
-    await recordGitOperation(input.recorder, {
-      phase: "worktree_prepare",
-      args: ["worktree", "add", worktreePath, branchName],
-      cwd: repoRoot,
-      metadata: {
-        repoRoot,
-        worktreePath,
-        branchName,
-        baseRef,
-        created: false,
-        reusedExistingBranch: true,
-      },
-      successMessage: `Attached existing branch ${branchName} at ${worktreePath}\n`,
-      failureLabel: `git worktree add ${worktreePath}`,
-    });
-  }
-  await provisionExecutionWorktree({
+  const prepared = await prepareSingleRepoWorktree({
     strategy: rawStrategy,
     base: input.base,
     repoRoot,
     worktreePath,
     branchName,
+    baseRef,
     issue: input.issue,
     agent: input.agent,
-    created: true,
     recorder: input.recorder ?? null,
   });
 
@@ -767,9 +1166,65 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [],
-    created: true,
+    warnings: prepared.warnings,
+    created: prepared.created,
   };
+}
+
+/** A child worktree as needed for multi-repo cleanup (subset of RealizedChildWorktree). */
+interface ChildWorktreeCleanupRef {
+  repoName: string;
+  repoRoot: string | null;
+  worktreePath: string;
+  branchName: string | null;
+}
+
+/**
+ * Read the per-child worktree list a multi_repo_worktree realization persisted
+ * into execution_workspaces.metadata.childWorktrees. Tolerant of partial/legacy
+ * shapes — only entries with a usable worktreePath survive.
+ */
+function parseChildWorktreesFromMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): ChildWorktreeCleanupRef[] {
+  const raw = metadata?.childWorktrees;
+  if (!Array.isArray(raw)) return [];
+  const out: ChildWorktreeCleanupRef[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const rec = entry as Record<string, unknown>;
+    const worktreePath = asString(rec.worktreePath, "").trim();
+    if (!worktreePath) continue;
+    out.push({
+      repoName: asString(rec.repoName, path.basename(worktreePath)),
+      repoRoot: asString(rec.repoRoot, "").trim() || null,
+      worktreePath,
+      branchName: asString(rec.branchName, "").trim() || null,
+    });
+  }
+  return out;
+}
+
+/**
+ * Fallback when a multi_repo_worktree record predates childWorktrees metadata:
+ * each immediate child dir of the task dir that is a linked worktree maps back
+ * to its owning repo via `git rev-parse --git-common-dir`. Best-effort.
+ */
+async function rediscoverChildWorktrees(taskDir: string): Promise<ChildWorktreeCleanupRef[]> {
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(taskDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: ChildWorktreeCleanupRef[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    const worktreePath = path.join(taskDir, entry.name);
+    const repoRoot = await resolveGitRepoRootForWorkspaceCleanup(worktreePath, null).catch(() => null);
+    out.push({ repoName: entry.name, repoRoot, worktreePath, branchName: null });
+  }
+  return out;
 }
 
 export async function cleanupExecutionWorkspaceArtifacts(input: {
@@ -830,7 +1285,87 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     }
   }
 
-  if (input.workspace.providerType === "git_worktree" && workspacePath) {
+  if (input.workspace.providerType === "multi_repo_worktree" && workspacePath) {
+    // Remove EVERY child worktree this task dir holds. We prefer the persisted
+    // childWorktrees metadata (authoritative repoRoot per child); if it is
+    // missing (older record), fall back to re-deriving each child's repoRoot
+    // from the worktree's own git-common-dir so cleanup is still correct.
+    const childWorktrees = parseChildWorktreesFromMetadata(input.workspace.metadata);
+    const resolvedChildren = childWorktrees.length > 0
+      ? childWorktrees
+      : await rediscoverChildWorktrees(workspacePath);
+    for (const child of resolvedChildren) {
+      const childWorktreeExists = await directoryExists(child.worktreePath);
+      const childRepoRoot =
+        child.repoRoot ??
+        (await resolveGitRepoRootForWorkspaceCleanup(child.worktreePath, null));
+      if (childWorktreeExists) {
+        if (!childRepoRoot) {
+          warnings.push(`Could not resolve git repo root for child worktree "${child.worktreePath}".`);
+        } else {
+          try {
+            await recordGitOperation(input.recorder, {
+              phase: "worktree_cleanup",
+              args: ["worktree", "remove", "--force", child.worktreePath],
+              cwd: childRepoRoot,
+              metadata: {
+                workspaceId: input.workspace.id,
+                workspacePath: child.worktreePath,
+                branchName: child.branchName ?? input.workspace.branchName,
+                cleanupAction: "worktree_remove",
+                repoName: child.repoName,
+              },
+              successMessage: `Removed git worktree ${child.worktreePath}\n`,
+              failureLabel: `git worktree remove ${child.worktreePath}`,
+            });
+          } catch (err) {
+            warnings.push(err instanceof Error ? err.message : String(err));
+          }
+        }
+      }
+      // Delete the per-issue branch in each child repo (best-effort; a branch
+      // that is unmerged or still checked out elsewhere is left alone).
+      const childBranch = child.branchName ?? input.workspace.branchName;
+      if (createdByRuntime && childBranch && childRepoRoot) {
+        try {
+          await recordGitOperation(input.recorder, {
+            phase: "worktree_cleanup",
+            args: ["branch", "-d", childBranch],
+            cwd: childRepoRoot,
+            metadata: {
+              workspaceId: input.workspace.id,
+              workspacePath: child.worktreePath,
+              branchName: childBranch,
+              cleanupAction: "branch_delete",
+              repoName: child.repoName,
+            },
+            successMessage: `Deleted branch ${childBranch}\n`,
+            failureLabel: `git branch -d ${childBranch}`,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          warnings.push(`Skipped deleting branch "${childBranch}" in "${child.repoName}": ${message}`);
+        }
+      }
+    }
+    // Finally remove the (now-empty) isolated task dir itself, but never if it
+    // somehow contains the project workspace cwd.
+    const projectWorkspaceCwd = input.projectWorkspace?.cwd ? path.resolve(input.projectWorkspace.cwd) : null;
+    const resolvedTaskDir = path.resolve(workspacePath);
+    const taskDirContainsProjectWorkspace = projectWorkspaceCwd
+      ? (
+          resolvedTaskDir === projectWorkspaceCwd ||
+          projectWorkspaceCwd.startsWith(`${resolvedTaskDir}${path.sep}`)
+        )
+      : false;
+    if (createdByRuntime && !taskDirContainsProjectWorkspace) {
+      await fs.rm(resolvedTaskDir, { recursive: true, force: true }).catch((err) => {
+        warnings.push(`Could not remove task dir "${resolvedTaskDir}": ${err instanceof Error ? err.message : String(err)}`);
+      });
+    } else if (taskDirContainsProjectWorkspace) {
+      warnings.push(`Refusing to remove task dir "${workspacePath}" because it contains the project workspace.`);
+    }
+  } else if (input.workspace.providerType === "git_worktree" && workspacePath) {
     const repoRoot = await resolveGitRepoRootForWorkspaceCleanup(
       workspacePath,
       input.projectWorkspace?.cwd ?? null,

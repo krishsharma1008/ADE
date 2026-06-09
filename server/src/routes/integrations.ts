@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import type { Db } from "@combyne/db";
 import {
   createIntegrationSchema,
@@ -19,6 +19,11 @@ import {
   type SonarQubeConfig,
   type IntegrationProvider,
 } from "@combyne/shared";
+import {
+  isJiraReadOnlyEnabled,
+  isJiraWriteOperation,
+  resolveJiraAgentMaxSearchResults,
+} from "@combyne/adapter-claude-local/server";
 import { validate } from "../middleware/validate.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { acceptedWorkService, heartbeatService, issuePullRequestService, logActivity } from "../services/index.js";
@@ -27,8 +32,27 @@ import { createJiraClient } from "../services/jira.js";
 import { createConfluentClient } from "../services/confluent.js";
 import { createGitHubClient } from "../services/github.js";
 import { createSonarQubeClient } from "../services/sonarqube.js";
-import { badRequest, notFound, unprocessable } from "../errors.js";
+import { badRequest, forbidden, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+
+/**
+ * Jira read-only policy enforcement for the Combyne REST proxy. Defense-in-depth
+ * mirror of the adapter's MCP `--disallowedTools` gate (jira-readonly-policy.ts):
+ * when COMBYNE_JIRA_AGENT_READONLY is on (default) an AGENT caller may not invoke
+ * a board-mutating Jira operation (create/transition/comment/...). Board/user
+ * actors are unaffected — the user themselves can still edit the board through
+ * the dashboard. The `operation` is the bare op name the policy classifies.
+ */
+function assertJiraWriteAllowed(req: Request, operation: string) {
+  if (req.actor.type !== "agent") return; // only agents are read-only-restricted
+  if (!isJiraReadOnlyEnabled()) return; // operator opt-out
+  if (isJiraWriteOperation(operation)) {
+    throw forbidden(
+      `Jira is read-only for agents (COMBYNE_JIRA_AGENT_READONLY): '${operation}' is a board mutation. ` +
+        "Agents may read issues but must not edit the board directly.",
+    );
+  }
+}
 
 export function integrationRoutes(db: Db) {
   const router = Router();
@@ -231,7 +255,14 @@ export function integrationRoutes(db: Db) {
       jql: req.query.jql,
       maxResults: req.query.maxResults ? Number(req.query.maxResults) : undefined,
     });
-    const issues = await client.searchIssues(parsed.jql, parsed.maxResults);
+    // Reduce intrusion: bound how many tickets an AGENT pulls per search so it
+    // can't auto-expand across the whole board. Board/user callers are unbounded
+    // (subject to the schema's own max). Same policy + flag as the write gate.
+    const effectiveMaxResults =
+      req.actor.type === "agent" && isJiraReadOnlyEnabled()
+        ? Math.min(parsed.maxResults ?? resolveJiraAgentMaxSearchResults(), resolveJiraAgentMaxSearchResults())
+        : parsed.maxResults;
+    const issues = await client.searchIssues(parsed.jql, effectiveMaxResults);
     res.json(issues);
   });
 
@@ -248,6 +279,7 @@ export function integrationRoutes(db: Db) {
 
   router.post("/companies/:companyId/integrations/jira/issues", async (req, res) => {
     assertBoard(req);
+    assertJiraWriteAllowed(req, "createJiraIssue");
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const config = await requireJiraConfig(companyId);
@@ -273,6 +305,7 @@ export function integrationRoutes(db: Db) {
     "/companies/:companyId/integrations/jira/issues/:issueKey/transition",
     async (req, res) => {
       assertBoard(req);
+      assertJiraWriteAllowed(req, "transitionJiraIssue");
       const companyId = req.params.companyId as string;
       const issueKey = req.params.issueKey as string;
       assertCompanyAccess(req, companyId);
@@ -289,6 +322,7 @@ export function integrationRoutes(db: Db) {
     "/companies/:companyId/integrations/jira/issues/:issueKey/comment",
     async (req, res) => {
       assertBoard(req);
+      assertJiraWriteAllowed(req, "addCommentToJiraIssue");
       const companyId = req.params.companyId as string;
       const issueKey = req.params.issueKey as string;
       assertCompanyAccess(req, companyId);
