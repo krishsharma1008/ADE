@@ -77,31 +77,42 @@ async function readMemoryEntryCount(db: Db): Promise<number> {
  * 200 with ok:false rather than a 500.
  */
 async function probeContextDb(url: string): Promise<ProbeResult> {
-  const probe = createDb(url);
-  try {
-    const serverVersion = await readServerVersion(probe);
-    const memorySchemaPresent = await readMemorySchemaPresent(probe);
-    const memoryEntryCount = memorySchemaPresent ? await readMemoryEntryCount(probe) : 0;
-    return { ok: true, serverVersion, memorySchemaPresent, memoryEntryCount };
-  } catch (err) {
-    return {
-      ok: false,
-      serverVersion: null,
-      memorySchemaPresent: false,
-      memoryEntryCount: null,
-      // Message only — never echo the url/credential.
-      error: err instanceof Error ? err.message : "Connection failed",
-    };
-  } finally {
-    // postgres-js client lives under the drizzle session; end it to release the
-    // throwaway pool. Best-effort: never let cleanup mask the probe outcome.
+  // Tolerate a slow/lossy remote rail: a Cloud SQL public IP across a high-latency
+  // link can take >10s to TLS-handshake (the createDb default) and occasionally
+  // drops a connect outright. Use a generous connect_timeout and ONE retry with a
+  // fresh throwaway connection so the status surface reports the rail accurately
+  // instead of a false "unreachable / schema missing" on a transient blip.
+  const PROBE_ATTEMPTS = 2;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+    const probe = createDb(url, { connect_timeout: 30 });
     try {
-      const client = (probe as unknown as { $client?: { end?: (opts?: unknown) => Promise<void> } }).$client;
-      if (client?.end) await client.end({ timeout: 5 });
-    } catch {
-      /* ignore */
+      const serverVersion = await readServerVersion(probe);
+      const memorySchemaPresent = await readMemorySchemaPresent(probe);
+      const memoryEntryCount = memorySchemaPresent ? await readMemoryEntryCount(probe) : 0;
+      return { ok: true, serverVersion, memorySchemaPresent, memoryEntryCount };
+    } catch (err) {
+      lastErr = err;
+    } finally {
+      // postgres-js client lives under the drizzle session; end it to release the
+      // throwaway pool. Best-effort: never let cleanup mask the probe outcome.
+      try {
+        const client = (probe as unknown as { $client?: { end?: (opts?: unknown) => Promise<void> } }).$client;
+        if (client?.end) await client.end({ timeout: 5 });
+      } catch {
+        /* ignore */
+      }
     }
+    if (attempt < PROBE_ATTEMPTS) await new Promise((r) => setTimeout(r, 600));
   }
+  return {
+    ok: false,
+    serverVersion: null,
+    memorySchemaPresent: false,
+    memoryEntryCount: null,
+    // Message only — never echo the url/credential.
+    error: lastErr instanceof Error ? lastErr.message : "Connection failed",
+  };
 }
 
 const urlBodySchema = z.object({ url: z.string().min(1) });

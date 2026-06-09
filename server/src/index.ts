@@ -26,7 +26,7 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig, logEmbeddingPosture, checkPinnedCompanyAdoption } from "./config.js";
-import { resolveContextDbUrl } from "./services/context-db.js";
+import { resolveContextDbUrl, pingContextDb } from "./services/context-db.js";
 import { drainContextCaptureOutbox } from "./services/memory-capture.js";
 import { drainAttachmentExtractionJobs } from "./services/attachment-extract.js";
 import { contextTrace } from "./services/context-trace.js"; // CONTEXT-TRACE
@@ -904,6 +904,25 @@ export async function startServer(): Promise<StartedServer> {
     // below) let each tick skip its own drain while a prior one is still running.
     let contextOutboxDrainInFlight = false;
     let attachmentDrainInFlight = false;
+
+    // Context-rail keepalive: when a SEPARATE context DB is configured, ping it on a
+    // short cadence to keep at least one pooled connection WARM. A Cloud SQL public
+    // IP across a high-latency/lossy link can take many seconds to TLS-handshake, so
+    // without this a user request that lands on a cold/idle-dropped socket pays that
+    // cost (or times out). The ping also refreshes the rail-health surface. No-op in
+    // single-DB mode (pingContextDb returns immediately). 45s < typical NAT idle TTL.
+    if (resolveContextDbUrl()) {
+      let contextPingInFlight = false;
+      const runContextPing = () => {
+        if (contextPingInFlight) return;
+        contextPingInFlight = true;
+        void pingContextDb(db as any).finally(() => {
+          contextPingInFlight = false;
+        });
+      };
+      runContextPing(); // warm immediately at boot so the first UI request is fast
+      setInterval(runContextPing, 45 * 1000);
+    }
 
     setInterval(() => {
       void heartbeat

@@ -17,10 +17,20 @@ import { loadConfig } from "../config.js";
  */
 const poolByUrl = new Map<string, Db>();
 
-/** Per-op deadline (ms) for the REMOTE context pool so a stalled Cloud SQL
- * round-trip can't wedge the heartbeat (invariant I4). Postgres aborts the query
- * server-side; the best-effort retrieval try/catch treats it as a miss. */
-const CONTEXT_STATEMENT_TIMEOUT_MS = 5000;
+/** Per-op SERVER-side deadline (ms) for the REMOTE context pool so a stalled
+ * Cloud SQL query can't wedge the heartbeat (invariant I4). Postgres aborts the
+ * query server-side; the best-effort retrieval try/catch treats it as a miss.
+ * Sized for a ranked retrieval (embedding + pgvector scan) on a cold index, not
+ * just `select 1` — too tight a value aborts legitimately-slow queries. */
+const CONTEXT_STATEMENT_TIMEOUT_MS = 15000;
+
+/** TCP+TLS connect deadline (s) for the REMOTE context pool. A Cloud SQL public
+ * IP across a high-latency / lossy link can take >10s to complete the TLS
+ * handshake, so the @combyne/db default (10s) spuriously times out a connection
+ * that would otherwise succeed. Generous here, because once a connection is made
+ * we keep it WARM (idle_timeout 0 + the keepalive ping) so the cost is paid at
+ * most once per connection lifetime, not per request. */
+const CONTEXT_CONNECT_TIMEOUT_S = 30;
 
 /** The resolved context DB URL, or '' when single-DB mode (main db reused). */
 export function resolveContextDbUrl(): string {
@@ -46,9 +56,18 @@ export function resolveContextDb(mainDb: Db): Db {
   if (!pool) {
     // createDb already (a) detects pooler URLs (port 6543) and disables prepared
     // statements and (b) applies remote SSL + pool/idle/connect tuning for
-    // non-loopback hosts. We additionally cap per-statement wall time so a hung
-    // context query rejects rather than blocking the heartbeat.
+    // non-loopback hosts. We OVERRIDE the connect/idle defaults for resilience on
+    // a slow/lossy remote rail, and cap per-statement wall time so a hung query
+    // rejects rather than blocking the heartbeat:
+    //   - connect_timeout: tolerate a multi-second TLS handshake (else a slow-but-
+    //     healthy Cloud SQL connect spuriously fails and the request 500s).
+    //   - idle_timeout 0: NEVER idle-close, so a user request reuses an already-
+    //     warm socket instead of paying a fresh handshake each time it goes idle.
+    //     max_lifetime (from pgOptions) still recycles connections periodically,
+    //     and the heartbeat keepalive (pingContextDb) prevents NAT idle-drops.
     pool = createDb(url, {
+      connect_timeout: CONTEXT_CONNECT_TIMEOUT_S,
+      idle_timeout: 0,
       connection: { statement_timeout: CONTEXT_STATEMENT_TIMEOUT_MS },
     });
     poolByUrl.set(url, pool);
@@ -140,4 +159,54 @@ export function recordContextDbHealth(input: { status: "ok" | "unreachable"; err
 
 export function getContextDbHealth(): ContextDbHealth {
   return contextDbHealth;
+}
+
+/**
+ * Run a CONTEXT-db operation with bounded retries on a TRANSIENT connectivity
+ * blip (the slow/lossy remote-rail case: an occasional CONNECT_TIMEOUT/ECONNRESET
+ * even when the rail is fundamentally up). Retries ONLY on connection-class errors
+ * (isContextDbConnectivityError) — a query/logic error or an empty result is NOT a
+ * connectivity failure and propagates immediately. Records rail health on the
+ * outcome so the status surface stays accurate. Single-DB mode never hits a
+ * connectivity error, so this is a transparent passthrough there.
+ */
+export async function withContextRetry<T>(fn: () => Promise<T>, opts?: { attempts?: number }): Promise<T> {
+  const attempts = Math.max(1, opts?.attempts ?? 3);
+  let lastErr: unknown;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const result = await fn();
+      if (resolveContextDbUrl()) recordContextDbHealth({ status: "ok" });
+      return result;
+    } catch (err) {
+      lastErr = err;
+      const transient = isContextDbConnectivityError(err);
+      if (transient) {
+        recordContextDbHealth({ status: "unreachable", error: err instanceof Error ? err.message : String(err) });
+      }
+      if (!transient || i === attempts) throw err;
+      // Brief backoff so a momentary blip clears before the retry (250ms, 500ms…).
+      await new Promise((r) => setTimeout(r, 250 * i));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Keepalive: run a trivial query against the context pool to keep at least one
+ * connection WARM, so a user request reuses it instead of paying a cold multi-
+ * second TLS handshake, and to refresh the rail-health surface. Called on a timer
+ * from the server's heartbeat. No-op in single-DB mode; NEVER throws.
+ */
+export async function pingContextDb(mainDb: Db): Promise<boolean> {
+  if (!resolveContextDbUrl()) return true; // single-DB: nothing remote to keep warm
+  try {
+    const cdb = resolveContextDb(mainDb);
+    await cdb.execute(sql`select 1`);
+    recordContextDbHealth({ status: "ok" });
+    return true;
+  } catch (err) {
+    recordContextDbHealth({ status: "unreachable", error: err instanceof Error ? err.message : String(err) });
+    return false;
+  }
 }
