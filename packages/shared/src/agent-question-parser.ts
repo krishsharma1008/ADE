@@ -120,8 +120,13 @@ function extractDedicatedQuestionSectionItems(lines: string[]): ExtractedAgentQu
       continue;
     }
     if (!insideSection) continue;
-    const item = stripBullet(line) || (line.endsWith("?") ? stripMarkdownEmphasis(line) : "");
-    if (item && item.endsWith("?")) out.push({ body: item, choices: null });
+    // Under a DEDICATED question-section header, a line is a question if it CONTAINS
+    // a '?', not only if it ENDS with one — agents routinely append a clarifying
+    // clause after the question mark (e.g. "...still calling these endpoints? Phase 2
+    // removal is blocked on this confirmation."). The header already signals intent,
+    // so contains-'?' is safe here; the header-less fallback path stays strict.
+    const item = stripBullet(line) || (line.includes("?") ? stripMarkdownEmphasis(line) : "");
+    if (item && item.includes("?")) out.push({ body: item, choices: null });
   }
   return out;
 }

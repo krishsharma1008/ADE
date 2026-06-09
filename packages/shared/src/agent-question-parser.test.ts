@@ -105,4 +105,22 @@ Build finished.
 
     expect(out).toEqual(["Do we have sandbox access?", "Which provider should we prefer?"]);
   });
+
+  it("extracts a question that has a clarifying clause AFTER the '?' under a dedicated header", () => {
+    // Real EM escalation: the '?' is mid-line, followed by an explanatory sentence.
+    // The dedicated "Open questions" header signals intent, so contains-'?' applies.
+    const out = extractAgentQuestionsFromText(`
+## Coordination update
+
+**Scope**: repayment intent lives in fs-brick-service.
+
+## Open questions
+
+- Has FE confirmed they are no longer calling the repayment intent endpoints (\`POST /repayment/intent\`, \`GET /intent\`)? Phase 2 removal is blocked on this confirmation.
+`);
+
+    expect(out).toHaveLength(1);
+    expect(out[0]).toContain("Has FE confirmed they are no longer calling the repayment intent endpoints");
+    expect(out[0]).toContain("Phase 2 removal is blocked");
+  });
 });
