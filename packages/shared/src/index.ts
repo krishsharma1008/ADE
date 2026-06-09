@@ -800,3 +800,10 @@ export {
   KNOWN_AGENT_ERROR_CODES,
   type AgentErrorCodeEntry,
 } from "./agent-error-codes.js";
+
+export {
+  extractAgentQuestionItems,
+  extractAgentQuestionsFromText,
+  formatExtractedAgentQuestion,
+  type ExtractedAgentQuestion,
+} from "./agent-question-parser.js";

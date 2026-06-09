@@ -67,7 +67,7 @@ import {
 } from "lucide-react";
 import type { ActivityEvent } from "@combyne/shared";
 import type { Agent, IssueAttachment, IssuePullRequest } from "@combyne/shared";
-import { resolveAgentErrorCode } from "@combyne/shared";
+import { extractAgentQuestionsFromText, resolveAgentErrorCode } from "@combyne/shared";
 
 type CommentReassignment = {
   assigneeAgentId: string | null;
@@ -1632,81 +1632,8 @@ export function IssueDetail() {
   );
 }
 
-const AWAITING_USER_HEADER_RE =
-  /^#{1,6}\s+(?:open\s+questions?|clarifying\s+questions?|questions?\s+for\s+(?:the\s+)?user|questions?\s+pending|decision\s+(?:needed|required)|needs?\s+(?:user\s+)?input|input\s+(?:needed|required)|blockers?|blocked|cannot\s+proceed|action\s+required|clarifications?|clarification\s+(?:needed|required)|notes?)\b/i;
-const AWAITING_USER_INTENT_RE =
-  /\b(?:need|needs|needed|requires?|required|missing|blocked|cannot proceed|waiting on|choose|decide|decision|confirm|provide|input|clarify|clarification|which|whether)\b/i;
-const AWAITING_USER_PLEASANTRY_RE =
-  /^(?:do you (?:want|need)|would you like|want me to|shall i|should i (?:also )?(?:do|continue|proceed|keep|move|go)|anything else|need anything)\b/i;
-
-function stripQuestionBullet(line: string) {
-  const cleaned = line.trim().replace(/^\*\*|\*\*$/g, "").replace(/\*\*/g, "").trim();
-  const match = cleaned.match(/^(?:[-*+]\s+|\(\d+\)\s*|\d+[.)]\s+|[a-zA-Z][.)]\s+|Q\d+[:.)]\s*)(.*)$/i);
-  return (match?.[1] ?? cleaned).trim();
-}
-
 function extractAwaitingUserQuestions(text: string) {
-  if (!text.trim()) return [];
-  const lines = text.split(/\r?\n/);
-  const out: string[] = [];
-  const seen = new Set<string>();
-
-  const push = (raw: string) => {
-    const value = raw.trim();
-    if (value.length < 8) return;
-    if (AWAITING_USER_PLEASANTRY_RE.test(value)) return;
-    const key = value.toLowerCase().replace(/\s+/g, " ");
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push(value);
-  };
-
-  let section: string[] = [];
-  const flush = () => {
-    const meaningful = section.map(stripQuestionBullet).filter(Boolean);
-    section = [];
-    if (meaningful.length === 0) return;
-    const firstQuestion = meaningful.find((line) => line.endsWith("?"));
-    if (firstQuestion) {
-      const options = meaningful
-        .filter((line) => line !== firstQuestion && !line.endsWith("?"))
-        .slice(0, 6)
-        .map((line) => `- ${line}`);
-      push([firstQuestion, ...options].join("\n"));
-      return;
-    }
-    if (meaningful.some((line) => AWAITING_USER_INTENT_RE.test(line))) {
-      const [lead, ...rest] = meaningful;
-      push([`Please clarify: ${lead}`, ...rest.slice(0, 6).map((line) => `- ${line}`)].join("\n"));
-    }
-  };
-
-  let inside = false;
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    if (AWAITING_USER_HEADER_RE.test(line)) {
-      flush();
-      inside = true;
-      continue;
-    }
-    if (inside && /^#{1,6}\s+/.test(line)) {
-      flush();
-      inside = false;
-      continue;
-    }
-    if (inside) section.push(line);
-  }
-  flush();
-
-  if (out.length === 0) {
-    for (const rawLine of lines) {
-      const value = stripQuestionBullet(rawLine);
-      if (value.endsWith("?")) push(value);
-    }
-  }
-
-  return out.slice(0, 20);
+  return extractAgentQuestionsFromText(text, 20);
 }
 
 function ReplyAndWakeCard({

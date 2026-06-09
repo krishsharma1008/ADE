@@ -1,6 +1,11 @@
 import { and, eq, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { issueComments, issues } from "@combyne/db";
+import {
+  extractAgentQuestionItems,
+  extractAgentQuestionsFromText,
+  formatExtractedAgentQuestion,
+} from "@combyne/shared";
 import { logger } from "../middleware/logger.js";
 import { routeAgentQuestionsToManager } from "./agent-question-routing.js";
 
@@ -8,10 +13,9 @@ export interface ExtractedQuestionSource {
   companyId: string;
   agentId: string;
   issueId: string;
-  /** Free-form text emitted by the agent — stdoutExcerpt, resultJson, plan doc, etc. */
+  /** Free-form text emitted by the agent: stdoutExcerpt, resultJson, plan doc, etc. */
   sourceText: string;
-  /** Cap on how many questions to auto-post at once. Prevents a runaway plan
-   *  with 40 open questions from flooding the issue timeline. */
+  /** Cap on how many questions to auto-post at once. */
   maxQuestions?: number;
 }
 
@@ -26,254 +30,37 @@ export interface ExtractedQuestionsResult {
 }
 
 const DEFAULT_MAX_QUESTIONS = 10;
-const MIN_QUESTION_LENGTH = 10;
-const MAX_QUESTION_LENGTH = 1500;
-
-const QUESTION_SECTION_HEADERS = [
-  /^#{1,6}\s+open\s+questions?\b/i,
-  /^#{1,6}\s+clarifying\s+questions?\b/i,
-  /^#{1,6}\s+clarifications?\b/i,
-  /^#{1,6}\s+clarification\s+(?:needed|required)\b/i,
-  /^#{1,6}\s+questions?\s+for\s+(?:the\s+)?user\b/i,
-  /^#{1,6}\s+questions?\s+pending\b/i,
-  /^#{1,6}\s+decision\s+(?:needed|required)\b/i,
-  /^#{1,6}\s+needs?\s+input\b/i,
-  /^\*\*(?:open\s+questions?|clarifying\s+questions?|clarifications?|clarification\s+(?:needed|required)|decision\s+(?:needed|required)|needs?\s+input)\*\*/i,
-];
-
-const USER_INPUT_SECTION_HEADERS = [
-  /^#{1,6}\s+blockers?\b/i,
-  /^#{1,6}\s+blocked\b/i,
-  /^#{1,6}\s+needs?\s+user\s+input\b/i,
-  /^#{1,6}\s+needs?\s+input\b/i,
-  /^#{1,6}\s+input\s+(?:needed|required)\b/i,
-  /^#{1,6}\s+waiting\s+on\s+(?:the\s+)?user\b/i,
-  /^#{1,6}\s+cannot\s+proceed\b/i,
-  /^#{1,6}\s+action\s+required\b/i,
-  /^#{1,6}\s+decision\s+(?:needed|required)\b/i,
-  /^#{1,6}\s+clarifications?\b/i,
-  /^#{1,6}\s+clarification\s+(?:needed|required)\b/i,
-  /^#{1,6}\s+notes?\b/i,
-  /^\*\*(?:blockers?|blocked|needs?\s+(?:user\s+)?input|input\s+(?:needed|required)|waiting\s+on\s+(?:the\s+)?user|cannot\s+proceed|action\s+required|decision\s+(?:needed|required)|clarifications?|clarification\s+(?:needed|required)|notes?)\*\*/i,
-];
-
-const USER_INPUT_INTENT_PATTERNS: RegExp[] = [
-  /\b(?:need|needs|needed|requires?|required|choose|decide|decision|confirm|provide|input|clarify|clarification|which|whether)\b/i,
-];
-
-// Trailing pleasantries / permission-seekers that look like questions but
-// don't actually want input — e.g. "Want me to do anything else?". These
-// were causing tickets to land in awaiting_user when the work was done.
-const PLEASANTRY_PATTERNS: RegExp[] = [
-  /^(?:do you (?:want|need)|would you like|want me to|shall i|should i (?:also )?(?:do|continue|proceed|keep|move|go))\b/i,
-  /^(?:is there|anything (?:else|more)|need anything|let me know|sound good|sounds good|make sense|does that (?:work|make sense)|ok with you|good with you|happy with)\b/i,
-  /^(?:can i (?:help|assist|do)|may i (?:help|assist)|how (?:does|do) that (?:look|sound))\b/i,
-];
-
 const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
 
 /**
- * Pull numbered / bulleted questions out of agent-produced text. An agent
- * writing "8 open questions listed at the bottom of the plan" in prose was
- * leaving the Reply-and-Wake card with nothing structured to render — this
- * function converts those into proper `kind="question"` comments that the
- * existing QuestionAnswerCard UI already knows how to render.
- *
- * Parsing is deliberately loose: we look for a "## Open questions" section
- * (or equivalent) and take every bulleted/numbered line ending in "?", or
- * we fall back to harvesting any numbered list whose items end in "?".
+ * Compatibility wrapper for existing server call sites that expect display
+ * strings. Structured extraction lives in @combyne/shared so server and UI
+ * fallback parsing remain identical.
  */
 export function extractQuestionsFromText(
   raw: string,
   maxQuestions: number = DEFAULT_MAX_QUESTIONS,
 ): string[] {
-  if (!raw || typeof raw !== "string") return [];
-  const lines = raw.split(/\r?\n/);
-
-  const blockerItems = extractUserInputSectionQuestions(lines);
-
-  // Pass 1 — find a dedicated "Open questions" section and harvest inside it.
-  let insideSection = false;
-  const sectionItems: string[] = [];
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    const isSectionHeader = QUESTION_SECTION_HEADERS.some((re) => re.test(line));
-    if (isSectionHeader) {
-      insideSection = true;
-      continue;
-    }
-    // Any other markdown heading ends the current section.
-    if (insideSection && /^#{1,6}\s+/.test(line)) {
-      insideSection = false;
-      continue;
-    }
-    if (!insideSection) continue;
-    // Inside a dedicated section we trust the agent's intent — accept
-    // either a bulleted line or a bare line ending in "?".
-    const item = stripBullet(line) || (line.endsWith("?") ? line.replace(/^\*\*|\*\*$/g, "").trim() : "");
-    if (item && item.endsWith("?")) sectionItems.push(item);
-  }
-
-  // Pass 2 — if no dedicated section, harvest only bulleted/numbered
-  // questions from the full text. We do NOT accept bare prose lines
-  // ending in "?" here — those are usually trailing pleasantries
-  // ("Want me to do anything else?") rather than real blocking questions.
-  const fallbackItems: string[] = [];
-  if (sectionItems.length === 0) {
-    for (const rawLine of lines) {
-      const item = stripBullet(rawLine.trim());
-      if (item && item.endsWith("?")) fallbackItems.push(item);
-    }
-  }
-
-  const candidates = [...blockerItems, ...(sectionItems.length > 0 ? sectionItems : fallbackItems)];
-
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const candidate of candidates) {
-    if (candidate.length < MIN_QUESTION_LENGTH) continue;
-    if (candidate.length > MAX_QUESTION_LENGTH) continue;
-    if (isPleasantryQuestion(candidate)) continue;
-    const key = candidate.toLowerCase().replace(/\s+/g, " ");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(candidate);
-    if (out.length >= maxQuestions) break;
-  }
-  return out;
-}
-
-function extractUserInputSectionQuestions(lines: string[]): string[] {
-  let insideSection = false;
-  let currentSection: string[] = [];
-  let currentHeader = "";
-  const out: string[] = [];
-
-  const flush = () => {
-    if (currentSection.length === 0) return;
-    const prompt = buildUserInputQuestion(currentSection, currentHeader);
-    if (prompt) out.push(prompt);
-    currentSection = [];
-    currentHeader = "";
-  };
-
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    const isUserInputHeader = USER_INPUT_SECTION_HEADERS.some((re) => re.test(line));
-    if (isUserInputHeader) {
-      flush();
-      insideSection = true;
-      currentHeader = line;
-      continue;
-    }
-    if (insideSection && /^#{1,6}\s+/.test(line)) {
-      flush();
-      insideSection = false;
-      continue;
-    }
-    if (!insideSection) continue;
-    currentSection.push(rawLine);
-  }
-  flush();
-
-  return out;
-}
-
-function buildUserInputQuestion(sectionLines: string[], header = ""): string {
-  const trimmedLines = sectionLines.map((line) => line.trim()).filter(Boolean);
-  if (trimmedLines.length === 0) return "";
-
-  const questionLines: string[] = [];
-  const optionLines: string[] = [];
-  let sawQuestion = false;
-
-  for (const line of trimmedLines) {
-    const strippedBullet = stripBullet(line);
-    const normalized = strippedBullet || line.replace(/^\*\*|\*\*$/g, "").trim();
-    if (!normalized) continue;
-    if (!sawQuestion && strippedBullet && questionLines.length > 0) {
-      optionLines.push(`- ${normalized}`);
-      continue;
-    }
-    if (!sawQuestion) {
-      questionLines.push(normalized);
-      if (normalized.includes("?")) sawQuestion = true;
-      continue;
-    }
-    if (strippedBullet) {
-      optionLines.push(`- ${normalized}`);
-      continue;
-    }
-    if (normalized.endsWith("?")) {
-      questionLines.push(normalized);
-    }
-  }
-
-  const hasQuestionMark = questionLines.some((line) => line.includes("?"));
-  const hasStrongHeaderIntent = /\b(?:decision|input|clarification|clarifying)\b/i.test(header);
-  const hasInputIntent = trimmedLines.some((line) =>
-    USER_INPUT_INTENT_PATTERNS.some((pattern) => pattern.test(line)),
-  );
-  if (!hasQuestionMark && !hasStrongHeaderIntent && !hasInputIntent) return "";
-
-  const promptLines = hasQuestionMark
-    ? [...questionLines, ...optionLines]
-    : [`Please clarify: ${questionLines.join(" ")}`, ...optionLines];
-  const prompt = promptLines.join("\n").trim();
-  return prompt.length > MAX_QUESTION_LENGTH ? `${prompt.slice(0, MAX_QUESTION_LENGTH - 1).trimEnd()}…` : prompt;
-}
-
-function isPleasantryQuestion(candidate: string): boolean {
-  const trimmed = candidate.trim().replace(/^\*+\s*/, "").replace(/\s*\*+$/, "");
-  return PLEASANTRY_PATTERNS.some((pattern) => pattern.test(trimmed));
-}
-
-/**
- * Strip common markdown bullet prefixes: `-`, `*`, `1.`, `1)`, `(1)`,
- * `Q1:`, `Q.1`. Returns the question body, or an empty string if the line
- * isn't a list item. We deliberately do NOT accept bare prose lines that
- * happen to end in "?" — that catches trailing pleasantries like "Want me
- * to do anything else?" and causes tickets to land in awaiting_user when
- * the work is actually finished.
- */
-function stripBullet(line: string): string {
-  // Strip a leading bold marker so a markdown-styled list item like
-  // "**1. Button purpose — …?**" or "**- Which color?**" is recognized. Agents
-  // commonly emit bold-wrapped numbered questions; without this they fall through
-  // as plain comments and never become structured `question` comments (so the
-  // answer card never appears and the human answer is never captured).
-  const deBolded = line.replace(/^\*\*\s*/, "");
-  const bulletMatch = deBolded.match(
-    /^(?:[-*+]\s+|\(\d+\)\s*|\d+[.)]\s+|Q\d+[:.)]\s*)(.*)$/i,
-  );
-  if (bulletMatch) return bulletMatch[1]!.trim().replace(/^\*\*|\*\*$/g, "").trim();
-  return "";
+  return extractAgentQuestionsFromText(raw, maxQuestions);
 }
 
 /**
  * Extract questions from the run output and post each as a structured
  * `kind="question"` comment. Skips any question text that's already been
- * posted as an *unanswered* question on this issue (dedupe across runs).
- * Transitions the issue to `awaiting_user` when at least one new question
- * is posted.
- *
- * Returns stats for telemetry. Failures bubble up to the caller so the
- * run-finalize path can log — they never break run completion.
+ * posted as an unanswered question on this issue (dedupe across runs).
  */
 export async function extractAndPostQuestions(
   db: Db,
   input: ExtractedQuestionSource,
 ): Promise<ExtractedQuestionsResult> {
   const max = input.maxQuestions ?? DEFAULT_MAX_QUESTIONS;
-  const extracted = extractQuestionsFromText(input.sourceText, max);
-  if (extracted.length === 0) {
+  const extractedItems = extractAgentQuestionItems(input.sourceText, max);
+  if (extractedItems.length === 0) {
     return { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false };
   }
 
   // If the user (or a scheduler) already closed the issue mid-run, do not
-  // post questions or rebound to awaiting_user — that's how the close
-  // appeared "not to work". The run can still complete normally.
+  // post questions or rebound to awaiting_user.
   const currentIssue = await db
     .select({ status: issues.status })
     .from(issues)
@@ -286,11 +73,12 @@ export async function extractAndPostQuestions(
     return { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false };
   }
 
+  const extractedDisplayText = extractedItems.map(formatExtractedAgentQuestion);
   const managerRoute = await routeAgentQuestionsToManager(db, {
     companyId: input.companyId,
     issueId: input.issueId,
     askingAgentId: input.agentId,
-    questions: extracted,
+    questions: extractedDisplayText,
     actor: { actorType: "agent", actorId: input.agentId },
   }).catch((err) => {
     logger.warn(
@@ -303,7 +91,7 @@ export async function extractAndPostQuestions(
     return {
       posted: managerRoute.routedCommentIds.length,
       skippedDuplicates: 0,
-      skippedExisting: Math.max(0, extracted.length - managerRoute.routedCommentIds.length),
+      skippedExisting: Math.max(0, extractedItems.length - managerRoute.routedCommentIds.length),
       statusTransitioned: managerRoute.issue.status === "blocked",
       routedToManager: true,
       routedToAgentId: managerRoute.routedToAgentId,
@@ -311,10 +99,11 @@ export async function extractAndPostQuestions(
     };
   }
 
-  // Dedupe against already-open question comments on this issue so a
-  // re-run of the same plan doesn't multiply the card list.
+  // Dedupe against already-open question comments on this issue so a re-run
+  // of the same plan doesn't multiply the card list. Include choices in the
+  // key because option-style prompts store choices outside the comment body.
   const openQuestions = await db
-    .select({ body: issueComments.body })
+    .select({ body: issueComments.body, choices: issueComments.choices })
     .from(issueComments)
     .where(
       and(
@@ -324,13 +113,17 @@ export async function extractAndPostQuestions(
       ),
     );
   const existingKeys = new Set(
-    openQuestions.map((row) => row.body.toLowerCase().replace(/\s+/g, " ").trim()),
+    openQuestions.map((row) =>
+      row.choices && row.choices.length > 0
+        ? normalizeQuestionKey(`${row.body}\n${row.choices.map((choice) => `- ${choice}`).join("\n")}`)
+        : normalizeQuestionKey(row.body),
+    ),
   );
 
   let posted = 0;
   let skippedExisting = 0;
-  for (const question of extracted) {
-    const key = question.toLowerCase().replace(/\s+/g, " ");
+  for (const item of extractedItems) {
+    const key = normalizeQuestionKey(formatExtractedAgentQuestion(item));
     if (existingKeys.has(key)) {
       skippedExisting++;
       continue;
@@ -342,8 +135,9 @@ export async function extractAndPostQuestions(
         issueId: input.issueId,
         authorAgentId: input.agentId,
         authorUserId: null,
-        body: question,
+        body: item.body,
         kind: "question",
+        choices: item.choices && item.choices.length > 0 ? item.choices : null,
       });
       posted++;
     } catch (err) {
@@ -357,8 +151,6 @@ export async function extractAndPostQuestions(
   let statusTransitioned = false;
   if (posted > 0) {
     try {
-      // Guard against a race where the user closes the ticket between
-      // our pre-check and this update — never resurrect a closed issue.
       const updated = await db
         .update(issues)
         .set({ status: "awaiting_user", awaitingUserSince: new Date(), updatedAt: new Date() })
@@ -380,8 +172,12 @@ export async function extractAndPostQuestions(
 
   return {
     posted,
-    skippedDuplicates: extracted.length - posted - skippedExisting,
+    skippedDuplicates: extractedItems.length - posted - skippedExisting,
     skippedExisting,
     statusTransitioned,
   };
+}
+
+function normalizeQuestionKey(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
 }

@@ -1,11 +1,42 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, isNull } from "drizzle-orm";
 import { agents, companies, issueComments, issues } from "@combyne/db";
+import { extractAgentQuestionItems } from "@combyne/shared";
 import {
   extractQuestionsFromText,
   extractAndPostQuestions,
 } from "../agent-question-extract.js";
 import { startTestDb, stopTestDb, type TestDbHandle } from "./_test-db.js";
+
+const SCREENSHOT_STYLE_TEXT = `
+Four quick questions before I build the design direction - this shapes everything.
+
+**1. Background feel**
+The current site is very dark (near-black with glow). For the calm redesign:
+- A) Dark stays, but calmer - pull back the glow and noise, think Linear or Resend
+- B) Light / off-white - flip to a clean airy surface, think Loom or Notion
+- C) Neutral mid-tone - warm gray or cool slate, grounded feel
+- D) Open to your proposal - you decide and I'll react
+
+**2. Audience**
+Who primarily lands on this site?
+- A) Executives / VP Sales - ROI and credibility above all
+- B) Ops / RevOps practitioners - want to understand the product fast
+- C) Mixed - top of page sells the exec, rest satisfies the practitioner
+
+**3. Colors**
+Current accents are violet \`#8b5cf6\` and cyan \`#22d3ee\`. For the calm direction:
+- A) Keep violet as anchor - desaturate slightly, drop the cyan, one-accent system
+- B) Full reset - you pick what serves calm best, I'm not attached to the current palette
+- C) Neutral with one warm accent - move toward slate, stone, or muted amber
+
+**4. Reference site** (any industry)
+Is there a site that already feels like the vibe you want?
+- A) Linear.app - dark, minimal, deliberate, negative space does the work
+- B) Stripe / Clerk - clean professional, trust signals, light-leaning
+- C) Loom / Notion - friendly but polished, soft background, approachable
+- D) No reference - propose something and I'll react
+`;
 
 describe("agent-question-extract", () => {
   describe("extractQuestionsFromText (pure)", () => {
@@ -60,6 +91,39 @@ Implementation note: nothing to decide here.
       expect(out[1]).toMatch(/brand color/);
       // The bold markers are stripped from the captured question text.
       expect(out.every((q) => !q.includes("**"))).toBe(true);
+    });
+
+    it("extracts screenshot-style option blocks with choices", () => {
+      const out = extractQuestionsFromText(SCREENSHOT_STYLE_TEXT);
+      const items = extractAgentQuestionItems(SCREENSHOT_STYLE_TEXT);
+
+      expect(out).toHaveLength(4);
+      expect(out[0]).toContain("Background feel");
+      expect(out[0]).toContain("- A) Dark stays");
+      expect(items).toHaveLength(4);
+      expect(items[0]?.choices).toHaveLength(4);
+      expect(items[1]?.choices).toHaveLength(3);
+      expect(items[2]?.choices).toHaveLength(3);
+      expect(items[3]?.choices).toHaveLength(4);
+    });
+
+    it("does not treat ordinary numbered implementation plans as questions", () => {
+      const text = `
+Implementation plan:
+
+**1. Update theme tokens**
+- Edit CSS variables
+- Replace glow shadows
+
+**2. Refactor components**
+- Update buttons
+- Rebuild cards
+
+**3. Verify**
+- Run tests
+- Build the UI
+      `;
+      expect(extractQuestionsFromText(text)).toEqual([]);
     });
 
     it("dedupes questions that only differ in whitespace/case", () => {
@@ -387,6 +451,54 @@ I cannot access the Google Sheet that defines the exact new fields. I need the f
         .from(issues)
         .where(eq(issues.id, issue.id));
       expect(refreshed.status).toBe("awaiting_user");
+    });
+
+    it("posts screenshot-style option questions with choices and awaits user", async () => {
+      const [issue] = await handle.db
+        .insert(issues)
+        .values({
+          companyId,
+          title: "Theme direction questions",
+          status: "in_progress",
+          priority: "medium",
+          assigneeAgentId: agentId,
+        })
+        .returning();
+
+      const result = await extractAndPostQuestions(handle.db, {
+        companyId,
+        agentId,
+        issueId: issue.id,
+        sourceText: SCREENSHOT_STYLE_TEXT,
+      });
+
+      expect(result.posted).toBe(4);
+      expect(result.statusTransitioned).toBe(true);
+
+      const questions = await handle.db
+        .select()
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, issue.id),
+            eq(issueComments.kind, "question"),
+            isNull(issueComments.answeredAt),
+          ),
+        );
+      expect(questions).toHaveLength(4);
+      expect(questions[0]?.body).toContain("Background feel");
+      expect(questions[0]?.body).not.toContain("- A) Dark stays");
+      expect(questions[0]?.choices).toEqual(
+        expect.arrayContaining([expect.stringContaining("A) Dark stays")]),
+      );
+      expect(questions.every((question) => Array.isArray(question.choices))).toBe(true);
+
+      const [refreshed] = await handle.db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issue.id));
+      expect(refreshed.status).toBe("awaiting_user");
+      expect(refreshed.awaitingUserSince).not.toBeNull();
     });
   });
 });
