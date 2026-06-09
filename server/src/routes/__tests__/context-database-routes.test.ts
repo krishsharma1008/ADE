@@ -185,6 +185,95 @@ describe("POST /instance/context-database/save", () => {
   });
 });
 
+describe("POST /instance/context-database/teams & /join — gate + credential surface", () => {
+  const TEAM_ID = "b405dc3d-3dbe-4d37-b1ad-3a3a8895192c";
+
+  for (const [name, actor] of [
+    ["non-admin board", nonAdminBoardActor],
+    ["agent", agentActor],
+  ] as const) {
+    it(`rejects ${name} actor with 403 on POST /teams`, async () => {
+      const app = makeApp(actor, stubDb());
+      const res = await request(app)
+        .post("/instance/context-database/teams")
+        .send({ url: DB_URL_WITH_PASSWORD });
+      expect(res.status).toBe(403);
+    });
+
+    it(`rejects ${name} actor with 403 on POST /join and writes NO config file`, async () => {
+      const app = makeApp(actor, stubDb());
+      const res = await request(app)
+        .post("/instance/context-database/join")
+        .send({ url: DB_URL_WITH_PASSWORD, teamId: TEAM_ID, teamName: "Lending" });
+      expect(res.status).toBe(403);
+      // The rejected join must NOT have written a config file.
+      expect(fs.existsSync(process.env.COMBYNE_CONFIG as string)).toBe(false);
+    });
+  }
+
+  it("/teams with no url in single-DB mode returns ok:false with an explanatory message", async () => {
+    const app = makeApp(adminActor, stubDb());
+    const res = await request(app).post("/instance/context-database/teams").send({});
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.companies).toEqual([]);
+    expect(res.body.error).toBe("No separate context database is configured");
+  });
+
+  it("/teams against an unreachable url returns ok:false (200) and never leaks the credential", async () => {
+    const app = makeApp(adminActor, stubDb());
+    const res = await request(app)
+      .post("/instance/context-database/teams")
+      // Reserved TEST-NET-1 address + closed port → connection fails fast.
+      .send({ url: "postgres://user:topsecret@192.0.2.1:5432/none?connect_timeout=2" });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.companies).toEqual([]);
+    expect(typeof res.body.error).toBe("string");
+    // The probe error must never echo the supplied credential.
+    expect(JSON.stringify(res.body)).not.toContain("topsecret");
+  }, 20000);
+
+  it("/teams rejects a non-postgres url with 400", async () => {
+    const app = makeApp(adminActor, stubDb());
+    const res = await request(app)
+      .post("/instance/context-database/teams")
+      .send({ url: "http://example.com" });
+    expect(res.status).toBe(400);
+  });
+
+  it("/join rejects a non-postgres url with 400 and writes NO config file", async () => {
+    const app = makeApp(adminActor, stubDb());
+    const res = await request(app)
+      .post("/instance/context-database/join")
+      .send({ url: "http://example.com", teamId: TEAM_ID, teamName: "Lending" });
+    expect(res.status).toBe(400);
+    expect(fs.existsSync(process.env.COMBYNE_CONFIG as string)).toBe(false);
+  });
+
+  it("/join rejects a missing/invalid teamId (zod uuid) with 400", async () => {
+    const app = makeApp(adminActor, stubDb());
+    const missing = await request(app)
+      .post("/instance/context-database/join")
+      .send({ url: DB_URL_WITH_PASSWORD, teamName: "Lending" });
+    expect(missing.status).toBe(400);
+    const invalid = await request(app)
+      .post("/instance/context-database/join")
+      .send({ url: DB_URL_WITH_PASSWORD, teamId: "not-a-uuid", teamName: "Lending" });
+    expect(invalid.status).toBe(400);
+  });
+
+  it("/join with no url and single-DB mode 400s 'No shared context database configured'", async () => {
+    const app = makeApp(adminActor, stubDb());
+    const res = await request(app)
+      .post("/instance/context-database/join")
+      .send({ teamId: TEAM_ID, teamName: "Lending" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("No shared context database configured");
+    expect(fs.existsSync(process.env.COMBYNE_CONFIG as string)).toBe(false);
+  });
+});
+
 describe("POST /instance/embedding-config", () => {
   const EMBED_KEY = "sk-proj-supersecret-embedding-key-0123456789";
 

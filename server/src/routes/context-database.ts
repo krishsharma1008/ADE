@@ -4,10 +4,12 @@ import { createDb, type Db } from "@combyne/db";
 import { z } from "zod";
 import { badRequest } from "../errors.js";
 import { validate } from "../middleware/validate.js";
-import { assertInstanceAdmin } from "./authz.js";
+import { assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { writeConfigFile, readConfigFileContextDatabaseUrl } from "../config-file.js";
 import { loadConfig } from "../config.js";
 import { resolveContextDb, resolveContextDbUrl } from "../services/context-db.js";
+import { accessService, logActivity } from "../services/index.js";
+import { adoptPinnedCompany } from "../services/company-pin-adopt.js";
 
 const REDACTED = "****";
 
@@ -115,7 +117,63 @@ async function probeContextDb(url: string): Promise<ProbeResult> {
   };
 }
 
+interface ListCompaniesResult {
+  ok: boolean;
+  companies: Array<{ id: string; name: string }>;
+  error?: string;
+}
+
+/**
+ * Open a THROWAWAY connection to `url`, list the `public.companies` registry (the
+ * joinable TEAMS on a shared context DB), then ALWAYS close the connection. NEVER
+ * persists. Mirrors {@link probeContextDb}: an unreachable/invalid url resolves to
+ * `{ ok: false, companies: [], error }` — it never throws, so the caller returns
+ * 200 with ok:false rather than a 500. The credential is NEVER echoed in `error`.
+ */
+async function listContextCompanies(url: string): Promise<ListCompaniesResult> {
+  const ATTEMPTS = 2;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    const probe = createDb(url, { connect_timeout: 30 });
+    try {
+      const rows = (await probe.execute(
+        sql`SELECT id, name FROM public.companies ORDER BY name`,
+      )) as unknown as Array<{ id?: string; name?: string }>;
+      const companies = rows
+        .filter((r) => typeof r.id === "string" && typeof r.name === "string")
+        .map((r) => ({ id: r.id as string, name: r.name as string }));
+      return { ok: true, companies };
+    } catch (err) {
+      lastErr = err;
+    } finally {
+      try {
+        const client = (probe as unknown as { $client?: { end?: (opts?: unknown) => Promise<void> } }).$client;
+        if (client?.end) await client.end({ timeout: 5 });
+      } catch {
+        /* ignore */
+      }
+    }
+    if (attempt < ATTEMPTS) await new Promise((r) => setTimeout(r, 600));
+  }
+  return {
+    ok: false,
+    companies: [],
+    // Message only — never echo the url/credential.
+    error: lastErr instanceof Error ? lastErr.message : "Connection failed",
+  };
+}
+
 const urlBodySchema = z.object({ url: z.string().min(1) });
+
+// Body for POST /instance/context-database/join. `url` is optional: when present
+// it must be a postgres:// url and is persisted (restart-gated); when omitted the
+// route honors the already-configured rail. teamId is the canonical shared team id
+// adopted locally; teamName is used only on a fresh adopt INSERT.
+const joinBodySchema = z.object({
+  url: z.string().min(1).optional(),
+  teamId: z.string().uuid(),
+  teamName: z.string().min(1),
+});
 
 // PR-15 §3.7 — embedding-config write. The team-shared key is write-only: it is
 // persisted to config.json (0600 via writeConfigFile) and NEVER returned by any
@@ -202,6 +260,111 @@ export function contextDatabaseRoutes(db: Db) {
         saved: true,
         restartRequired: true,
         redactedEndpoint: redactDbUrl(url),
+      });
+    },
+  );
+
+  // (3a) List the joinable teams (the companies registry) on a shared context DB
+  // WITHOUT persisting anything — instance-admin only. Open join: every team is
+  // returned; no key / approval. `url` is optional — when omitted the route honors
+  // an already-configured rail (resolveContextDbUrl); in single-DB mode it returns
+  // ok:false with an explanatory message (200). The credential is NEVER echoed.
+  router.post("/instance/context-database/teams", async (req, res) => {
+    assertInstanceAdmin(req);
+    const body = (req.body ?? {}) as { url?: unknown };
+    let url: string;
+    if (body.url !== undefined) {
+      if (typeof body.url !== "string" || !isPostgresUrl(body.url)) {
+        throw badRequest("url must be a postgres:// or postgresql:// connection string");
+      }
+      url = body.url;
+    } else {
+      url = resolveContextDbUrl();
+    }
+    if (!url) {
+      res.json({ ok: false, companies: [], error: "No separate context database is configured" });
+      return;
+    }
+    res.json(await listContextCompanies(url));
+  });
+
+  // (3b) Join (adopt) an existing team — instance-admin only. Open join (no key /
+  // approval): the only gate is that the team exists in the shared registry. The
+  // join persists the context DB URL (restart-gated) when a NEW url is supplied,
+  // adopts the local ops companies row at the team's canonical id (idempotent, no
+  // clobber via adoptPinnedCompany), grants the board user membership, and returns
+  // the local company so the UI can make it active. The credential is NEVER echoed.
+  router.post(
+    "/instance/context-database/join",
+    validate(joinBodySchema),
+    async (req, res) => {
+      assertInstanceAdmin(req);
+      const { url: bodyUrl, teamId, teamName } = req.body as {
+        url?: string;
+        teamId: string;
+        teamName: string;
+      };
+
+      // Resolve the effective URL: an explicit (validated postgres) url, else the
+      // already-configured rail. 400 when neither yields a shared context DB.
+      let url: string;
+      if (bodyUrl !== undefined) {
+        if (!isPostgresUrl(bodyUrl)) {
+          throw badRequest("url must be a postgres:// or postgresql:// connection string");
+        }
+        url = bodyUrl;
+      } else {
+        url = resolveContextDbUrl();
+      }
+      if (!url) {
+        throw badRequest("No shared context database configured");
+      }
+
+      // Open-join membership check: the team must exist in the shared registry.
+      const registry = await listContextCompanies(url);
+      if (!registry.ok) {
+        // Surface the probe failure without ever echoing the credential.
+        throw badRequest(registry.error ?? "Could not reach the shared context database");
+      }
+      if (!registry.companies.some((c) => c.id === teamId)) {
+        throw badRequest("Team not found in the shared context database registry");
+      }
+
+      // Persist the URL only when a NEW one was supplied — restart-gated, same
+      // merge-write POST /save uses. Honoring an already-active rail re-persists
+      // nothing (restartRequired:false).
+      if (bodyUrl !== undefined) {
+        writeConfigFile({ contextDatabaseUrl: url });
+      }
+
+      // Adopt the local ops company at id===teamId (idempotent, no-clobber).
+      const result = await adoptPinnedCompany(db, { id: teamId, name: teamName });
+
+      // Idempotent membership so a non-admin board actor sees the team in
+      // GET /companies (which filters by companyIds).
+      const actor = getActorInfo(req);
+      await accessService(db).ensureMembership(teamId, "user", actor.actorId, "owner", "active");
+
+      await logActivity(db, {
+        companyId: teamId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        action: "company.joined",
+        entityType: "company",
+        entityId: teamId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        details: { name: teamName, action: result.action },
+      });
+
+      res.json({
+        joined: true,
+        // Only a NEWLY persisted url requires a restart for the memory rail; an
+        // already-active rail changed nothing, so the adoption is fully effective now.
+        restartRequired: bodyUrl !== undefined,
+        company: { id: result.id, name: result.name, issuePrefix: result.issuePrefix },
+        redactedEndpoint: redactDbUrl(url),
+        action: result.action,
       });
     },
   );

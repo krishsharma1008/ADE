@@ -9,6 +9,11 @@ import { goalsApi } from "../api/goals";
 import { agentsApi } from "../api/agents";
 import { issuesApi } from "../api/issues";
 import { healthApi } from "../api/health";
+import {
+  databaseApi,
+  type ContextDatabaseProbe,
+  type ContextDatabaseStatus
+} from "../api/database";
 import { queryKeys } from "../lib/queryKeys";
 import { Dialog, DialogPortal } from "@/components/ui/dialog";
 import {
@@ -113,6 +118,25 @@ export function OnboardingWizard() {
   // Step 1
   const [companyName, setCompanyName] = useState("");
   const [companyGoal, setCompanyGoal] = useState("");
+
+  // Step 1 — "Join an existing team" branch. CREATE mode is the unchanged default.
+  const [step1Mode, setStep1Mode] = useState<"create" | "join">("create");
+  const [joinUrl, setJoinUrl] = useState("");
+  const [joinProbe, setJoinProbe] = useState<ContextDatabaseProbe | null>(null);
+  const [joinTeams, setJoinTeams] = useState<Array<{ id: string; name: string }> | null>(
+    null
+  );
+  const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
+  const [joinLoading, setJoinLoading] = useState(false);
+  const [joinError, setJoinError] = useState<string | null>(null);
+  const [joinSaved, setJoinSaved] = useState(false);
+  const [contextDbStatus, setContextDbStatus] = useState<ContextDatabaseStatus | null>(
+    null
+  );
+  // When a shared context rail is ALREADY configured (env or config-file), the URL
+  // field is hidden and /teams + /join are called with no url in the body.
+  const usingConfiguredRail = contextDbStatus?.usingSeparateContextDb === true;
+  const needsJoinUrl = contextDbStatus != null && !usingConfiguredRail;
 
   // Step 2
   const [agentName, setAgentName] = useState("CEO");
@@ -311,6 +335,15 @@ export function OnboardingWizard() {
     setError(null);
     setCompanyName("");
     setCompanyGoal("");
+    setStep1Mode("create");
+    setJoinUrl("");
+    setJoinProbe(null);
+    setJoinTeams(null);
+    setSelectedTeamId(null);
+    setJoinLoading(false);
+    setJoinError(null);
+    setJoinSaved(false);
+    setContextDbStatus(null);
     setAgentName("CEO");
     setAdapterType("claude_local");
     setCwd("");
@@ -427,6 +460,100 @@ export function OnboardingWizard() {
       setError(err instanceof Error ? err.message : "Failed to create company");
     } finally {
       setLoading(false);
+    }
+  }
+
+  // Entering JOIN mode: fetch the current context-DB status so we know whether a
+  // shared rail is already configured (hide the URL field + list teams immediately)
+  // or the user must enter + test a URL first.
+  async function enterJoinMode() {
+    setStep1Mode("join");
+    setJoinError(null);
+    setJoinProbe(null);
+    setJoinTeams(null);
+    setSelectedTeamId(null);
+    setJoinSaved(false);
+    if (contextDbStatus) {
+      // Already fetched — if a rail is configured, list immediately.
+      if (contextDbStatus.usingSeparateContextDb) void handleListTeams();
+      return;
+    }
+    try {
+      const status = await databaseApi.getStatus();
+      setContextDbStatus(status);
+      if (status.usingSeparateContextDb) void handleListTeams();
+    } catch (err) {
+      setJoinError(
+        err instanceof Error ? err.message : "Failed to read context database status"
+      );
+    }
+  }
+
+  async function handleTestJoinConnection() {
+    const url = joinUrl.trim();
+    if (!url) return;
+    setJoinLoading(true);
+    setJoinError(null);
+    setJoinProbe(null);
+    try {
+      const result = await databaseApi.test(url);
+      setJoinProbe(result);
+    } catch (err) {
+      setJoinError(err instanceof Error ? err.message : "Test connection failed");
+    } finally {
+      setJoinLoading(false);
+    }
+  }
+
+  async function handleListTeams() {
+    // url is omitted when honoring an already-configured rail.
+    const url = needsJoinUrl ? joinUrl.trim() : undefined;
+    if (needsJoinUrl && !url) return;
+    setJoinLoading(true);
+    setJoinError(null);
+    setJoinTeams(null);
+    setSelectedTeamId(null);
+    try {
+      const result = await databaseApi.listTeams(url);
+      if (!result.ok) {
+        setJoinError(result.error ?? "Could not reach the shared context database");
+        return;
+      }
+      setJoinTeams(result.companies);
+    } catch (err) {
+      setJoinError(err instanceof Error ? err.message : "Failed to list teams");
+    } finally {
+      setJoinLoading(false);
+    }
+  }
+
+  async function handleJoin() {
+    if (!selectedTeamId) return;
+    const team = (joinTeams ?? []).find((t) => t.id === selectedTeamId);
+    if (!team) return;
+    setJoinLoading(true);
+    setJoinError(null);
+    try {
+      const res = await databaseApi.join({
+        url: needsJoinUrl ? joinUrl.trim() : undefined,
+        teamId: team.id,
+        teamName: team.name
+      });
+      if (res.restartRequired) setJoinSaved(true);
+      // Replicate handleStep1Next's exact post-step-1 state-set so steps 2-4 operate
+      // on the joined team's id exactly as they do for a created company.
+      setCompanyName(team.name);
+      setCreatedCompanyId(res.company.id);
+      setCreatedCompanyPrefix(res.company.issuePrefix);
+      setSelectedCompanyId(res.company.id);
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+      // Defensive: the join may have changed the configured rail.
+      queryClient.invalidateQueries({ queryKey: queryKeys.contextDatabase.status });
+      setStep(2);
+    } catch (err) {
+      setJoinError(err instanceof Error ? err.message : "Failed to join team");
+    } finally {
+      setJoinLoading(false);
     }
   }
 
@@ -587,7 +714,9 @@ export function OnboardingWizard() {
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      if (step === 1 && companyName.trim()) handleStep1Next();
+      if (step === 1 && step1Mode === "join") {
+        if (selectedTeamId) void handleJoin();
+      } else if (step === 1 && companyName.trim()) handleStep1Next();
       else if (step === 2 && agentName.trim()) handleStep2Next();
       else if (step === 3 && taskTitle.trim()) handleStep3Next();
       else if (step === 4) handleLaunch();
@@ -653,12 +782,54 @@ export function OnboardingWizard() {
                       <Building2 className="h-5 w-5 text-muted-foreground" />
                     </div>
                     <div>
-                      <h3 className="font-medium">Name your company</h3>
+                      <h3 className="font-medium">
+                        {step1Mode === "join"
+                          ? "Join an existing team"
+                          : "Name your company"}
+                      </h3>
                       <p className="text-xs text-muted-foreground">
-                        This is the organization your agents will work for.
+                        {step1Mode === "join"
+                          ? "Connect the shared context database and adopt a team your agents will work for."
+                          : "This is the organization your agents will work for."}
                       </p>
                     </div>
                   </div>
+
+                  {/* Mode toggle: create a new company (default) vs join an existing team. */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      data-mode="create"
+                      className={cn(
+                        "rounded-md border px-3 py-2 text-sm font-medium transition-colors",
+                        step1Mode === "create"
+                          ? "border-foreground bg-accent"
+                          : "border-border hover:bg-accent/50"
+                      )}
+                      onClick={() => {
+                        setStep1Mode("create");
+                        setJoinError(null);
+                      }}
+                    >
+                      Create a new company
+                    </button>
+                    <button
+                      type="button"
+                      data-mode="join"
+                      className={cn(
+                        "rounded-md border px-3 py-2 text-sm font-medium transition-colors",
+                        step1Mode === "join"
+                          ? "border-foreground bg-accent"
+                          : "border-border hover:bg-accent/50"
+                      )}
+                      onClick={() => void enterJoinMode()}
+                    >
+                      Join an existing team
+                    </button>
+                  </div>
+
+                  {step1Mode === "create" && (
+                    <>
                   <div>
                     <label className="text-xs text-muted-foreground mb-1 block">
                       Company name
@@ -750,6 +921,146 @@ export function OnboardingWizard() {
                               </>
                             )}
                           </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                    </>
+                  )}
+
+                  {step1Mode === "join" && (
+                    <div className="space-y-4" data-panel="join">
+                      {usingConfiguredRail ? (
+                        <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                          Using already-configured shared context DB:{" "}
+                          <span className="font-mono break-all">
+                            {contextDbStatus?.redactedEndpoint || "configured"}
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <label className="text-xs text-muted-foreground block">
+                            Shared context database URL
+                          </label>
+                          <input
+                            type="password"
+                            className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                            placeholder="postgres://user:password@host:5432/db"
+                            value={joinUrl}
+                            autoComplete="off"
+                            data-slot="join-url"
+                            onChange={(e) => {
+                              setJoinUrl(e.target.value);
+                              setJoinProbe(null);
+                              setJoinTeams(null);
+                              setSelectedTeamId(null);
+                            }}
+                          />
+                          <p className="text-[11px] text-muted-foreground leading-relaxed">
+                            Rendered masked. The credential is never echoed back — anyone
+                            who can reach this database may join any listed team.
+                          </p>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              disabled={joinLoading || joinUrl.trim().length === 0}
+                              onClick={() => void handleTestJoinConnection()}
+                              data-action="join-test"
+                            >
+                              Test connection
+                            </Button>
+                            <Button
+                              size="sm"
+                              disabled={joinLoading || joinUrl.trim().length === 0}
+                              onClick={() => void handleListTeams()}
+                              data-action="join-list"
+                            >
+                              List teams
+                            </Button>
+                          </div>
+                          {joinProbe && (
+                            <div
+                              className="rounded-md border border-border bg-muted/30 p-3 text-sm"
+                              data-slot="join-probe-result"
+                            >
+                              <span
+                                className={cn(
+                                  "text-xs font-medium",
+                                  joinProbe.ok ? "text-green-600" : "text-destructive"
+                                )}
+                              >
+                                {joinProbe.ok ? "reachable" : "unreachable"}
+                              </span>
+                              {!joinProbe.ok && (
+                                <p className="mt-1 text-destructive text-xs">
+                                  {joinProbe.error ?? "Connection failed"}
+                                </p>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {usingConfiguredRail && (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={joinLoading}
+                          onClick={() => void handleListTeams()}
+                          data-action="join-list"
+                        >
+                          {joinTeams ? "Refresh teams" : "List teams"}
+                        </Button>
+                      )}
+
+                      {joinTeams && (
+                        <div className="space-y-1.5" data-slot="join-teams">
+                          {joinTeams.length === 0 ? (
+                            <p className="text-xs text-muted-foreground">
+                              No teams found on this database yet — create a new company
+                              instead.
+                            </p>
+                          ) : (
+                            joinTeams.map((team) => (
+                              <button
+                                key={team.id}
+                                type="button"
+                                data-team-id={team.id}
+                                className={cn(
+                                  "flex w-full items-center gap-2 rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                                  selectedTeamId === team.id
+                                    ? "border-foreground bg-accent"
+                                    : "border-border hover:bg-accent/50"
+                                )}
+                                onClick={() => setSelectedTeamId(team.id)}
+                              >
+                                <Building2 className="h-4 w-4 text-muted-foreground shrink-0" />
+                                <span className="flex-1 truncate font-medium">
+                                  {team.name}
+                                </span>
+                                {selectedTeamId === team.id && (
+                                  <Check className="h-4 w-4 text-green-500 shrink-0" />
+                                )}
+                              </button>
+                            ))
+                          )}
+                        </div>
+                      )}
+
+                      {joinError && (
+                        <p className="text-xs text-destructive" data-slot="join-error">
+                          {joinError}
+                        </p>
+                      )}
+
+                      {joinSaved && (
+                        <div
+                          className="rounded-md border border-yellow-500/50 bg-yellow-500/10 p-3 text-xs text-yellow-700 dark:text-yellow-400"
+                          data-slot="join-restart-required"
+                        >
+                          <strong>Restart required</strong> — the shared context rail takes
+                          effect on the next boot; your team is adopted locally now.
                         </div>
                       )}
                     </div>
@@ -1279,7 +1590,7 @@ export function OnboardingWizard() {
                   )}
                 </div>
                 <div className="flex items-center gap-2">
-                  {step === 1 && (
+                  {step === 1 && step1Mode === "create" && (
                     <Button
                       size="sm"
                       disabled={!companyName.trim() || loading}
@@ -1291,6 +1602,21 @@ export function OnboardingWizard() {
                         <ArrowRight className="h-3.5 w-3.5 mr-1" />
                       )}
                       {loading ? "Creating..." : "Next"}
+                    </Button>
+                  )}
+                  {step === 1 && step1Mode === "join" && (
+                    <Button
+                      size="sm"
+                      disabled={!selectedTeamId || joinLoading}
+                      onClick={() => void handleJoin()}
+                      data-action="join-team"
+                    >
+                      {joinLoading ? (
+                        <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                      ) : (
+                        <ArrowRight className="h-3.5 w-3.5 mr-1" />
+                      )}
+                      {joinLoading ? "Joining..." : "Join team"}
                     </Button>
                   )}
                   {step === 2 && (
