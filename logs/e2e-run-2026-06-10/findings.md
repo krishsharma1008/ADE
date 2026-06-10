@@ -77,3 +77,12 @@ PINB405-20 flipped in_review→done at 16:51 while tracked PR #5 (the stranded-f
 
 ## Finding #24 — Cross-DB FK violation: accepted_work_events.memory_entry_id references local memory_entries while entries live on the central DB (round 2)
 PostgresError 23503 at ~16:51: insert on accepted_work_events failed because memory_entry_id (created on the SHARED context DB) is not present in the LOCAL ops-DB memory_entries table the FK points to. In split-DB mode this FK can never hold for centrally-stored entries. Fix: drop the FK (keep the column as a soft reference) or validate existence app-side against the active memory rail.
+
+## Finding #25 — Central context DB outage stalls agent runs pre-spawn; no timeout/degradation (round 2, HIGH)
+TCP to the shared rail (34.171.242.104:5432) became unreachable mid-round. Agent wakes then hung BEFORE adapter spawn (no run log at all) on central-DB memory retrieval, hit the 5-min orphan reaper, and automation re-woke them — an EM reap-loop burning tokens until the board paused the agent. The /api/instance/context-database health endpoint also hangs. Fix: statement/connect timeouts on the context-DB pool + degrade recall to local/empty with a warning instead of blocking the run; health endpoint must time-bound its probe.
+
+## Finding #26 — Ready-to-merge PR not surfaced in the Inbox (user-reported, round 2)
+A tracked PR with mergeStatus=ready (approval pending) did not appear in the Inbox as an action item; the user had to know to open the issue's PR panel. The merge_pr approval should render in the Inbox approvals section (it counts in badges) — verify the Inbox approvals list includes merge_pr cards with a deep link to the PR panel, and add a "Ready to merge" row type if approvals are filtered.
+
+## Finding #27 — Review-feedback fix dropped during rebase; failing tests merged with no CI to catch it (round 2, HIGH)
+PR #5's final content lost commit 7cee9a4 (the requested global-handler restore) during the agent's rebase amid the outage/reap chaos; it merged only regression tests that now FAIL against staging (the global advice lacks the 3 handlers; UserLimitNotFoundException has no @ResponseStatus). Without CI on the mirror, nothing flagged it. Compounds F11 (enable CI) and #21 (merge gate); also argues for the artifact gate verifying "requested change present" on fix-PRs (diff must touch the file named in feedback).
