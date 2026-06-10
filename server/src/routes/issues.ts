@@ -548,6 +548,27 @@ export function issueRoutes(db: Db, storage: StorageService) {
       details: { title: issue.title, identifier: issue.identifier },
     });
 
+    // F6 (e2e-run-2026-06-10 #6): an agent creating an assigned subtask through this
+    // generic endpoint is a delegation — build the same handoff + vetted passdown
+    // packet as POST /issues/:id/delegate, and AWAIT it before the wake below so the
+    // sub-agent's first wake can hydrate it (M7 race fix, see the delegate route).
+    if (
+      issue.parentId &&
+      issue.assigneeAgentId &&
+      actor.agentId &&
+      actor.agentId !== issue.assigneeAgentId
+    ) {
+      const parent = await svc.getById(issue.parentId);
+      await createHandoff(db, {
+        companyId,
+        issueId: issue.id,
+        fromAgentId: actor.agentId,
+        toAgentId: issue.assigneeAgentId,
+        complexity: ISSUE_COMPLEXITIES.find((value) => value === issue.complexity) ?? "small",
+        serviceScope: issue.serviceScope ?? parent?.serviceScope ?? null,
+      });
+    }
+
     if (issue.assigneeAgentId && issue.status !== "backlog") {
       void heartbeat
         .wakeup(issue.assigneeAgentId, {
