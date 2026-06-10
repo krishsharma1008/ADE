@@ -1125,7 +1125,10 @@ export async function autoCloseIssueAfterSuccessfulRun(
               `(head \`${untracked.pr.headBranch}\`) for this issue — auto-tracked it.`,
             kind: "system",
           });
-          artifactPresent = true;
+          // The upsert moved the issue to in_review — the PR is still OPEN, so the
+          // board merge (or sweep-detected external merge) is what closes the issue.
+          // Falling through to the done-transition below would close it pre-merge.
+          return { closed: false, reason: "pr_auto_tracked_in_review" };
         }
       } catch (err) {
         logger.debug(
