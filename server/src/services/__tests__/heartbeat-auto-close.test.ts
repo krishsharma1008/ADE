@@ -284,7 +284,11 @@ describe("heartbeat successful-run auto-close", () => {
     expect(refreshed.status).toBe("done");
   });
 
-  it("closes a code ticket when a tracked pull request exists", async () => {
+  // Finding #23 companion (e2e-run-2026-06-10 round 2): an OPEN tracked PR is a
+  // valid artifact, but auto-closing the issue past it was sanctioned premature
+  // closure — the human merge gate is what closes the ticket. The run hands the
+  // issue to in_review; the merge close-out transitions it to done.
+  it("moves a code ticket with an OPEN tracked pull request to in_review (merge closes it)", async () => {
     const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
     await handle.db.insert(issuePullRequests).values({
       companyId,
@@ -294,6 +298,40 @@ describe("heartbeat successful-run auto-close", () => {
       pullUrl: "https://github.com/acme/widgets/pull/42",
       title: "Implement the widget",
       baseBranch: "main",
+    });
+
+    const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      issueId: issue.id,
+      questionResult: { posted: 0, skippedDuplicates: 0, skippedExisting: 0, statusTransitioned: false },
+      requiresArtifact: true,
+    });
+
+    expect(result).toEqual({ closed: false, reason: "tracked_pr_in_review" });
+    const [refreshed] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(refreshed.status).toBe("in_review");
+
+    const comments = await handle.db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issue.id));
+    expect(comments.some((c) => c.body.includes("awaits the human merge"))).toBe(true);
+  });
+
+  it("still closes a code ticket whose tracked pull request is already MERGED", async () => {
+    const { issue, run } = await seedIssue("in_progress", { complexity: "small" });
+    await handle.db.insert(issuePullRequests).values({
+      companyId,
+      issueId: issue.id,
+      repo: "acme/widgets",
+      pullNumber: 43,
+      pullUrl: "https://github.com/acme/widgets/pull/43",
+      title: "Implement the merged widget",
+      baseBranch: "main",
+      state: "closed",
+      mergeStatus: "merged",
     });
 
     const result = await autoCloseIssueAfterSuccessfulRun(handle.db, {

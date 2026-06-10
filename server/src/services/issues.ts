@@ -21,6 +21,7 @@ import {
 } from "@combyne/db";
 import { extractProjectMentionIds } from "@combyne/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { logActivity } from "./activity-log.js";
 import { createHandoff } from "./agent-handoff.js";
 import { resolveIssueComplexity } from "./issue-complexity.js";
 import { notifyParentOnChildStatus } from "./issue-parent-notifications.js";
@@ -854,6 +855,68 @@ export function issueService(db: Db) {
       }
       if (issueData.status === "done" && existing.status !== "done") {
         await assertDelegationPolicyAllowsCompletion(existing, issueData.complexity);
+
+        // Finding #23 (e2e-run-2026-06-10 round 2): PINB405-20 was closed by a
+        // non-human path while PR #5 was still open — the review work was stranded
+        // and nothing in the activity log said who closed it. Single chokepoint:
+        // every done-transition that is not human-initiated is refused while a
+        // tracked PR for this issue is still open (the issue closes when the PR
+        // merges). Humans can still force-close from the board.
+        const actorType = options.parentNotificationActor?.actorType ?? "system";
+        if (actorType !== "user") {
+          const openTrackedPrs = await db
+            .select({
+              pullNumber: issuePullRequests.pullNumber,
+              pullUrl: issuePullRequests.pullUrl,
+            })
+            .from(issuePullRequests)
+            .where(
+              and(
+                eq(issuePullRequests.issueId, id),
+                eq(issuePullRequests.state, "open"),
+                notInArray(issuePullRequests.mergeStatus, ["merged", "closed"]),
+              ),
+            );
+          if (openTrackedPrs.length > 0) {
+            const body = `Close blocked: tracked PR ${openTrackedPrs
+              .map((pr) => `#${pr.pullNumber}`)
+              .join(", ")} is still open for this issue. The issue closes automatically when the PR is merged; a human can close it manually from the board.`;
+            // The PR sweep retries on an interval — don't repost an identical
+            // advisory every cycle.
+            const [lastSystemComment] = await db
+              .select({ body: issueComments.body })
+              .from(issueComments)
+              .where(and(eq(issueComments.issueId, id), eq(issueComments.kind, "system")))
+              .orderBy(desc(issueComments.createdAt))
+              .limit(1);
+            if (lastSystemComment?.body !== body) {
+              await db.insert(issueComments).values({
+                companyId: existing.companyId,
+                issueId: id,
+                authorAgentId: null,
+                authorUserId: null,
+                body,
+                kind: "system",
+              });
+            }
+            await logActivity(db, {
+              companyId: existing.companyId,
+              actorType,
+              actorId: options.parentNotificationActor?.actorId ?? "issue-service",
+              action: "issue.close_blocked_open_pr",
+              entityType: "issue",
+              entityId: id,
+              details: {
+                previousStatus: existing.status,
+                openPullNumbers: openTrackedPrs.map((pr) => pr.pullNumber),
+              },
+            }).catch(() => undefined);
+            throw unprocessable("Issue close blocked: a tracked pull request is still open", {
+              code: "open_tracked_prs",
+              pullNumbers: openTrackedPrs.map((pr) => pr.pullNumber),
+            });
+          }
+        }
       }
 
       applyStatusSideEffects(issueData.status, patch);
@@ -929,6 +992,27 @@ export function issueService(db: Db) {
           previousStatus: existing.status,
           actor: options.parentNotificationActor ?? { actorType: "system", actorId: null },
         });
+      }
+
+      // Finding #23 (attribution half): service-internal callers (merge close-out,
+      // auto-close, sweeps, terminal sessions) used to change status with NO
+      // activity-log entry, so a wrong transition could not be traced to its
+      // origin. Attributed callers (REST routes) log their own richer entries and
+      // pass parentNotificationActor — only unattributed transitions are stamped
+      // here. Best-effort: an audit-log failure must never fail the update.
+      if (result && issueData.status && issueData.status !== existing.status && !options.parentNotificationActor) {
+        await logActivity(db, {
+          companyId: existing.companyId,
+          actorType: "system",
+          actorId: "issue-service",
+          action: "issue.status_changed",
+          entityType: "issue",
+          entityId: id,
+          details: {
+            previousStatus: existing.status,
+            nextStatus: issueData.status,
+          },
+        }).catch(() => undefined);
       }
 
       return result;

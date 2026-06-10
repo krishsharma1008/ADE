@@ -18,6 +18,7 @@ import {
   probeContextDb,
   formatDatabaseBackupResult,
   runDatabaseBackup,
+  agents,
   authUsers,
   companies,
   companyMemberships,
@@ -867,7 +868,17 @@ export async function startServer(): Promise<StartedServer> {
 
     // Reap orphaned runs at startup (no threshold -- runningProcesses is empty).
     // Chained AFTER usage-pause boot recovery so the ordering invariant holds.
+    // Fix #20 (e2e round-2): first reset agents stranded in "running" by the dead
+    // process — their runs are about to be reaped, and a stale running/error badge
+    // confused the operator during a live round. Deliberate "error" (loop guard)
+    // is NOT reset here; resuming the agent is the human acknowledgement.
     void bootUsagePauseRecovery
+      .then(() =>
+        db
+          .update(agents)
+          .set({ status: "idle", updatedAt: new Date() })
+          .where(eq(agents.status, "running")),
+      )
       .then(() => heartbeat.reapOrphanedRuns())
       .catch((err) => {
         logger.error({ err }, "startup reap of orphaned heartbeat runs failed");

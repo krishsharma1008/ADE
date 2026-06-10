@@ -48,3 +48,4 @@ tests/e2e/playwright-report/
 
 # Standalone installer cache (but keep DMG for distribution)
 StandAloneAppleSiliconInstaller/.cache/
+.gstack/

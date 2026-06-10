@@ -2270,7 +2270,19 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   }
 
   if (events.length === 0 && logLines.length === 0 && !logError) {
-    return <p className="text-xs text-muted-foreground">No log events.</p>;
+    const neverSpawned = !run.logRef && !isLive;
+    return (
+      <div className="space-y-1">
+        <p className="text-xs text-muted-foreground">
+          {neverSpawned
+            ? "No run log was produced — this run ended before the agent process started."
+            : "No log events."}
+        </p>
+        {neverSpawned && run.error && (
+          <p className="text-xs text-red-600 dark:text-red-400 break-all">{run.error}</p>
+        )}
+      </div>
+    );
   }
 
   const levelColors: Record<string, string> = {

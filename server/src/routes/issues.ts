@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
-import { eq } from "drizzle-orm";
+import { and, eq, ne, notInArray } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import { issues } from "@combyne/db";
 import {
@@ -547,6 +547,31 @@ export function issueRoutes(db: Db, storage: StorageService) {
       entityId: issue.id,
       details: { title: issue.title, identifier: issue.identifier },
     });
+
+    // Fix #18: retry-safety for agent-created assigned subtasks on the generic
+    // endpoint too (same natural-key guard as the delegate route).
+    if (req.body.parentId && req.body.assigneeAgentId && actor.agentId) {
+      const [dupSubtask] = await db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.parentId, req.body.parentId as string),
+            eq(issues.assigneeAgentId, req.body.assigneeAgentId as string),
+            eq(issues.title, (req.body.title as string) ?? ""),
+            notInArray(issues.status, ["done", "cancelled"]),
+            ne(issues.id, issue.id),
+          ),
+        )
+        .limit(1);
+      if (dupSubtask) {
+        // The duplicate was just created by THIS call racing a retry — cancel ours
+        // and return the original so the caller converges on one subtask.
+        await svc.update(issue.id, { status: "cancelled" }).catch(() => null);
+        res.status(200).json({ ...dupSubtask, deduplicated: true });
+        return;
+      }
+    }
 
     // F6 (e2e-run-2026-06-10 #6): an agent creating an assigned subtask through this
     // generic endpoint is a delegation — build the same handoff + vetted passdown
@@ -1373,6 +1398,27 @@ export function issueRoutes(db: Db, storage: StorageService) {
     const actor = getActorInfo(req);
     const fromAgentId =
       actor.actorType === "agent" ? actor.agentId ?? parent.assigneeAgentId : parent.assigneeAgentId;
+
+    // Fix #18 (e2e round-2): delegation must be retry-safe. An ambiguous failure
+    // made the EM retry and create two identical subtasks (both woke the agent).
+    // Natural-key guard: an OPEN subtask with the same parent + assignee + title
+    // is the same delegation — return it instead of duplicating.
+    const [existingSubtask] = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.parentId, parent.id),
+          eq(issues.assigneeAgentId, toAgentId),
+          eq(issues.title, title),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .limit(1);
+    if (existingSubtask) {
+      res.status(200).json({ issue: existingSubtask, deduplicated: true });
+      return;
+    }
 
     const created = await svc.create(parent.companyId, {
       title,

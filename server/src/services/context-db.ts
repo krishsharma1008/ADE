@@ -96,11 +96,19 @@ export async function withContextScope<T>(
   fn: (cdb: Db) => Promise<T>,
 ): Promise<T> {
   const cdb = resolveContextDb(mainDb);
-  if (companyId === null) return fn(cdb);
-  return cdb.transaction(async (tx) => {
-    await tx.execute(sql`SELECT set_config('app.current_company', ${companyId}, true)`);
-    return fn(tx as unknown as Db);
-  });
+  // Fix #25: every scoped rail call carries the client-side deadline — a dead
+  // warm socket must reject (and evict the pool) instead of hanging the caller
+  // (agent runs were stalling pre-spawn on memory recall during a rail outage).
+  // Single-DB mode (cdb === mainDb) skips the deadline: the local DB never
+  // blackholes and racing it would add noise to embedded-PG test runs.
+  const guarded = cdb === mainDb ? <R>(work: () => Promise<R>) => work() : withContextDeadline;
+  if (companyId === null) return guarded(() => fn(cdb));
+  return guarded(() =>
+    cdb.transaction(async (tx) => {
+      await tx.execute(sql`SELECT set_config('app.current_company', ${companyId}, true)`);
+      return fn(tx as unknown as Db);
+    }),
+  );
 }
 
 /** Postgres class-08 connection-exception codes + node socket errors that mean
@@ -198,11 +206,63 @@ export async function withContextRetry<T>(fn: () => Promise<T>, opts?: { attempt
  * second TLS handshake, and to refresh the rail-health surface. Called on a timer
  * from the server's heartbeat. No-op in single-DB mode; NEVER throws.
  */
+/**
+ * Fix #25 (e2e round-2): a silently-dead warm socket (network blackhole while
+ * idle_timeout=0 keeps connections open) hangs queries FOREVER client-side —
+ * the server-enforced statement_timeout never arrives over a dead link. Every
+ * rail call gets a client-side wall-clock deadline; on timeout the pool is
+ * EVICTED so the next call re-dials (and fails fast via connect_timeout)
+ * instead of reusing the corpse. Live impact before this fix: agent runs hung
+ * pre-spawn on memory recall and the reaper killed them in a loop.
+ */
+const CONTEXT_CLIENT_DEADLINE_MS = Number(process.env.COMBYNE_CONTEXT_CLIENT_DEADLINE_MS) || 20_000;
+
+export class ContextDbDeadlineError extends Error {
+  constructor(ms: number) {
+    super(`context DB call exceeded the ${ms}ms client deadline (rail unreachable?)`);
+    this.name = "ContextDbDeadlineError";
+  }
+}
+
+export function evictContextDbPool(): void {
+  const url = resolveContextDbUrl();
+  if (!url) return;
+  const pool = poolByUrl.get(url);
+  if (!pool) return;
+  poolByUrl.delete(url);
+  void (pool as unknown as { $client?: { end?: (opts?: { timeout?: number }) => Promise<void> } })
+    .$client?.end?.({ timeout: 1 })
+    ?.catch(() => {});
+}
+
+export async function withContextDeadline<T>(
+  fn: () => Promise<T>,
+  ms: number = CONTEXT_CLIENT_DEADLINE_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          evictContextDbPool();
+          recordContextDbHealth({ status: "unreachable", error: "client deadline exceeded" });
+          reject(new ContextDbDeadlineError(ms));
+        }, ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function pingContextDb(mainDb: Db): Promise<boolean> {
   if (!resolveContextDbUrl()) return true; // single-DB: nothing remote to keep warm
   try {
     const cdb = resolveContextDb(mainDb);
-    await cdb.execute(sql`select 1`);
+    await withContextDeadline(async () => {
+      await cdb.execute(sql`select 1`);
+    }, 10_000);
     recordContextDbHealth({ status: "ok" });
     return true;
   } catch (err) {

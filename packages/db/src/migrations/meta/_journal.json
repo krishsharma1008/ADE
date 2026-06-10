@@ -428,6 +428,13 @@
       "when": 1780405305900,
       "tag": "0061_max_turns_continuation_windows",
       "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1780405306000,
+      "tag": "0062_accepted_work_memory_fk_drop",
+      "breakpoints": true
     }
   ]
 }

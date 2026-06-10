@@ -11,7 +11,6 @@ import {
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 import { agents } from "./agents.js";
-import { memoryEntries } from "./memory_layers.js";
 
 export const acceptedWorkEvents = pgTable(
   "accepted_work_events",
@@ -40,9 +39,9 @@ export const acceptedWorkEvents = pgTable(
     }),
     wakeupRequestedAt: timestamp("wakeup_requested_at", { withTimezone: true }),
     memoryStatus: text("memory_status").notNull().default("pending"),
-    memoryEntryId: uuid("memory_entry_id").references(() => memoryEntries.id, {
-      onDelete: "set null",
-    }),
+    // Logical reference only (no FK since 0062): the captured entry can live on
+    // the separate central context DB, where a cross-database FK is impossible.
+    memoryEntryId: uuid("memory_entry_id"),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

@@ -1046,6 +1046,43 @@ export async function autoCloseIssueAfterSuccessfulRun(
     .then((rows) => rows[0] ?? null);
   if (unresolvedPullRequestBlocker) return { closed: false, reason: "unresolved_pr_feedback" };
 
+  // Finding #23 companion: a successful run whose work product is a still-OPEN
+  // tracked PR must hand off to the human merge gate (in_review) — closing the
+  // issue here was sanctioned premature closure (the PR would await merge on a
+  // "done" ticket). The merge close-out / external-merge sweep transitions the
+  // issue to done after the merge. Mirrors the F9 auto-track return below; the
+  // issueService.update close chokepoint would refuse the done-transition
+  // anyway, but this puts the issue in the RIGHT state instead of erroring.
+  const openTrackedPr = await db
+    .select({ pullNumber: issuePullRequests.pullNumber })
+    .from(issuePullRequests)
+    .where(
+      and(
+        eq(issuePullRequests.companyId, issue.companyId),
+        eq(issuePullRequests.issueId, issue.id),
+        eq(issuePullRequests.state, "open"),
+        notInArray(issuePullRequests.mergeStatus, ["merged", "closed"]),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (openTrackedPr) {
+    if (issue.status !== "in_review") {
+      await issueService(db).update(issue.id, { status: "in_review" });
+      await db.insert(issueComments).values({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        authorAgentId: null,
+        authorUserId: null,
+        body:
+          `Run completed — tracked PR #${openTrackedPr.pullNumber} is open and awaits the human merge. ` +
+          `Issue moved to review; merging the PR closes it.`,
+        kind: "system",
+      });
+    }
+    return { closed: false, reason: "tracked_pr_in_review" };
+  }
+
   const unresolvedQaFeedback = await db
     .select({ id: qaFeedbackEvents.id })
     .from(qaFeedbackEvents)
@@ -4349,6 +4386,66 @@ export function heartbeatService(db: Db) {
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
+
+      // Fix #15 (e2e round-2): a recoverable interruption must RE-DELIVER the work,
+      // not strand it — previously the wake was marked failed and nothing requeued,
+      // so the issue sat in_progress with no run until a manual wake. Loop guard:
+      // 3+ interruptions for the agent inside 15 minutes means something systemic
+      // (e.g. the central context DB outage that caused a reap-loop live) — stop
+      // retrying, mark the agent error, and surface it instead of burning tokens.
+      if (!hardCapHit) {
+        const since = new Date(now.getTime() - 15 * 60 * 1000);
+        const recentInterruptions = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, run.agentId),
+              eq(heartbeatRuns.status, "interrupted_recoverable"),
+              gt(heartbeatRuns.finishedAt, since),
+            ),
+          );
+        if (recentInterruptions.length >= 3) {
+          await db
+            .update(agents)
+            .set({ status: "error", updatedAt: now })
+            .where(and(eq(agents.id, run.agentId), eq(agents.status, "idle")));
+          const issueIdForComment = readNonEmptyString(
+            (run.contextSnapshot as Record<string, unknown> | null)?.issueId,
+          );
+          if (issueIdForComment) {
+            await db
+              .insert(issueComments)
+              .values({
+                companyId: run.companyId,
+                issueId: issueIdForComment,
+                authorAgentId: null,
+                authorUserId: null,
+                body:
+                  "Agent runs were interrupted 3+ times in 15 minutes — retries paused " +
+                  "(agent marked error). Check infrastructure (e.g. context DB reachability), " +
+                  "then resume the agent to continue.",
+                kind: "system",
+              })
+              .catch(() => {});
+          }
+          logger.error(
+            { agentId: run.agentId, interruptions: recentInterruptions.length },
+            "reaper.interruption_loop_guard_tripped",
+          );
+        } else {
+          await enqueueWakeup(run.agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "interrupted_run_redelivery",
+            payload: run.contextSnapshot as Record<string, unknown> | null,
+            requestedByActorType: "system",
+            requestedByActorId: "orphan-reaper",
+          }).catch((err) =>
+            logger.warn({ err, agentId: run.agentId }, "reaper.redelivery_wake_failed"),
+          );
+        }
+      }
     }
 
     if (reaped.length > 0) {

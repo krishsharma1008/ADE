@@ -115,4 +115,35 @@ describe("M7: delegate awaits createHandoff before wakeup", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].toAgentId).toBe(engineerId);
   });
+
+  // Fix #18 (e2e-run-2026-06-10 round 2): an ambiguous failure made the EM retry
+  // /delegate and create two identical subtasks (PINB405-19 + -20), both waking
+  // the engineer. The natural-key guard (parent + assignee + title, non-terminal)
+  // must return the existing subtask instead of duplicating.
+  it("retrying an identical delegate returns the existing subtask (deduplicated)", async () => {
+    const payload = { toAgentId: engineerId, title: "Retry-safe delegation slice", complexity: "small" };
+
+    const first = await request(app).post(`/api/issues/${parentId}/delegate`).send(payload);
+    expect(first.status).toBe(201);
+    const firstId = first.body?.issue?.id as string;
+
+    const retry = await request(app).post(`/api/issues/${parentId}/delegate`).send(payload);
+    expect(retry.status).toBe(200);
+    expect(retry.body?.deduplicated).toBe(true);
+    expect(retry.body?.issue?.id).toBe(firstId);
+
+    const subtasks = await handle.db
+      .select()
+      .from(issues)
+      .where(eq(issues.title, "Retry-safe delegation slice"));
+    expect(subtasks).toHaveLength(1);
+  });
+
+  it("a delegate with a different title still creates a fresh subtask", async () => {
+    const res = await request(app)
+      .post(`/api/issues/${parentId}/delegate`)
+      .send({ toAgentId: engineerId, title: "A genuinely different slice", complexity: "small" });
+    expect(res.status).toBe(201);
+    expect(res.body?.deduplicated).toBeUndefined();
+  });
 });

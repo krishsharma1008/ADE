@@ -10,7 +10,7 @@ import type {
   SonarQubeConfig,
   SonarQubeQualityGate,
 } from "@combyne/shared";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { createGitHubClient } from "./github.js";
 import { integrationService } from "./integrations.js";
 import { createSonarQubeClient } from "./sonarqube.js";
@@ -161,6 +161,15 @@ function buildFeedback(input: {
   }
   return lines.join("\n");
 }
+
+// Finding #21 (e2e-run-2026-06-10 round 2): a human merged a PR while the assignee
+// was mid-revision after "Let agents fix" — the fix commit landed after the merge and
+// was stranded (it took finding #27's fix-forward PR to recover). While the tracked
+// issue is back in "in_progress" the dashboard merge stays gated; it unlocks when the
+// agent returns the issue to "in_review" (with an updated PR or a no-change reply).
+// This blocker is merge-gating only — it is never sent to the agent as PR feedback.
+const ACTIVE_REVISION_BLOCKER =
+  "Assignee is actively revising this issue — merge unlocks when it returns to review (updated PR or a no-change reply)";
 
 function blockersFor(input: {
   state: string;
@@ -337,6 +346,28 @@ export function issuePullRequestService(db: Db) {
 
   async function resolveDanglingMergeApprovalsForIssue(companyId: string, issueId: string) {
     try {
+      // Finding #26 (e2e-run-2026-06-10 round 2): on a multi-PR issue this batch
+      // used to auto-approve the LIVE sibling PR's approval too (PR #6's approval
+      // died 46s after creation when the sweep saw merged PR #5 on the same
+      // issue) — which both hid the ready-PR card from the inbox and bricked the
+      // dashboard merge ("Only pending merge approvals can be merged"). An
+      // approval currently attached to an unmerged, unclosed tracked PR is not
+      // dangling — skip it.
+      const liveApprovalIds = new Set(
+        (
+          await db
+            .select({ approvalId: issuePullRequests.approvalId })
+            .from(issuePullRequests)
+            .where(
+              and(
+                eq(issuePullRequests.issueId, issueId),
+                notInArray(issuePullRequests.mergeStatus, ["merged", "closed"]),
+              ),
+            )
+        )
+          .map((row) => row.approvalId)
+          .filter((id): id is string => !!id),
+      );
       const linked = await db
         .select({ id: approvals.id, status: approvals.status, type: approvals.type })
         .from(issueApprovals)
@@ -345,6 +376,7 @@ export function issuePullRequestService(db: Db) {
       for (const approval of linked) {
         if (approval.type !== "merge_pr") continue;
         if (approval.status !== "pending" && approval.status !== "revision_requested") continue;
+        if (liveApprovalIds.has(approval.id)) continue;
         await approvalsSvc
           .approve(approval.id, "issue-pr-reconcile", "Auto-resolved: PR merged")
           .catch((err) =>
@@ -399,6 +431,33 @@ export function issuePullRequestService(db: Db) {
         await db
           .update(approvals)
           .set({ payload, updatedAt: now() })
+          .where(eq(approvals.id, existing.id));
+        return existing.id;
+      }
+      // Self-heal for finding #26: before the dangling-resolver was scoped to
+      // non-live approvals, it could auto-approve an OPEN sibling PR's approval
+      // ("Auto-resolved: PR merged" by issue-pr-reconcile). That machine-made
+      // decision bricked merge() and hid the inbox card. Reopen exactly that
+      // case on the next reconcile of the still-open PR; human decisions (real
+      // decidedByUserId) are never touched.
+      if (
+        existing &&
+        existing.status === "approved" &&
+        existing.decidedByUserId === "issue-pr-reconcile" &&
+        row.mergeStatus !== "merged" &&
+        row.mergeStatus !== "closed" &&
+        row.state === "open"
+      ) {
+        await db
+          .update(approvals)
+          .set({
+            payload,
+            status: "pending",
+            decisionNote: null,
+            decidedByUserId: null,
+            decidedAt: null,
+            updatedAt: now(),
+          })
           .where(eq(approvals.id, existing.id));
         return existing.id;
       }
@@ -507,7 +566,12 @@ export function issuePullRequestService(db: Db) {
       reviewStatus,
       qualityStatus,
     });
-    const mergeStatus = pr.merged ? "merged" : blockers.length === 0 ? "ready" : blockers.some((b) => b.includes("failed") || b.includes("requested")) ? "blocked" : "pending";
+    // Finding #21: feedback dispatch / hold-release run on the agent-actionable
+    // blockers only; the merge gate below joins for mergeStatus + merge().
+    const trackedIssue = pr.merged ? null : await issuesSvc.getById(row.issueId);
+    const mergeBlockers =
+      trackedIssue?.status === "in_progress" ? [...blockers, ACTIVE_REVISION_BLOCKER] : blockers;
+    const mergeStatus = pr.merged ? "merged" : mergeBlockers.length === 0 ? "ready" : mergeBlockers.some((b) => b.includes("failed") || b.includes("requested")) ? "blocked" : "pending";
     const feedback = buildFeedback({ repo: row.repo, pullNumber: row.pullNumber, checks, reviews, qualityGate, blockers });
     const hash = feedbackHash(feedback);
     const feedbackStatus =
@@ -536,7 +600,7 @@ export function issuePullRequestService(db: Db) {
         feedbackStatus,
         lastReconciledAt: now(),
         mergedAt: pr.mergedAt ? new Date(pr.mergedAt) : row.mergedAt,
-        metadata: { ...(row.metadata ?? {}), checks, reviews, qualityGate, blockers },
+        metadata: { ...(row.metadata ?? {}), checks, reviews, qualityGate, blockers: mergeBlockers },
         updatedAt: now(),
       })
       .where(eq(issuePullRequests.id, row.id))
@@ -668,13 +732,22 @@ export function issuePullRequestService(db: Db) {
     }
 
     const refreshed = await getById(row.id);
-    return { pullRequest: (refreshed ?? updated) as never, checks, reviews, qualityGate, blockers, feedback };
+    return {
+      pullRequest: (refreshed ?? updated) as never,
+      checks,
+      reviews,
+      qualityGate,
+      blockers: mergeBlockers,
+      agentBlockers: blockers,
+      feedback,
+    };
   }
 
   async function sendFeedback(id: string, opts: { requestedByActorType: "user" | "agent" | "system"; requestedByActorId: string | null }) {
     const status = await reconcile(id);
     const row = status.pullRequest as unknown as typeof issuePullRequests.$inferSelect;
-    if (status.blockers.length === 0) return { status, sent: false, commentId: null as string | null };
+    const actionable = status.agentBlockers ?? status.blockers;
+    if (actionable.length === 0) return { status, sent: false, commentId: null as string | null };
     const hash = feedbackHash(status.feedback);
     if (
       row.lastFeedbackHash === hash &&
@@ -777,7 +850,9 @@ export function issuePullRequestService(db: Db) {
       .then((rows) => rows[0] ?? null);
 
     const assigneeAgentId = issue?.assigneeAgentId ?? null;
-    const hasBlockers = result.status.blockers.length > 0;
+    // Agent-actionable blockers only — the #21 merge gate ("assignee is actively
+    // revising") must never trigger a feedback wake at the agent it describes.
+    const hasBlockers = (result.status.agentBlockers ?? result.status.blockers).length > 0;
     const forceWake = opts.forceWake === true;
     // Consider waking only when there is fresh feedback (result.sent) or a human is
     // explicitly forcing dispatch (forceWake) — and there is someone to wake.
@@ -1097,7 +1172,24 @@ export function issuePullRequestService(db: Db) {
       decisionNote: input.decisionNote ?? null,
       decidedByUserId: input.decidedByUserId,
     });
-    await issuesSvc.update(row.issueId, { status: "done" });
+    // The merged PR's row is already mergeStatus "merged", so the finding-#23 close
+    // chokepoint only refuses this transition when a SIBLING tracked PR is still
+    // open — same semantics as the B3 sibling guard on external merges. The merge
+    // itself succeeded; the issue staying open (with the chokepoint's system
+    // comment explaining why) must not fail the merge response.
+    try {
+      await issuesSvc.update(row.issueId, { status: "done" });
+    } catch (err) {
+      const code =
+        err instanceof HttpError && err.details && typeof err.details === "object"
+          ? (err.details as { code?: string }).code
+          : undefined;
+      if (code !== "open_tracked_prs") throw err;
+      logger.info(
+        { issueId: row.issueId, issuePullRequestId: row.id },
+        "issue_pr.merge_close_deferred_sibling_pr_open",
+      );
+    }
     return { pullRequest: updated, mergeResult: result, githubPullRequest: pr, approvalMemoryEntryId };
   }
 

@@ -45,5 +45,11 @@ export interface IssuePullRequestStatus {
   reviews: GitHubPRReview[];
   qualityGate: SonarQubeQualityGate | null;
   blockers: string[];
+  /**
+   * The subset of blockers an agent can act on (CI, reviews, quality gate).
+   * Merge-gating-only blockers (e.g. "assignee is actively revising") are in
+   * `blockers` but not here, so they never drive feedback dispatch to agents.
+   */
+  agentBlockers?: string[];
   feedback: string;
 }
