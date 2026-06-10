@@ -29,6 +29,10 @@ These almost always get merged quickly when they're clean.
 
 PRs that follow this path are **much** more likely to be accepted, even when they're large.
 
+## Local Toolchain Notes
+- **Java repos (agent workspaces):** BukuWarung services use Gradle 7.x, which cannot run on JDK 18+. Install a compatible JDK so agents and reviewers can run tests locally: `brew install openjdk@17` (binary at `/opt/homebrew/opt/openjdk@17/bin/java`; point Gradle at it via `org.gradle.java.home` or `JAVA_HOME`). Without it, "tests pass" claims on Java tickets are unverifiable on this host.
+- Test-mirror repos (`krish-buku/*-test`) should have CI enabled so PR checks aren't `unknown`.
+
 ## General Rules (both paths)
 - Write clear commit messages
 - Keep PR title + description meaningful

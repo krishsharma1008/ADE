@@ -6888,6 +6888,32 @@ export function heartbeatService(db: Db) {
     }
 
     if (!isAgentStatusInvokable(agent.status)) {
+      // Persist the miss (mirrors the other skip gates) so a paused-agent wake is
+      // never silently lost: resume re-scans these rows and re-enqueues one wake.
+      await writeSkippedRequest(`agent.not_invokable.${agent.status}`);
+      if (issueId) {
+        try {
+          const body = `Wake for @${agent.name} skipped — agent is ${agent.status}. The agent will re-scan its queue when resumed.`;
+          const [latestSystem] = await db
+            .select({ body: issueComments.body })
+            .from(issueComments)
+            .where(and(eq(issueComments.issueId, issueId), eq(issueComments.kind, "system")))
+            .orderBy(desc(issueComments.createdAt))
+            .limit(1);
+          if (latestSystem?.body !== body) {
+            await db.insert(issueComments).values({
+              companyId: agent.companyId,
+              issueId,
+              authorAgentId: null,
+              authorUserId: null,
+              body,
+              kind: "system",
+            });
+          }
+        } catch (err) {
+          logger.warn({ err, issueId, agentId }, "failed to surface skipped wake on issue");
+        }
+      }
       throw conflict("Agent is not invokable in its current state", { status: agent.status });
     }
 

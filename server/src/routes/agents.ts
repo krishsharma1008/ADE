@@ -3,7 +3,7 @@ import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@combyne/db";
 import { agentWakeupRequests, agents as agentsTable, companies, heartbeatRuns, issues, transcriptSummaries } from "@combyne/db";
-import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, like, not, sql } from "drizzle-orm";
 import {
   createAgentKeySchema,
   createAgentHireSchema,
@@ -18,6 +18,7 @@ import {
   updateAgentSchema,
 } from "@combyne/shared";
 import type { InstanceSchedulerHeartbeatAgent } from "@combyne/shared";
+import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
 import {
   agentService,
@@ -1238,6 +1239,49 @@ export function agentRoutes(db: Db) {
       entityType: "agent",
       entityId: agent.id,
     });
+
+    // Re-deliver wakes missed while paused: one queue-rescan wake (not a
+    // per-skipped-row replay — the agent's queue scan covers every issue) when
+    // either a not-invokable skip was recorded or assigned work is waiting.
+    try {
+      // Consume (not just read) the missed-wake rows so each is redelivered once:
+      // the "redelivered." prefix breaks the LIKE match for subsequent resumes.
+      const consumed = await db
+        .update(agentWakeupRequests)
+        .set({ reason: sql`'redelivered.' || ${agentWakeupRequests.reason}` })
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agent.id),
+            eq(agentWakeupRequests.status, "skipped"),
+            like(agentWakeupRequests.reason, "agent.not_invokable%"),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      const missedWake = consumed.length > 0;
+      const [assignedOpen] = missedWake
+        ? []
+        : await db
+            .select({ id: issues.id })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.companyId, agent.companyId),
+                eq(issues.assigneeAgentId, agent.id),
+                inArray(issues.status, ["todo", "in_progress"]),
+              ),
+            )
+            .limit(1);
+      if (missedWake || assignedOpen) {
+        await heartbeat.wakeup(agent.id, {
+          source: "on_demand",
+          reason: "agent_resumed_rescan",
+          requestedByActorType: "user",
+          requestedByActorId: req.actor.userId ?? "board",
+        });
+      }
+    } catch (err) {
+      logger.warn({ err, agentId: agent.id }, "resume rescan wake failed");
+    }
 
     res.json(agent);
   });
