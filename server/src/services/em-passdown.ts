@@ -80,8 +80,11 @@ export const PASSDOWN_TIERS: Record<IssueComplexity, TierConfig> = {
   large: { maxEntries: 12, maxTokens: 10_000, layers: ["shared", "workspace"] },
 };
 
-/** §5.1.3 confidence floor: drop ranked hits weaker than this. */
-const MIN_SCORE = 0.15;
+/** §5.1.3 confidence floor: drop ranked hits weaker than this. Raised from 0.15
+ * after the 2026-06-10 E2E audit (C5): on a thin corpus the hash ranker scored
+ * weakly-relevant entries 0.38-0.53, and 0.15 let recency-boosted noise into the
+ * packet. 0.25 matches memory.ts minRelevanceForVersion's hash-path default. */
+const MIN_SCORE = 0.25;
 /** §5.1.1 minConfidence floor passed to the trust filter. */
 const MIN_CONFIDENCE = 0.6;
 

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, like, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   activityLog,
@@ -3787,6 +3787,37 @@ export function heartbeatService(db: Db) {
     await setWakeupStatus(requeued.wakeupRequestId, "queued", {});
 
     await startNextQueuedRunForAgent(agent.id);
+
+    // Audit A2 (e2e-run-2026-06-10): work that arrived WHILE the agent was
+    // usage-paused (question answered, new assignment) recorded skipped wakes but
+    // resuming only re-queued the paused run — the new work was never delivered.
+    // Consume the missed-wake rows ("redelivered." prefix = once only) and enqueue
+    // one queue-rescan wake.
+    try {
+      const consumed = await db
+        .update(agentWakeupRequests)
+        .set({ reason: sql`'redelivered.' || ${agentWakeupRequests.reason}` })
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agent.id),
+            eq(agentWakeupRequests.status, "skipped"),
+            like(agentWakeupRequests.reason, "agent.not_invokable%"),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      if (consumed.length > 0) {
+        await enqueueWakeup(agent.id, {
+          source: "on_demand",
+          reason: "usage_resume_rescan",
+          requestedByActorType: "system",
+          requestedByActorId: "usage-pause-poller",
+        }).catch((err) =>
+          logger.debug({ err, agentId: agent.id }, "usage resume rescan wake failed"),
+        );
+      }
+    } catch (err) {
+      logger.debug({ err, agentId: agent.id }, "usage resume missed-wake scan failed");
+    }
 
     logger.info(
       { runId: run.id, agentId: agent.id, attemptCount },

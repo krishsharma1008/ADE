@@ -297,6 +297,23 @@ export function approvalRoutes(db: Db) {
       details: { type: approval.type },
     });
 
+    // Audit B5 (e2e-run-2026-06-10): only the approve path woke the requester — a
+    // rejected agent never learned its request was denied and could keep waiting.
+    if (approval.requestedByAgentId) {
+      await heartbeat
+        .wakeup(approval.requestedByAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "approval_rejected",
+          payload: { approvalId: approval.id, approvalStatus: approval.status },
+          requestedByActorType: "user",
+          requestedByActorId: req.actor.userId ?? "board",
+        })
+        .catch((err) =>
+          logger.warn({ err, approvalId: approval.id }, "failed to wake requester on approval reject"),
+        );
+    }
+
     res.json(redactApprovalPayload(approval));
   });
 
@@ -321,6 +338,25 @@ export function approvalRoutes(db: Db) {
         entityId: approval.id,
         details: { type: approval.type },
       });
+
+      // Audit B5: revision requests need the requester to act — wake it.
+      if (approval.requestedByAgentId) {
+        await heartbeat
+          .wakeup(approval.requestedByAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "approval_revision_requested",
+            payload: { approvalId: approval.id, approvalStatus: approval.status },
+            requestedByActorType: "user",
+            requestedByActorId: req.actor.userId ?? "board",
+          })
+          .catch((err) =>
+            logger.warn(
+              { err, approvalId: approval.id },
+              "failed to wake requester on approval revision request",
+            ),
+          );
+      }
 
       res.json(redactApprovalPayload(approval));
     },

@@ -50,6 +50,7 @@ const ACTIONABLE_APPROVAL_STATUSES = new Set(["pending", "revision_requested"]);
 type InboxTab = "new" | "all";
 type InboxCategoryFilter =
   | "everything"
+  | "awaiting_input"
   | "issues_i_touched"
   | "join_requests"
   | "approvals"
@@ -58,6 +59,7 @@ type InboxCategoryFilter =
   | "stale_work";
 type InboxApprovalFilter = "all" | "actionable" | "resolved";
 type SectionKey =
+  | "awaiting_input"
   | "issues_i_touched"
   | "join_requests"
   | "approvals"
@@ -416,6 +418,12 @@ export function Inbox() {
     () => (issues ? getStaleIssues(issues) : []).filter((i) => !dismissed.has(`stale:${i.id}`)),
     [issues, dismissed],
   );
+  // Audit D1 (e2e-run-2026-06-10): the sidebar badge counts awaiting_user issues
+  // but this page never listed them — badge said "Inbox 3", page showed 2 items.
+  const awaitingUserIssues = useMemo(
+    () => (issues ?? []).filter((issue) => issue.status === "awaiting_user"),
+    [issues],
+  );
   const sortByMostRecentActivity = useCallback(
     (a: Issue, b: Issue) => {
       const activityDiff = issueLastActivityTimestamp(b) - issueLastActivityTimestamp(a);
@@ -566,9 +574,11 @@ export function Inbox() {
   const hasJoinRequests = joinRequests.length > 0;
   const hasTouchedIssues = touchedIssues.length > 0;
 
+  const hasAwaitingInput = awaitingUserIssues.length > 0;
   const newItemCount =
     failedRuns.length +
     staleIssues.length +
+    awaitingUserIssues.length +
     (showAggregateAgentError ? 1 : 0) +
     (showBudgetAlert ? 1 : 0);
 
@@ -581,6 +591,8 @@ export function Inbox() {
     allCategoryFilter === "everything" || allCategoryFilter === "failed_runs";
   const showAlertsCategory = allCategoryFilter === "everything" || allCategoryFilter === "alerts";
   const showStaleCategory = allCategoryFilter === "everything" || allCategoryFilter === "stale_work";
+  const showAwaitingCategory =
+    allCategoryFilter === "everything" || allCategoryFilter === "awaiting_input";
 
   const approvalsToRender = tab === "new" ? actionableApprovals : filteredAllApprovals;
   const showTouchedSection = tab === "new" ? hasTouchedIssues : showTouchedCategory && hasTouchedIssues;
@@ -594,8 +606,11 @@ export function Inbox() {
     tab === "new" ? hasRunFailures : showFailedRunsCategory && hasRunFailures;
   const showAlertsSection = tab === "new" ? hasAlerts : showAlertsCategory && hasAlerts;
   const showStaleSection = tab === "new" ? hasStale : showStaleCategory && hasStale;
+  const showAwaitingSection =
+    tab === "new" ? hasAwaitingInput : showAwaitingCategory && hasAwaitingInput;
 
   const visibleSections = [
+    showAwaitingSection ? "awaiting_input" : null,
     showFailedRunsSection ? "failed_runs" : null,
     showAlertsSection ? "alerts" : null,
     showStaleSection ? "stale_work" : null,
@@ -654,6 +669,7 @@ export function Inbox() {
                 <SelectItem value="approvals">Approvals</SelectItem>
                 <SelectItem value="failed_runs">Failed runs</SelectItem>
                 <SelectItem value="alerts">Alerts</SelectItem>
+                <SelectItem value="awaiting_input">Awaiting your input</SelectItem>
                 <SelectItem value="stale_work">Stale work</SelectItem>
               </SelectContent>
             </Select>
@@ -852,6 +868,46 @@ export function Inbox() {
                   </button>
                 </div>
               )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {showAwaitingSection && (
+        <>
+          {showSeparatorBefore("awaiting_input") && <Separator />}
+          <div>
+            <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              Awaiting Your Input
+            </h3>
+            <div className="divide-y divide-border border border-border">
+              {awaitingUserIssues.map((issue) => (
+                <Link
+                  key={issue.id}
+                  to={`/issues/${issue.identifier ?? issue.id}`}
+                  className="flex items-start gap-2 px-3 py-3 no-underline text-inherit transition-colors hover:bg-accent/50 sm:items-center sm:gap-3 sm:px-4"
+                >
+                  <span className="shrink-0">
+                    <StatusIcon status={issue.status} />
+                  </span>
+                  <span className="line-clamp-2 min-w-0 flex-1 text-sm sm:line-clamp-none sm:truncate">
+                    {issue.title}
+                  </span>
+                  <span className="shrink-0 text-xs font-mono text-muted-foreground">
+                    {issue.identifier ?? issue.id.slice(0, 8)}
+                  </span>
+                  {issue.assigneeAgentId &&
+                    (() => {
+                      const name = agentName(issue.assigneeAgentId);
+                      return name ? (
+                        <span className="hidden sm:inline-flex"><Identity name={name} size="sm" /></span>
+                      ) : null;
+                    })()}
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    waiting {timeAgo(issue.awaitingUserSince ?? issue.updatedAt)}
+                  </span>
+                </Link>
+              ))}
             </div>
           </div>
         </>

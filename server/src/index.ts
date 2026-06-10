@@ -911,6 +911,13 @@ export async function startServer(): Promise<StartedServer> {
     let prSweepInFlight = false;
     const issuePullRequestsSvc = issuePullRequestService(db);
 
+    // Audit C1 (e2e-run-2026-06-10): memory TTL decay existed only as a manual
+    // board endpoint, so ttlDays was never enforced — run it daily per company.
+    const MEMORY_DECAY_INTERVAL_MS =
+      Number(process.env.COMBYNE_MEMORY_DECAY_INTERVAL_MS) || 24 * 60 * 60 * 1000;
+    let lastMemoryDecayAt = 0;
+    let memoryDecayInFlight = false;
+
     // Context-rail keepalive: when a SEPARATE context DB is configured, ping it on a
     // short cadence to keep at least one pooled connection WARM. A Cloud SQL public
     // IP across a high-latency/lossy link can take many seconds to TLS-handshake, so
@@ -1060,6 +1067,33 @@ export async function startServer(): Promise<StartedServer> {
           })
           .finally(() => {
             prSweepInFlight = false;
+          });
+      }
+
+      if (!memoryDecayInFlight && now - lastMemoryDecayAt >= MEMORY_DECAY_INTERVAL_MS) {
+        lastMemoryDecayAt = now;
+        memoryDecayInFlight = true;
+        void (async () => {
+          const { memoryService } = await import("./services/memory.js");
+          const memory = memoryService(db as any);
+          const activeCompanies = await db
+            .select({ id: companies.id })
+            .from(companies)
+            .where(eq(companies.status, "active"));
+          for (const company of activeCompanies) {
+            try {
+              const archived = await memory.runDecayPass(company.id, new Date(now));
+              if (archived > 0) {
+                logger.info({ companyId: company.id, archived }, "memory decay pass archived entries");
+              }
+            } catch (err) {
+              logger.debug({ err, companyId: company.id }, "memory decay pass failed");
+            }
+          }
+        })()
+          .catch((err) => logger.error({ err }, "memory decay tick failed"))
+          .finally(() => {
+            memoryDecayInFlight = false;
           });
       }
 

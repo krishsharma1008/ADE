@@ -2610,7 +2610,7 @@ function PersistedTranscriptSection({ runId }: { runId: string }) {
         </p>
       )}
       {expanded && data && entries.length === 0 && (
-        <p className="text-xs text-muted-foreground">No persisted transcript entries for this run.</p>
+        <p className="text-xs text-muted-foreground">No content turns persisted for this run — only lifecycle events were recorded (see the run log for streaming output).</p>
       )}
       {expanded && entries.length > 0 && (
         <div className="space-y-1 font-mono text-xs">

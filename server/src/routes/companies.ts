@@ -1,5 +1,8 @@
 import { Router } from "express";
 import type { Db } from "@combyne/db";
+import { agentWakeupRequests, issues } from "@combyne/db";
+import { and, eq, inArray, like, sql } from "drizzle-orm";
+import { logger } from "../middleware/logger.js";
 import {
   companyPortabilityExportSchema,
   companyPortabilityImportSchema,
@@ -227,6 +230,50 @@ export function companyRoutes(db: Db) {
       entityType: "company",
       entityId: companyId,
     });
+
+    // Audit A1 (e2e-run-2026-06-10): wakes attempted while the COMPANY was paused
+    // were persisted as skipped (company.*) and then lost — resume re-delivers one
+    // queue-rescan wake per agent that either missed a wake or has open assigned
+    // work, mirroring the agent-resume re-scan.
+    try {
+      const consumed = await db
+        .update(agentWakeupRequests)
+        .set({ reason: sql`'redelivered.' || ${agentWakeupRequests.reason}` })
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, "skipped"),
+            like(agentWakeupRequests.reason, "company.%"),
+          ),
+        )
+        .returning({ agentId: agentWakeupRequests.agentId });
+      const missedAgentIds = new Set(consumed.map((row) => row.agentId));
+      const assigned = await db
+        .selectDistinct({ agentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            inArray(issues.status, ["todo", "in_progress"]),
+          ),
+        );
+      for (const row of assigned) {
+        if (row.agentId) missedAgentIds.add(row.agentId);
+      }
+      for (const agentId of missedAgentIds) {
+        await heartbeat
+          .wakeup(agentId, {
+            source: "on_demand",
+            reason: "company_resumed_rescan",
+            requestedByActorType: "user",
+            requestedByActorId: req.actor.userId ?? "board",
+          })
+          .catch((err) => logger.debug({ err, agentId }, "company resume rescan wake failed"));
+      }
+    } catch (err) {
+      logger.warn({ err, companyId }, "company resume rescan failed");
+    }
+
     res.json(company);
   });
 

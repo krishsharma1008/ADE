@@ -12,6 +12,7 @@ import {
   companies,
   companyIntegrations,
   issueApprovals,
+  issueComments,
   issuePullRequests,
   issues,
   memoryEntries,
@@ -206,6 +207,119 @@ describe("F13/F14: external-merge sweep + merge_pr approval batch-resolve", () =
 
     const [resolved] = await handle.db.select().from(approvals).where(eq(approvals.id, stale.id));
     expect(resolved.status).toBe("approved");
+  });
+
+  it("memory body captured on merge contains no transient blocker text (audit C2)", async () => {
+    const { svc, tracked } = await trackOpenPr(24);
+    mockMergedPr(24, "sha-24");
+    await svc.reconcile(tracked.id);
+
+    const [entry] = await handle.db
+      .select()
+      .from(memoryEntries)
+      .where(eq(memoryEntries.source, `pr-approval:${tracked.approvalId}`));
+    expect(entry).toBeTruthy();
+    expect(entry.body).not.toContain("Blocking items");
+    expect(entry.body).not.toContain("not merge-allowed");
+    expect(entry.body).not.toContain("PR is not open");
+    expect(entry.body).toContain("Accepted pattern");
+  });
+
+  it("PR closed WITHOUT merge: terminal tracking, approval rejected, comment + assignee wake (audit B1)", async () => {
+    const { svc, issue, tracked } = await trackOpenPr(25);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const href = String(url);
+      if (href.includes("/pulls/25/reviews")) return new Response(JSON.stringify([]), { status: 200 });
+      if (href.includes("/check-runs"))
+        return new Response(JSON.stringify({ check_runs: [] }), { status: 200 });
+      if (href.includes("/pulls/25")) {
+        return new Response(
+          JSON.stringify({
+            id: 25, number: 25, title: "feat: abandoned", body: null,
+            state: "closed", draft: false, user: { login: "engineer" },
+            head: { ref: "feat/SWP-25/x", sha: "sha-25" },
+            base: { ref: "staging", repo: { default_branch: "staging" } },
+            merged: false, mergeable: null, merge_commit_sha: null, merged_at: null,
+            created_at: "2026-06-10T00:00:00Z", updated_at: "2026-06-10T05:00:00Z",
+            html_url: "https://github.test/pull/25",
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    await svc.reconcile(tracked.id);
+
+    const [row] = await handle.db
+      .select()
+      .from(issuePullRequests)
+      .where(eq(issuePullRequests.id, tracked.id));
+    expect(row.mergeStatus).toBe("closed");
+
+    const [approval] = await handle.db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.id, tracked.approvalId!));
+    expect(approval.status).toBe("rejected");
+
+    const comments = await handle.db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issue.id));
+    expect(comments.some((c) => c.body.includes("WITHOUT being merged"))).toBe(true);
+
+    // Terminal "closed" rows leave the sweep (audit B4): a second sweep makes no
+    // GitHub call for this row — assert by checking it is not re-reconciled.
+    const before = row.lastReconciledAt;
+    await svc.reconcileOpenTrackedPrs(companyId);
+    const [after] = await handle.db
+      .select({ lastReconciledAt: issuePullRequests.lastReconciledAt })
+      .from(issuePullRequests)
+      .where(eq(issuePullRequests.id, tracked.id));
+    expect(after.lastReconciledAt?.toISOString()).toBe(before?.toISOString());
+  });
+
+  it("multi-PR issue: first merge resolves its approval but does NOT close the issue (audit B3)", async () => {
+    const [issue] = await handle.db
+      .insert(issues)
+      .values({ companyId, title: "Two-PR ticket", status: "in_progress", assigneeAgentId: agentId })
+      .returning();
+    const svc = issuePullRequestService(handle.db);
+    const trackBoth = async (pullNumber: number) =>
+      svc.upsertForIssue({
+        companyId,
+        issueId: issue.id,
+        requestedByAgentId: agentId,
+        repo: "krish-buku/fs-brick-service-test",
+        pullNumber,
+        pullUrl: `https://github.test/pull/${pullNumber}`,
+        title: `feat: part ${pullNumber}`,
+        baseBranch: "staging",
+        headBranch: `feat/SWP-${pullNumber}/x`,
+        headSha: `sha-${pullNumber}`,
+        mergeMethod: "squash",
+      });
+    const prA = await trackBoth(26);
+    await trackBoth(27);
+
+    mockMergedPr(26, "sha-26");
+    await svc.reconcile(prA.id);
+
+    const [issueAfter] = await handle.db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(issueAfter.status).not.toBe("done");
+
+    const [approvalA] = await handle.db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.id, prA.approvalId!));
+    expect(approvalA.status).toBe("approved");
+
+    const comments = await handle.db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issue.id));
+    expect(comments.some((c) => c.body.includes("issue stays open"))).toBe(true);
   });
 
   it("soft-fails when GitHub is unreachable: no state change, no throw", async () => {

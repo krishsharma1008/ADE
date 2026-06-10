@@ -264,6 +264,44 @@ export function issuePullRequestService(db: Db) {
     row: typeof issuePullRequests.$inferSelect,
     pr: { title: string; body?: string | null; headBranch?: string | null; mergeCommitSha?: string | null; mergedAt?: string | null; htmlUrl?: string | null; user?: string | null; baseBranch?: string | null },
   ): Promise<void> {
+    // Audit B3 (e2e-run-2026-06-10): when MULTIPLE PRs are tracked for one issue,
+    // the first merge must not close the issue while a sibling PR is still open —
+    // the dashboard would show "done" with review work outstanding. Resolve THIS
+    // PR's approvals, comment, and let the LAST merge close the issue.
+    const [openSibling] = await db
+      .select({ id: issuePullRequests.id, pullNumber: issuePullRequests.pullNumber })
+      .from(issuePullRequests)
+      .where(
+        and(
+          eq(issuePullRequests.issueId, row.issueId),
+          ne(issuePullRequests.id, row.id),
+          notInArray(issuePullRequests.mergeStatus, ["merged", "closed"]),
+        ),
+      )
+      .limit(1);
+    if (openSibling) {
+      if (row.approvalId) {
+        await approvalsSvc
+          .approve(row.approvalId, "issue-pr-reconcile", "PR merged on GitHub")
+          .catch((err) =>
+            logger.debug({ err, approvalId: row.approvalId }, "issue_pr.sibling_merge_approval_resolve_skipped"),
+          );
+      }
+      await db
+        .insert(issueComments)
+        .values({
+          companyId: row.companyId,
+          issueId: row.issueId,
+          authorAgentId: null,
+          authorUserId: null,
+          body:
+            `PR ${row.repo}#${row.pullNumber} merged — issue stays open because tracked PR ` +
+            `#${openSibling.pullNumber} is still pending. The last merge closes this issue.`,
+          kind: "system",
+        })
+        .catch(() => {});
+      return;
+    }
     await issuesSvc
       .update(
         row.issueId,
@@ -506,6 +544,28 @@ export function issuePullRequestService(db: Db) {
       .then((rows) => rows[0] ?? row);
     await createOrUpdateMergeApproval(updated);
 
+    // Audit B2 (e2e-run-2026-06-10): after a force-push, the "PR head changed since
+    // merge approval was prepared" blocker never cleared — createOrUpdateMergeApproval
+    // refreshes the approval payload's expectedHeadSha while the approval is still
+    // pending, but the tracking ROW kept the stale value forever. Mirror the refresh
+    // here so the blocker clears on the next reconcile once the panel re-renders the
+    // new head. (A decided approval keeps its frozen SHA — that mismatch is the
+    // merge()-time recheck working as intended.)
+    if (
+      updated.approvalId &&
+      pr.headSha &&
+      updated.expectedHeadSha &&
+      updated.expectedHeadSha !== pr.headSha
+    ) {
+      const approval = await approvalsSvc.getById(updated.approvalId);
+      if (approval && approval.status === "pending") {
+        await db
+          .update(issuePullRequests)
+          .set({ expectedHeadSha: pr.headSha, updatedAt: now() })
+          .where(eq(issuePullRequests.id, updated.id));
+      }
+    }
+
     // HOOK 2 on an EXTERNALLY-detected merge. The in-app merge() captures the
     // pr-approval, but a human can merge the PR directly on GitHub (bypassing the
     // PR panel). When reconcile observes the PR has JUST transitioned to merged,
@@ -554,6 +614,57 @@ export function issuePullRequestService(db: Db) {
         user: pr.user,
         baseBranch: pr.baseBranch,
       });
+    }
+
+    // Audit B1 (e2e-run-2026-06-10): a PR CLOSED WITHOUT MERGE previously had no
+    // handler — the issue sat in_review forever, the merge_pr approval stayed
+    // pending, and nobody was told. On the closed-unmerged TRANSITION: mark the
+    // tracking row terminal ("closed" leaves the sweep via the notInArray filter),
+    // reject the approval(s), surface a system comment, and wake the assignee so
+    // the work is re-planned instead of silently abandoned.
+    if (!pr.merged && pr.state === "closed" && row.state === "open") {
+      await db
+        .update(issuePullRequests)
+        .set({ mergeStatus: "closed", updatedAt: now() })
+        .where(eq(issuePullRequests.id, updated.id));
+      if (updated.approvalId) {
+        await approvalsSvc
+          .reject(updated.approvalId, "issue-pr-reconcile", "PR was closed on GitHub without merging")
+          .catch((err) =>
+            logger.debug({ err, approvalId: updated.approvalId }, "issue_pr.closed_unmerged_approval_reject_skipped"),
+          );
+      }
+      await db
+        .insert(issueComments)
+        .values({
+          companyId: updated.companyId,
+          issueId: updated.issueId,
+          authorAgentId: null,
+          authorUserId: null,
+          body:
+            `PR ${updated.repo}#${updated.pullNumber} was closed on GitHub WITHOUT being merged. ` +
+            `The merge approval was rejected. Decide whether to reopen the PR, open a new one, or re-plan this issue.`,
+          kind: "system",
+        })
+        .catch(() => {});
+      const [issueRow] = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, updated.issueId));
+      if (issueRow?.assigneeAgentId) {
+        await heartbeatService(db)
+          .wakeup(issueRow.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "pr_closed_unmerged",
+            payload: { issueId: updated.issueId, issuePullRequestId: updated.id },
+            requestedByActorType: "system",
+            requestedByActorId: "issue-pr-reconcile",
+          })
+          .catch((err) =>
+            logger.debug({ err, issueId: updated.issueId }, "issue_pr.closed_unmerged_wake_skipped"),
+          );
+      }
     }
 
     const refreshed = await getById(row.id);
@@ -871,7 +982,9 @@ export function issuePullRequestService(db: Db) {
       .where(
         and(
           eq(issuePullRequests.companyId, companyId),
-          ne(issuePullRequests.mergeStatus, "merged"),
+          // "closed" (unmerged, audit B1) is terminal too — keeps abandoned PRs
+          // from burning GitHub calls on every sweep forever (audit B4).
+          notInArray(issuePullRequests.mergeStatus, ["merged", "closed"]),
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       )
@@ -999,7 +1112,18 @@ export function issuePullRequestService(db: Db) {
   }): Promise<string | null> {
     const { row, status } = input;
     const note = readNonEmptyString(input.decisionNote);
-    const reviewFeedback = readNonEmptyString(status.feedback);
+    // DURABLE content only (e2e-run-2026-06-10 audit C2): status.feedback is a
+    // point-in-time snapshot — blocker lines like "PR is not open (closed)" or
+    // "Base branch X is not merge-allowed" go stale the moment config/state moves,
+    // yet used to be frozen into a VERIFIED memory body and re-served to agents
+    // forever. Keep only reviewer guidance (changes-requested bodies), which is a
+    // durable record of what the humans asked for.
+    const reviewFeedback = readNonEmptyString(
+      status.reviews
+        .filter((review) => review.state.toUpperCase() === "CHANGES_REQUESTED")
+        .map((review) => `${review.user}: ${review.body?.trim() || "Changes requested"}`)
+        .join("\n"),
+    );
     // Accepted-pattern summary: which reviewers approved the merged work (the
     // pattern the EM is endorsing by merging). Deterministic, derived from the
     // reconciled reviews — never agent-authored prose.
