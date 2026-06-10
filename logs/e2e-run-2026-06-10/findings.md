@@ -50,3 +50,6 @@ A tsx-watch hot reload mid-round marked both in-flight Backend-1 runs interrupte
 
 ## Finding #16 — Dashboard merge button permanently disabled on CI-less repos (user-reported, round 2)
 IssueDetail's canMerge re-derived the merge gates client-side and required ciStatus==="passed" — on repos with no CI, ciStatus is forever "unknown", so the Merge button never enabled even when the server's mergeStatus was "ready" (zero blockers). This is what forced the human to merge on GitHub in BOTH rounds (compounding F13). Fixed: the UI now trusts the server verdict (mergeStatus==="ready" + approvalId + headSha); merge() re-validates server-side regardless.
+
+## Finding #17 — "Run needs review" banner without an actionable question (user-reported, round 2)
+When a child hits in_review, the EM's parent follow-up can park the parent in awaiting_user with a SYSTEM digest (no structured question). The UI banner then reads "No clear question was captured…" — technically true, but it gives the operator nothing to act on and reads as if the agent is stuck. Fix candidates: (a) don't park the parent in awaiting_user for the child-in-review checkpoint when there is no question (keep in_progress + comment); (b) banner copy should say what actually happens next ("agent will resume automatically after the child resolves").
