@@ -1,0 +1,49 @@
+# Findings log (fix after testing completes)
+
+## Finding #1 — Stale PR tracking state
+PINB405-9's PR (fs-bnpl-service-test#2) was merged on GitHub 2026-06-09T09:31Z but ADE tracking still showed state=open/mergeStatus=pending a day later. No background reconcile job; manual POST /api/issue-pull-requests/:id/reconcile fixed it. Issue also sat in_review although its PR was merged.
+
+## Finding #2 — Docs teach premature parent closure (user-reported)
+skills/combyne/references/api-reference.md, Manager heartbeat worked example (~line 194-200): step 6 creates subtasks then immediately `PATCH /api/issues/issue-30 { "status": "done" }`. Conflicts with server policy and desired EM behavior: parent must stay open (in_progress) until children complete. Fix: example should leave parent in_progress with a delegation comment, and close only on a children-complete wake.
+
+## Finding #3 — IC heartbeat example skips the PR/review gate
+skills/combyne/references/api-reference.md ~line 122-150 (Worked Example: IC Heartbeat): a *coding* task ("Fix rate limiter bug", step 4 "write code, run tests") goes straight in_progress -> done with no branch/PR/in_review step. Contradicts SKILL.md GitHub workflow (engineer code work must end at in_review with a tracked PR; board merges; "do not close the issue as done yourself"). Fix: make the IC example a code task that ends with PR tracking + in_review, or switch it to a clearly non-code task.
+
+## Finding #4 — Quick-reference table offers agents a merge endpoint
+skills/combyne/SKILL.md line ~473 (Key Endpoints table): "GitHub: merge PR | PUT /api/companies/:companyId/integrations/github/repos/:repo/pulls/:number/merge" is listed as an available action, directly contradicting line 221 ("Agents must never merge pull requests") and the proxy table ("Merge PR | Board/dashboard only"). Fix: remove the row or mark it board-only.
+
+## Finding #5 — Silent wake loss when assignee is paused at issue-create (HIGH)
+Creating PINB405-12 while the EM was paused (UI pause toggle) produced only a server-side WARN: enqueueWakeup 409 "Agent is not invokable in its current state" (heartbeat.ts ~6891, issues.ts wake-on-create). The create API still returned 201; nothing surfaced on the issue or UI; resume did NOT re-deliver the missed wake. The assigned todo ticket sat indefinitely until a manual /agents/:id/wakeup. Fix candidates: on agent resume, scan for assigned todo/in_progress issues with missed wakes (or persist pending wakeups); surface failed wakes on the issue timeline.
+
+## Finding #6 — EM delegation bypasses the central-DB passdown rail (HIGH)
+EM created subtask PINB405-13 via plain POST /companies/:companyId/issues (server log 04:44:05) instead of POST /issues/:id/delegate. Only the delegate endpoint awaits createHandoff() -> buildPassdownPacket() (agent-handoff.ts:170-200, issues.ts:1374-1387), so NO agent_handoffs row and NO vetted passdown packet was produced (verified: agent_handoffs count=0 for issue 0f7835b5). Root cause: skills/combyne/SKILL.md Step 9 explicitly teaches "Create subtasks with POST /api/companies/{companyId}/issues" — the path that skips the PR-9 context rail. Fix candidates: (a) update the skill to teach /issues/:id/delegate for assigned subtasks, and/or (b) make plain issue-create with parentId+assigneeAgentId also build the passdown packet server-side.
+
+## Finding #7 — Inbox notification persists after PR merge + issue closure (user-reported)
+Screenshot 2026-06-10 11:43: the "PR feedback for krish-buku/fs-bnpl-service-test#2" inbox notification remains visible after the PR was merged (2026-06-09), the tracking row was reconciled to merged, and the issue was closed done. No auto-dismiss/auto-read when the underlying PR/issue resolves. Fix: clear or mark-resolved inbox items when their source PR merges or issue closes.
+
+## Finding #8 — PR feedback generated from stale state + base-branch allowlist flags staging
+The same feedback body asserts "PR is not open (closed)" for a PR that was actually MERGED, and "Base branch staging is not merge-allowed" although staging IS the default branch (origin/HEAD) of both *-test mirrors. Two sub-issues: (a) feedback composer reads stale tracking state (merged misread as closed; related to Finding #1's missing background reconcile); (b) merge-allowed base-branch config appears hardcoded to main/master — staging-default repos get spurious blocking items. Same wrong note was distilled into central-DB memory entry d3ac602c (baseline), so stale state is propagating into the context DB.
+
+## Finding #9 — Progress gate misses real artifacts (pushed branch + open PR) and triggers a wasteful re-run loop
+Backend-1's first run on PINB405-13 (87af846d, 8.7min, 26.8k output tokens) produced a pushed branch AND an open GitHub PR (fs-brick-service-test#2, created in the run's final seconds) — but exited without POSTing PR tracking, setting in_review, or commenting. The server's no-verifiable-artifact gate checks only self-reported signals (tracked PR rows / reported changed files), so it flagged a successful run as artifact-less, moved the issue to awaiting_user, and the EM automation re-queued it (new Backend-1 run ce5ef2bb) — duplicate-work risk + token waste. Two facets: (a) agent dropped the workflow tail (likely turn budget exhausted mid-workflow); (b) gate should cross-check git/GitHub state (workspace branches, open PRs by head branch) before declaring no artifact. Also: no execution_workspaces row — agent worked directly in the shared parent clone (multi-repo worktree isolation never engaged; single-engineer case so no collision this round, but parallel rounds would conflict).
+
+## Finding #10 — awaiting_user is invisible at the notification level (user-reported)
+When PINB405-13 went awaiting_user (11:52:52), nothing surfaced: GET /companies/:id/sidebar-badges returns only {inbox, approvals, failedRuns, joinRequests, memory} — no awaiting-user/needs-response count — and no inbox item is generated for the transition. The UI has a per-row IssueNeedsResponseBadge + status colors, but you only see it if already on the issues list. Compounding: EM automation re-queued the issue ~80s later, so the state vanished before a human could notice. Fix: add awaiting_user count to sidebar-badges (side tab), generate an inbox notification on awaiting_user transitions, and consider whether EM auto-requeue should leave a visible trace for the board.
+
+## Finding #11 — Java toolchain gap blocks local test verification (environment)
+fs-brick-service-test needs Gradle 7.4-compatible Java (8-17); host has only Homebrew OpenJDK 25 -> `./gradlew test` fails to start (same incompatibility the agent reported on PINB405-9: "spotlessApply skipped locally"). Consequence: neither agents nor reviewers can run Java tests locally, and the test mirrors have ciStatus=unknown (no CI configured), so NO automated verification exists anywhere in the loop for Java code. Fix: install JDK 11/17 on the host (or configure Gradle toolchains + org.gradle.java.home), and/or enable CI on the *-test mirrors.
+
+## Finding #12 — Automation wake churn on in_review issues (minor)
+12:04: automation/system woke Backend-1 on PINB405-13 although the issue was in_review with a tracked PR and zero new context since 04:53. The run was a correct 20s no-op (no comment, no git change), but the wake itself is wasted budget. The skill's blocked-task dedup rule prevents exactly this for blocked issues; in_review needs the same guard (don't wake the assignee absent new comments/feedback opt-in/merge).
+
+## Finding #12 — CORRECTION
+The 12:04 Backend-1 wake was the feedback-opt-in ("Let agents fix") wake, not random churn — and the no-op was CORRECT behavior since the human approved instead of requesting changes. Residual minor point: an opt-in with zero pending feedback could skip the wake server-side.
+
+## Finding #13 — Out-of-band GitHub merges strand the pipeline (HIGH, ties #1+#8)
+User merged fs-brick-service-test#2 directly on GitHub (05:04:38Z; no /issue-pull-requests/:id/merge call in server log) — likely FORCED to, because the dashboard merge gate rejects base branch `staging` (Finding #8) even though staging is the repo's default branch. Consequences of any out-of-band merge: tracking row stays open/pending, issue stays in_review indefinitely, no pr-approval memory entry, no agent wake — the exact stale-state pattern of Finding #1, now reproduced live. Fixes: (a) make merge-allowed base branches configurable per repo/workspace (staging-default repos exist); (b) background reconcile poller or GitHub webhook so external merges are detected; (c) reconcile endpoint should also drive downstream effects (close issue / wake / memory), not just the tracking row.
+
+## Finding #14 — merge_pr approval cards never resolve after merge (user-reported)
+Screenshot 12:06: "Approvals needing action" still shows "PR ready — open & merge in PR panel" cards as Pending for fs-brick-service-test#2 (merged 12:04, reconciled, issue done) and for yesterday's fs-bnpl PRs. API confirms 3 pending merge_pr approvals all pointing at resolved work (issue 8708ef4a). Reconcile/merge does not resolve the linked approval, so the approvals queue and its sidebar badge accumulate stale action items. Fix: resolve/auto-approve merge_pr approvals when their PR reaches merged (incl. via reconcile), and backfill-clean existing stale ones.
+
+## Finding #15 — Server restart orphans queued/in-flight agent runs without auto-requeue (round 2)
+A tsx-watch hot reload mid-round marked both in-flight Backend-1 runs interrupted_recoverable ("Process lost — server may have restarted"); the QUEUED run (T2) never started and nothing requeued it — the issue sat in_progress with no run until a manual wake. Fix candidate: on boot (or in the orphan reaper), requeue interrupted_recoverable runs / re-wake their agents. Operational lesson recorded: don't hot-edit server code while agent runs are in flight.
