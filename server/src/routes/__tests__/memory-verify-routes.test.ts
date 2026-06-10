@@ -91,6 +91,22 @@ describe("PR-14 memory verify/conflict routes", () => {
     expect(ok.body.verificationState).toBe("verified");
     expect(ok.body.verifiedBy).toBe("board-user");
     expect(ok.body.verifiedAt).toBeTruthy();
+
+    // WS-C idempotency: confirming twice must not error or double-stamp, and a
+    // dismiss-after-confirm archives without losing the verification audit.
+    const again = await request(makeApp(handle, boardActor))
+      .post(`/memory/entries/${entry.id}/verify`)
+      .send({});
+    expect(again.status).toBe(200);
+    expect(again.body.verificationState).toBe("verified");
+    expect(again.body.verifiedBy).toBe("board-user");
+
+    const dismissed = await request(makeApp(handle, boardActor))
+      .patch(`/memory/entries/${entry.id}`)
+      .send({ status: "archived" });
+    expect(dismissed.status).toBe(200);
+    expect(dismissed.body.status).toBe("archived");
+    expect(dismissed.body.verificationState).toBe("verified");
   });
 
   it("GET …/verify-queue surfaces agent-claims with distinct-issue reuse + pending promotions", async () => {
