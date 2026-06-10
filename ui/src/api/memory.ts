@@ -107,6 +107,9 @@ export const memoryApi = {
     api.get<MemoryCaptureItem[]>(`/companies/${companyId}/memory/capture-inbox`),
   listVerifyQueue: (companyId: string) =>
     api.get<MemoryVerifyItem[]>(`/companies/${companyId}/memory/verify-queue`),
+  deleteEntry: (entryId: string) =>
+    api.delete<MemoryEntry>(`/memory/entries/${encodeURIComponent(entryId)}`),
+
   verifyEntry: (entryId: string) =>
     api.post<MemoryEntry>(`/memory/entries/${entryId}/verify`, {}),
   decidePromotion: (promotionId: string, decision: "approved" | "rejected") =>

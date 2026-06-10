@@ -1,5 +1,5 @@
 import type { MemoryEntry, UpdateMemoryEntry } from "@combyne/shared";
-import { Check, Edit2, Globe } from "lucide-react";
+import { Check, Edit2, Globe, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useState } from "react";
@@ -41,6 +41,10 @@ export function MemoryEntryCard({
   alreadyPromoted,
   justPromoted,
   promoteError,
+  /** When supplied, a Delete (archive) action is shown. Server enforces layer gates. */
+  onDelete,
+  isDeleting,
+  deleteError,
 }: {
   entry: MemoryEntry;
   onSave?: (entryId: string, data: UpdateMemoryEntry) => void;
@@ -54,6 +58,9 @@ export function MemoryEntryCard({
   justPromoted?: boolean;
   /** A failed promote of THIS entry, surfaced inline (the action was otherwise silent). */
   promoteError?: string | null;
+  onDelete?: (entryId: string) => void;
+  isDeleting?: boolean;
+  deleteError?: string | null;
 }) {
   const [editOpen, setEditOpen] = useState(false);
   const superseded = entry.supersededById != null;
@@ -125,7 +132,32 @@ export function MemoryEntryCard({
             {isPromoting ? "Promoting…" : "Promote to global"}
           </Button>
         ) : null}
+        {onDelete && !superseded && (
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            disabled={isDeleting}
+            className="text-muted-foreground hover:text-destructive"
+            onClick={() => {
+              if (
+                window.confirm(
+                  `Delete (archive) this memory entry?\n\n"${entry.subject}"\n\nIt leaves retrieval immediately; the row is archived, not destroyed.`,
+                )
+              ) {
+                onDelete(entry.id);
+              }
+            }}
+            aria-label={`Delete ${entry.subject}`}
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        )}
       </div>
+      {deleteError && (
+        <p className="mt-1 text-xs text-destructive" role="alert">
+          Delete failed: {deleteError}
+        </p>
+      )}
       {promoteError && (
         <p className="mt-1 text-xs text-destructive" role="alert">
           Promote failed: {promoteError}

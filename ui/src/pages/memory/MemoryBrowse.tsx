@@ -115,6 +115,13 @@ export function MemoryBrowse({ isInstanceAdmin = false }: { isInstanceAdmin?: bo
   // M6: instance-admins can promote a verified company entry into the global
   // layer. On success we invalidate the browse queries so both the source view
   // and the global view refresh.
+  const deleteEntry = useMutation({
+    mutationFn: (entryId: string) => memoryApi.deleteEntry(entryId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["memory", selectedCompanyId, "browse"] });
+    },
+  });
+
   const promoteToGlobal = useMutation({
     mutationFn: (entryId: string) => memoryApi.promoteToGlobal(entryId),
     onSuccess: () => {
@@ -298,6 +305,15 @@ export function MemoryBrowse({ isInstanceAdmin = false }: { isInstanceAdmin?: bo
               promoteError={
                 promoteToGlobal.isError && promoteToGlobal.variables === entry.id
                   ? promoteErrorMessage
+                  : null
+              }
+              onDelete={(entryId) => deleteEntry.mutate(entryId)}
+              isDeleting={deleteEntry.isPending && deleteEntry.variables === entry.id}
+              deleteError={
+                deleteEntry.isError && deleteEntry.variables === entry.id
+                  ? deleteEntry.error instanceof Error
+                    ? deleteEntry.error.message
+                    : "Delete failed"
                   : null
               }
             />
