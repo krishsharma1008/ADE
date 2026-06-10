@@ -152,7 +152,7 @@ describe("em-passdown packet (PR-9)", () => {
     expect(pkt.body).toMatch(/Vetted context from your manager/);
   });
 
-  it("small tier is shared-only and capped at the tier entry count", async () => {
+  it("small tier ranks over shared+workspace and stays capped at the tier entry count", async () => {
     const pkt = await passdownService(handle.db).buildPassdownPacket({
       companyId,
       childIssueId,
@@ -162,9 +162,12 @@ describe("em-passdown packet (PR-9)", () => {
       complexity: "small",
     });
     expect(pkt.items.length).toBeLessThanOrEqual(PASSDOWN_TIERS.small.maxEntries);
-    // small tier draws from shared layer only — no workspace entries.
-    expect(pkt.items.every((i) => i.layer === "shared")).toBe(true);
-    expect(pkt.items.map((i) => i.entryId)).not.toContain(verifiedWorkspaceId);
+    // Recall fix (e2e round-2): small tier ranks over the SAME layers as
+    // medium/large — shared-only starved young corpora where every verified
+    // fact lives in workspace. The tight entry/token budget is the small-tier
+    // constraint, not layer starvation. Personal stays excluded.
+    expect(PASSDOWN_TIERS.small.layers).toEqual(["shared", "workspace"]);
+    expect(pkt.items.every((i) => i.layer === "shared" || i.layer === "workspace")).toBe(true);
   });
 
   it("unions EM-pinned curatedMemoryEntryIds and flags them, even off-query", async () => {

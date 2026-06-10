@@ -75,7 +75,13 @@ interface TierConfig {
  * spans both with recent human-answers/approvals.
  */
 export const PASSDOWN_TIERS: Record<IssueComplexity, TierConfig> = {
-  small: { maxEntries: 3, maxTokens: 1_500, layers: ["shared"] },
+  // Recall fix (e2e round-2, live repro): shared-only starved small tickets of
+  // ALL workspace memory — on a young corpus everything verified lives in
+  // workspace, so small-tier packets carried only stale global copies (wrong
+  // repo) while the top-ranked workspace entry was invisible. The small tier
+  // keeps its tight budget (3 entries / 1.5k tokens) but ranks over the same
+  // layers as medium/large.
+  small: { maxEntries: 3, maxTokens: 1_500, layers: ["shared", "workspace"] },
   medium: { maxEntries: 6, maxTokens: 4_000, layers: ["shared", "workspace"] },
   large: { maxEntries: 12, maxTokens: 10_000, layers: ["shared", "workspace"] },
 };
