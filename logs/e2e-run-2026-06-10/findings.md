@@ -59,3 +59,9 @@ T3 delegation produced PINB405-19 AND PINB405-20 — identical title/assignee/pa
 
 ## Round-2 recall observation (T3)
 The PINB405-20 packet carried Pefindo + the two bnpl pattern entries but NOT the repayment-intent human answer — the EM's subtask rewrite dropped the repayment-intent vocabulary, so ranking was fair on the actual query text. The curated-pin path (EM pinning a known-critical entry) is the designed remedy; noted as corpus/usage guidance rather than a logic bug. Both earlier probes (T1 post-fix, T2) recalled their target entries correctly.
+
+## Finding #19 — Single GitHub identity blocks the formal request-changes flow (round 2)
+The deployment uses one PAT for both agent pushes and board actions, and GitHub forbids "Request changes" on your own PR — so the reviewStatus=changes_requested → held-feedback → "Let agents fix" path cannot fire in single-account setups. Recommend documenting a second reviewer identity (separate PAT or GitHub App) for teams that want formal review gating; the ADE-native equivalent (board comment + @mention wake) covers the fix-push loop otherwise.
+
+## Finding #20 — Stale "error" status badge during an actively-running agent (user-reported, round 2)
+Backend-1's status stayed "error" (set when the hot-reload orphaned its runs) for minutes while a new run was visibly executing — run-start does not clear a stale error status; a later checkpoint eventually flips it to running. Operator-facing confusion: the header badge says error while Live Run shows running. Fix (queued for the post-round batch with #15): clear/replace agent.status=error when a run actually starts executing for that agent.
