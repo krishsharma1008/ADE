@@ -78,6 +78,10 @@ export function createGitHubClient(config: GitHubConfig) {
       headBranch: head?.ref as string,
       headSha: (head?.sha as string | null) ?? null,
       baseBranch: base?.ref as string,
+      baseRepoDefaultBranch:
+        (((base?.repo as Record<string, unknown> | undefined)?.default_branch as
+          | string
+          | undefined) ?? null),
       merged: (p.merged as boolean) ?? false,
       mergeable: (p.mergeable as boolean | null) ?? null,
       mergeCommitSha: (p.merge_commit_sha as string | null) ?? null,

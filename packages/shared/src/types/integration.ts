@@ -104,6 +104,8 @@ export interface GitHubPullRequest {
   headBranch: string;
   headSha: string | null;
   baseBranch: string;
+  /** Default branch of the PR's base repo (e.g. "staging" on staging-default mirrors). */
+  baseRepoDefaultBranch: string | null;
   merged: boolean;
   mergeable: boolean | null;
   mergeCommitSha: string | null;

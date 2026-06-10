@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { and, asc, eq, ne, notInArray } from "drizzle-orm";
 import type { Db } from "@combyne/db";
-import { approvals, issueApprovals, issueComments, issuePullRequests, issues } from "@combyne/db";
+import { approvals, issueApprovals, issueComments, issuePullRequests, issues, projectWorkspaces } from "@combyne/db";
 import type {
   GitHubCheckRun,
   GitHubConfig,
@@ -20,6 +20,7 @@ import { heartbeatService } from "./heartbeat.js";
 import { acceptedWorkService } from "./accepted-work.js";
 import type { CreateEntryInput } from "./memory.js";
 import { captureHumanMemoryDurable, prApprovalSource } from "./memory-capture.js";
+import { parseRemoteSlug } from "./push-remote-allowlist.js";
 import { contextTrace } from "./context-trace.js"; // CONTEXT-TRACE
 import { logger } from "../middleware/logger.js";
 
@@ -165,6 +166,8 @@ function blockersFor(input: {
   state: string;
   draft: boolean;
   baseBranch: string;
+  /** Resolved per-repo allowlist; falls back to the static/env list when absent. */
+  allowedMergeBases?: ReadonlySet<string>;
   headSha: string | null;
   expectedHeadSha: string | null;
   ciStatus: string;
@@ -174,7 +177,8 @@ function blockersFor(input: {
   const blockers: string[] = [];
   if (input.state !== "open") blockers.push(`PR is not open (${input.state})`);
   if (input.draft) blockers.push("PR is still a draft");
-  if (!mergeBaseAllowlist().includes(input.baseBranch)) blockers.push(`Base branch \`${input.baseBranch}\` is not merge-allowed`);
+  const allowedBases = input.allowedMergeBases ?? new Set(mergeBaseAllowlist());
+  if (!allowedBases.has(input.baseBranch)) blockers.push(`Base branch \`${input.baseBranch}\` is not merge-allowed`);
   if (!input.headSha) blockers.push("PR head SHA is unknown");
   if (input.expectedHeadSha && input.headSha && input.expectedHeadSha !== input.headSha) {
     blockers.push("PR head changed since merge approval was prepared");
@@ -359,6 +363,42 @@ export function issuePullRequestService(db: Db) {
       .orderBy(asc(issuePullRequests.createdAt));
   }
 
+  // F8 (e2e-run-2026-06-10 #8): the merge-base allowlist was a single global env
+  // list (main/master/development/develop), so staging-default repos could never be
+  // merged from the dashboard — forcing out-of-band GitHub merges. Resolution is
+  // read-time: static/env list ∪ the PR base repo's own default branch ∪ any
+  // project_workspaces.metadata.allowedMergeBases whose repoUrl matches the PR repo.
+  async function resolveMergeBaseAllowlist(
+    companyId: string,
+    repo: string,
+    baseRepoDefaultBranch: string | null,
+  ): Promise<Set<string>> {
+    const allowed = new Set(mergeBaseAllowlist());
+    if (baseRepoDefaultBranch && baseRepoDefaultBranch.trim()) {
+      allowed.add(baseRepoDefaultBranch.trim());
+    }
+    try {
+      const prSlug = parseRemoteSlug(repo)?.slug;
+      if (prSlug) {
+        const workspaces = await db
+          .select({ repoUrl: projectWorkspaces.repoUrl, metadata: projectWorkspaces.metadata })
+          .from(projectWorkspaces)
+          .where(eq(projectWorkspaces.companyId, companyId));
+        for (const workspace of workspaces) {
+          if (parseRemoteSlug(workspace.repoUrl)?.slug !== prSlug) continue;
+          const extra = (workspace.metadata as Record<string, unknown> | null)?.allowedMergeBases;
+          if (!Array.isArray(extra)) continue;
+          for (const branch of extra) {
+            if (typeof branch === "string" && branch.trim()) allowed.add(branch.trim());
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn({ err, companyId, repo }, "merge-base allowlist workspace resolution failed");
+    }
+    return allowed;
+  }
+
   async function reconcile(id: string): Promise<IssuePullRequestStatus> {
     const row = await getById(id);
     if (!row) throw notFound("Pull request tracking record not found");
@@ -379,10 +419,16 @@ export function issuePullRequestService(db: Db) {
     const ciStatus = statusFromChecks(checks);
     const reviewStatus = statusFromReviews(reviews);
     const qualityStatus = statusFromQualityGate(qualityGate);
+    const allowedMergeBases = await resolveMergeBaseAllowlist(
+      row.companyId,
+      row.repo,
+      pr.baseRepoDefaultBranch,
+    );
     const blockers = blockersFor({
       state: pr.state,
       draft: pr.draft,
       baseBranch: pr.baseBranch,
+      allowedMergeBases,
       headSha: pr.headSha,
       expectedHeadSha: row.expectedHeadSha,
       ciStatus,
