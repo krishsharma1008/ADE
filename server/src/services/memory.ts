@@ -910,7 +910,16 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       );
     }
     if (opts.serviceScope) {
-      filters.push(eq(memoryEntries.serviceScope, opts.serviceScope));
+      // Recall fix (e2e round-2 prep): a scope on the QUERY narrows to that
+      // repo's entries PLUS company-wide entries (service_scope IS NULL).
+      // Exact-match-only silently excluded null-scoped human answers — the
+      // highest-trust facts — from every scoped passdown/recall.
+      filters.push(
+        or(
+          eq(memoryEntries.serviceScope, opts.serviceScope),
+          isNull(memoryEntries.serviceScope),
+        ),
+      );
     }
     // ---- §3.2 retrieval-side trust filter (BOTH channels) ----
     if (opts.requireVerified) {
@@ -1002,7 +1011,9 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
       // layer.
       conds.push(sql`(layer = ANY(${opts.layers}) OR layer = 'global')`);
     }
-    if (opts.serviceScope) conds.push(sql`service_scope = ${opts.serviceScope}`);
+    if (opts.serviceScope)
+      // Recall fix: scoped retrieval includes company-wide (NULL-scope) entries.
+      conds.push(sql`(service_scope = ${opts.serviceScope} OR service_scope IS NULL)`);
     if (opts.requireVerified) conds.push(sql`verification_state = 'verified'`);
     if (opts.minConfidence !== undefined) conds.push(sql`confidence >= ${opts.minConfidence}`);
     if (opts.excludeSuperseded !== false) conds.push(sql`superseded_by_id IS NULL`);
