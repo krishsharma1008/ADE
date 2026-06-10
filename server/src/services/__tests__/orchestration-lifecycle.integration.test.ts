@@ -183,19 +183,27 @@ describe("orchestration lifecycle: paused-EM ticket -> delegation -> PR -> exter
     expect(res.status).toBe(201);
     parentIssueId = res.body.id;
 
-    const skipped = await handle.db
-      .select({ reason: agentWakeupRequests.reason })
-      .from(agentWakeupRequests)
-      .where(
-        and(eq(agentWakeupRequests.agentId, emId), eq(agentWakeupRequests.status, "skipped")),
-      );
-    expect(skipped.some((row) => row.reason === "agent.not_invokable.paused")).toBe(true);
-
-    const comments = await handle.db
-      .select({ body: issueComments.body })
-      .from(issueComments)
-      .where(eq(issueComments.issueId, parentIssueId));
-    expect(comments.some((c) => c.body.includes("Wake for @EM skipped"))).toBe(true);
+    // The create route's wake is fire-and-forget — poll for its async side effects
+    // (skipped row + system comment) instead of racing them.
+    let sawSkipped = false;
+    let sawComment = false;
+    for (let attempt = 0; attempt < 30 && !(sawSkipped && sawComment); attempt += 1) {
+      const skipped = await handle.db
+        .select({ reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(
+          and(eq(agentWakeupRequests.agentId, emId), eq(agentWakeupRequests.status, "skipped")),
+        );
+      sawSkipped = skipped.some((row) => row.reason === "agent.not_invokable.paused");
+      const comments = await handle.db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, parentIssueId));
+      sawComment = comments.some((c) => c.body.includes("Wake for @EM skipped"));
+      if (!(sawSkipped && sawComment)) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(sawSkipped).toBe(true);
+    expect(sawComment).toBe(true);
   });
 
   it("step 3: resuming the EM re-delivers exactly one rescan wake (F5)", async () => {
