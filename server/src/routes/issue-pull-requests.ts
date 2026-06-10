@@ -10,6 +10,8 @@ import { and, eq, isNull } from "drizzle-orm";
 import { validate } from "../middleware/validate.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { acceptedWorkService, heartbeatService, issuePullRequestService, logActivity } from "../services/index.js";
+import { integrationService } from "../services/integrations.js";
+import { resolveGithubAgentCapabilities } from "@combyne/shared";
 import {
   ALLOWED_PUSH_REMOTE_PATTERNS_ENV,
   isRemoteAllowed,
@@ -92,6 +94,22 @@ export function issuePullRequestRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    // WS-B capability gate: agents may only track (raise) PRs when the company's
+    // GitHub agentCapabilities allow it. Board/user callers are unaffected.
+    if (req.actor.type === "agent") {
+      const integration = await integrationService(db).getByProvider(issue.companyId, "github");
+      const caps = resolveGithubAgentCapabilities(
+        (integration?.config as Record<string, unknown> | null) ?? null,
+      );
+      if (!caps.canRaisePr) {
+        res.status(403).json({
+          error:
+            "GitHub capability 'canRaisePr' is disabled for agents by company policy. " +
+            "Ask a board user or adjust Agent Capabilities in Integrations.",
+        });
+        return;
+      }
+    }
     // Backstop the push/PR guardrail: reject tracking a PR for a non-allowlisted
     // (e.g. production) repo with a clear 4xx before it enters the merge pipeline.
     if (!isTrackedRepoAllowed(req.body.repo)) {

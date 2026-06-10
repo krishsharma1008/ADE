@@ -109,6 +109,23 @@ describe("jira read-only policy — flag + disallowed tool list", () => {
   it("emits an empty disallow list when the policy is OFF (operator opt-out)", () => {
     expect(jiraDisallowedMcpTools({ [JIRA_AGENT_READONLY_ENV]: "false" })).toEqual([]);
   });
+
+  it("WS-B: an explicit capability flag re-allows its op group under read-only", () => {
+    const disallowed = jiraDisallowedMcpTools({ COMBYNE_JIRA_CAN_COMMENT: "true" });
+    expect(disallowed).not.toContain("mcp__claude_ai_Atlassian__addCommentToJiraIssue");
+    // Other write ops stay blocked.
+    expect(disallowed).toContain("mcp__claude_ai_Atlassian__createJiraIssue");
+    expect(disallowed).toContain("mcp__claude_ai_Atlassian__transitionJiraIssue");
+    expect(disallowed).toContain("mcp__claude_ai_Atlassian__editJiraIssue");
+  });
+
+  it("WS-B: an explicit capability=false blocks its op group even when read-only is OFF", () => {
+    const disallowed = jiraDisallowedMcpTools({
+      [JIRA_AGENT_READONLY_ENV]: "false",
+      COMBYNE_JIRA_CAN_CREATE_ISSUE: "false",
+    });
+    expect(disallowed).toEqual(["mcp__claude_ai_Atlassian__createJiraIssue"]);
+  });
 });
 
 describe("jira read-only policy — search result cap", () => {

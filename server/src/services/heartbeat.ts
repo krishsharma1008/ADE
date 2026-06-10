@@ -49,6 +49,8 @@ import { integrationService } from "./integrations.js";
 import { parseRemoteSlug } from "./push-remote-allowlist.js";
 import { routeAgentQuestionsToManager } from "./agent-question-routing.js";
 import type { IssueComplexity, MemoryEntry, MemoryQueryResult } from "@combyne/shared";
+import { resolveGithubAgentCapabilities, resolveJiraAgentCapabilities } from "@combyne/shared";
+import { isJiraReadOnlyEnabled } from "@combyne/adapter-claude-local/server";
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
 import { loadAssignedIssueQueue, loadNextFocusedIssue } from "./agent-queue.js";
 import {
@@ -5130,6 +5132,30 @@ export function heartbeatService(db: Db) {
         readNonEmptyString(previousSessionParams?.sessionId) ??
         null,
     };
+    // WS-B: snapshot the company's per-provider agent capabilities into the run
+    // context. Adapters turn these into COMBYNE_GH_CAN_* env flags consumed by
+    // the command-guard PATH shim, and the Jira MCP disallow list reads the Jira
+    // set. Best-effort: a lookup failure leaves context absent = current policy.
+    try {
+      const githubIntegration = await integrationService(db).getByProvider(
+        agent.companyId,
+        "github",
+      );
+      if (githubIntegration?.enabled === "true") {
+        context.combyneGithubCapabilities = resolveGithubAgentCapabilities(
+          (githubIntegration.config as Record<string, unknown> | null) ?? null,
+        );
+      }
+      const jiraIntegration = await integrationService(db).getByProvider(agent.companyId, "jira");
+      if (jiraIntegration?.enabled === "true") {
+        context.combyneJiraCapabilities = resolveJiraAgentCapabilities(
+          (jiraIntegration.config as Record<string, unknown> | null) ?? null,
+          { envReadOnly: isJiraReadOnlyEnabled() },
+        );
+      }
+    } catch (err) {
+      logger.debug({ err, agentId: agent.id }, "agent capability snapshot failed");
+    }
     const coordinatorGuidance = buildCoordinatorGuidance(agent);
     if (coordinatorGuidance) {
       context.combyneCoordinatorGuidance = {

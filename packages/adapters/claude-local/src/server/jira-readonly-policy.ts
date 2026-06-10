@@ -202,9 +202,52 @@ export function resolveJiraAgentMaxSearchResults(
  * `--disallowedTools` when the read-only policy is on. Empty when the policy is
  * off (operator opt-out), so behavior is unchanged in that case.
  */
+/** WS-B per-capability env flags (set by the server from company config). */
+export const JIRA_CAPABILITY_ENV_KEYS = {
+  canComment: "COMBYNE_JIRA_CAN_COMMENT",
+  canTransition: "COMBYNE_JIRA_CAN_TRANSITION",
+  canCreateIssue: "COMBYNE_JIRA_CAN_CREATE_ISSUE",
+} as const;
+
+const JIRA_CAPABILITY_OPERATIONS: Record<keyof typeof JIRA_CAPABILITY_ENV_KEYS, readonly string[]> = {
+  canComment: ["addCommentToJiraIssue"],
+  canTransition: ["transitionJiraIssue"],
+  canCreateIssue: ["createJiraIssue"],
+};
+
+function readCapabilityFlag(
+  env: Record<string, string | undefined>,
+  key: string,
+): boolean | null {
+  const raw = env[key];
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  return raw.trim().toLowerCase() === "true";
+}
+
+/**
+ * Disallow list for the Claude CLI's --disallowedTools. Capability-aware (WS-B):
+ * the server injects COMBYNE_JIRA_CAN_* flags resolved from the company's
+ * integration config; an explicit flag overrides the env read-only default for
+ * that operation group in either direction. Everything else (edit/worklog/link/
+ * Confluence writes) follows the read-only policy unchanged — fine-grained
+ * capabilities deliberately cover only the operations the product exposes
+ * toggles for.
+ */
 export function jiraDisallowedMcpTools(
   env: Record<string, string | undefined> = process.env,
 ): string[] {
-  if (!isJiraReadOnlyEnabled(env)) return [];
-  return [...JIRA_WRITE_MCP_TOOLS];
+  const readOnly = isJiraReadOnlyEnabled(env);
+  const disallowedOps = new Set<string>(readOnly ? JIRA_WRITE_OPERATIONS : []);
+  for (const [capability, ops] of Object.entries(JIRA_CAPABILITY_OPERATIONS)) {
+    const flag = readCapabilityFlag(
+      env,
+      JIRA_CAPABILITY_ENV_KEYS[capability as keyof typeof JIRA_CAPABILITY_ENV_KEYS],
+    );
+    if (flag === null) continue;
+    for (const op of ops) {
+      if (flag) disallowedOps.delete(op);
+      else disallowedOps.add(op);
+    }
+  }
+  return Array.from(disallowedOps, (op) => `mcp__claude_ai_Atlassian__${op}`);
 }

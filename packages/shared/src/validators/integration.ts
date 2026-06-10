@@ -3,6 +3,77 @@ import { z } from "zod";
 export const INTEGRATION_PROVIDERS = ["jira", "confluent", "github", "sonarqube"] as const;
 export type IntegrationProviderConst = (typeof INTEGRATION_PROVIDERS)[number];
 
+// ── Agent capability controls ────────────────────────────────────────
+// Fine-grained per-company switches for what AGENTS may do with each provider.
+// Board users are never restricted by these. All fields optional: an absent
+// field means "use the default", so existing configs keep today's behavior.
+
+export const githubAgentCapabilitiesSchema = z
+  .object({
+    canRead: z.boolean().optional(),
+    canPush: z.boolean().optional(),
+    canRaisePr: z.boolean().optional(),
+    canMergePr: z.boolean().optional(),
+  })
+  .strict();
+export type GithubAgentCapabilitiesInput = z.infer<typeof githubAgentCapabilitiesSchema>;
+
+export const jiraAgentCapabilitiesSchema = z
+  .object({
+    canRead: z.boolean().optional(),
+    canComment: z.boolean().optional(),
+    canTransition: z.boolean().optional(),
+    canCreateIssue: z.boolean().optional(),
+  })
+  .strict();
+export type JiraAgentCapabilitiesInput = z.infer<typeof jiraAgentCapabilitiesSchema>;
+
+export interface GithubAgentCapabilities {
+  canRead: boolean;
+  canPush: boolean;
+  canRaisePr: boolean;
+  canMergePr: boolean;
+}
+
+export interface JiraAgentCapabilities {
+  canRead: boolean;
+  canComment: boolean;
+  canTransition: boolean;
+  canCreateIssue: boolean;
+}
+
+/** Defaults preserve current policy: agents read/push/raise PRs but never merge. */
+export function resolveGithubAgentCapabilities(
+  config: Record<string, unknown> | null | undefined,
+): GithubAgentCapabilities {
+  const caps = (config?.agentCapabilities ?? {}) as Partial<GithubAgentCapabilities>;
+  return {
+    canRead: caps.canRead ?? true,
+    canPush: caps.canPush ?? true,
+    canRaisePr: caps.canRaisePr ?? true,
+    canMergePr: caps.canMergePr ?? false,
+  };
+}
+
+/**
+ * Jira write defaults follow the operator's env read-only policy
+ * (COMBYNE_JIRA_AGENT_READONLY): when read-only is on, writes default OFF.
+ * An explicit config value overrides the env default in either direction.
+ */
+export function resolveJiraAgentCapabilities(
+  config: Record<string, unknown> | null | undefined,
+  opts: { envReadOnly: boolean },
+): JiraAgentCapabilities {
+  const caps = (config?.agentCapabilities ?? {}) as Partial<JiraAgentCapabilities>;
+  const writeDefault = !opts.envReadOnly;
+  return {
+    canRead: caps.canRead ?? true,
+    canComment: caps.canComment ?? writeDefault,
+    canTransition: caps.canTransition ?? writeDefault,
+    canCreateIssue: caps.canCreateIssue ?? writeDefault,
+  };
+}
+
 export const jiraConfigSchema = z.object({
   baseUrl: z
     .string()
@@ -11,6 +82,7 @@ export const jiraConfigSchema = z.object({
   email: z.string().email("Must be a valid email"),
   apiToken: z.string().min(1, "API token is required"),
   projectKey: z.string().min(1, "Project key is required").max(10),
+  agentCapabilities: jiraAgentCapabilitiesSchema.optional(),
 });
 export type JiraConfigInput = z.infer<typeof jiraConfigSchema>;
 
@@ -31,6 +103,7 @@ export const githubConfigSchema = z.object({
   token: z.string().min(1, "Token is required"),
   owner: z.string().min(1, "Owner (org or user) is required"),
   defaultRepo: z.string().optional(),
+  agentCapabilities: githubAgentCapabilitiesSchema.optional(),
 });
 export type GitHubConfigInput = z.infer<typeof githubConfigSchema>;
 
@@ -59,10 +132,21 @@ export const updateIntegrationSchema = z
     config: z
       .union([jiraConfigSchema, confluentConfigSchema, githubConfigSchema, sonarqubeConfigSchema])
       .optional(),
+    // Capability toggles ride a separate top-level field: the full-config path
+    // requires secrets, and we must not force re-entering a token (or wipe it)
+    // just to flip an agent capability. The route merges this into the stored
+    // config server-side.
+    agentCapabilities: z
+      .union([githubAgentCapabilitiesSchema, jiraAgentCapabilitiesSchema])
+      .optional(),
   })
-  .refine((data) => data.enabled !== undefined || data.config !== undefined, {
-    message: "At least one of enabled or config must be provided",
-  });
+  .refine(
+    (data) =>
+      data.enabled !== undefined || data.config !== undefined || data.agentCapabilities !== undefined,
+    {
+      message: "At least one of enabled, config, or agentCapabilities must be provided",
+    },
+  );
 export type UpdateIntegration = z.infer<typeof updateIntegrationSchema>;
 
 export const jiraSyncIssuesSchema = z.object({

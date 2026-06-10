@@ -171,6 +171,8 @@ export function Integrations() {
   const [jiraForm, setJiraForm] = useState<JiraConfig>({ ...BLANK_JIRA });
   const [confluentForm, setConfluentForm] = useState<ConfluentConfig>({ ...BLANK_CONFLUENT });
   const [githubForm, setGitHubForm] = useState<GitHubConfig>({ ...BLANK_GITHUB });
+  const [githubCaps, setGithubCaps] = useState<Record<string, boolean>>({});
+  const [jiraCaps, setJiraCaps] = useState<Record<string, boolean>>({});
   const [sonarqubeForm, setSonarQubeForm] = useState<SonarQubeConfig>({ ...BLANK_SONARQUBE });
   const [formError, setFormError] = useState<string | null>(null);
   const [expandedProvider, setExpandedProvider] = useState<IntegrationProvider | null>(null);
@@ -209,6 +211,9 @@ export function Integrations() {
     if (jiraRecord) {
       const cfg = jiraRecord.config as JiraConfig;
       setJiraForm({ baseUrl: cfg.baseUrl ?? "", email: cfg.email ?? "", apiToken: "", projectKey: cfg.projectKey ?? "" });
+      const effective = (jiraRecord as { effectiveAgentCapabilities?: Record<string, boolean> })
+        .effectiveAgentCapabilities;
+      if (effective) setJiraCaps(effective);
     }
   }, [jiraRecord?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -223,6 +228,9 @@ export function Integrations() {
     if (githubRecord) {
       const cfg = githubRecord.config as GitHubConfig;
       setGitHubForm({ baseUrl: cfg.baseUrl ?? "https://api.github.com", token: "", owner: cfg.owner ?? "", defaultRepo: cfg.defaultRepo ?? "" });
+      const effective = (githubRecord as { effectiveAgentCapabilities?: Record<string, boolean> })
+        .effectiveAgentCapabilities;
+      if (effective) setGithubCaps(effective);
     }
   }, [githubRecord?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -259,6 +267,12 @@ export function Integrations() {
 
   const testMutation = useMutation({
     mutationFn: (provider: IntegrationProvider) => integrationsApi.test(selectedCompanyId!, provider),
+  });
+
+  const capsMutation = useMutation({
+    mutationFn: ({ provider, caps }: { provider: IntegrationProvider; caps: Record<string, boolean> }) =>
+      integrationsApi.update(selectedCompanyId!, provider, { agentCapabilities: caps }),
+    onSuccess: invalidate,
   });
 
   function handleSave(provider: IntegrationProvider) {
@@ -454,9 +468,26 @@ export function Integrations() {
 
                     {/* Test result feedback */}
                     {testSuccess && (
-                      <div className="flex items-center gap-2 rounded-md bg-green-500/10 border border-green-500/20 px-3 py-2 text-xs text-green-700 dark:text-green-400">
-                        <Check className="h-3.5 w-3.5" />
-                        Connection verified successfully
+                      <div className="space-y-1.5">
+                        <div className="flex items-center gap-2 rounded-md bg-green-500/10 border border-green-500/20 px-3 py-2 text-xs text-green-700 dark:text-green-400">
+                          <Check className="h-3.5 w-3.5" />
+                          REST API connection verified successfully
+                        </div>
+                        {testMutation.data?.cli && (
+                          testMutation.data.cli.available && testMutation.data.cli.authenticated ? (
+                            <div className="flex items-center gap-2 rounded-md bg-green-500/10 border border-green-500/20 px-3 py-2 text-xs text-green-700 dark:text-green-400">
+                              <Check className="h-3.5 w-3.5" />
+                              gh CLI authenticated
+                              {testMutation.data.cli.login ? ` as ${testMutation.data.cli.login}` : ""}
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 px-3 py-2 text-xs text-yellow-700 dark:text-yellow-400">
+                              <X className="h-3.5 w-3.5" />
+                              {testMutation.data.cli.error ??
+                                "gh CLI unavailable — agent git/PR flows will fail on this host"}
+                            </div>
+                          )
+                        )}
                       </div>
                     )}
                     {testError && (
@@ -468,13 +499,52 @@ export function Integrations() {
 
                     {/* Provider-specific form */}
                     {meta.key === "jira" && (
-                      <JiraForm form={jiraForm} setForm={setJiraForm} connected={jiraConnected} />
+                      <>
+                        <JiraForm form={jiraForm} setForm={setJiraForm} connected={jiraConnected} />
+                        {jiraConnected && (
+                          <AgentCapabilitiesEditor
+                            title="Agent capabilities (Jira)"
+                            caps={jiraCaps}
+                            rows={[
+                              { key: "canRead", label: "Read issues & search the board" },
+                              { key: "canComment", label: "Comment on issues" },
+                              { key: "canTransition", label: "Transition issue status" },
+                              { key: "canCreateIssue", label: "Create issues" },
+                            ]}
+                            onChange={(key, value) => setJiraCaps((prev) => ({ ...prev, [key]: value }))}
+                            onSave={() => capsMutation.mutate({ provider: "jira", caps: jiraCaps })}
+                            saving={capsMutation.isPending}
+                          />
+                        )}
+                      </>
                     )}
                     {meta.key === "confluent" && (
                       <ConfluentForm form={confluentForm} setForm={setConfluentForm} connected={confluentConnected} />
                     )}
                     {meta.key === "github" && (
-                      <GitHubForm form={githubForm} setForm={setGitHubForm} connected={githubConnected} />
+                      <>
+                        <GitHubForm form={githubForm} setForm={setGitHubForm} connected={githubConnected} />
+                        {githubConnected && (
+                          <AgentCapabilitiesEditor
+                            title="Agent capabilities (GitHub)"
+                            caps={githubCaps}
+                            rows={[
+                              { key: "canRead", label: "Read repositories & pull requests" },
+                              { key: "canPush", label: "Push branches (git push)" },
+                              { key: "canRaisePr", label: "Raise pull requests (gh pr create)" },
+                              {
+                                key: "canMergePr",
+                                label: "Merge pull requests",
+                                caution:
+                                  "Enabling lets agents merge tracked, APPROVED PRs — the merge approval gate still applies.",
+                              },
+                            ]}
+                            onChange={(key, value) => setGithubCaps((prev) => ({ ...prev, [key]: value }))}
+                            onSave={() => capsMutation.mutate({ provider: "github", caps: githubCaps })}
+                            saving={capsMutation.isPending}
+                          />
+                        )}
+                      </>
                     )}
                     {meta.key === "sonarqube" && (
                       <SonarQubeForm form={sonarqubeForm} setForm={setSonarQubeForm} connected={sonarqubeConnected} />
@@ -550,6 +620,52 @@ export function Integrations() {
 }
 
 /* ── Agent capability row ───────────────────────────────────────────── */
+
+function AgentCapabilitiesEditor({
+  title,
+  caps,
+  rows,
+  onChange,
+  onSave,
+  saving,
+}: {
+  title: string;
+  caps: Record<string, boolean>;
+  rows: Array<{ key: string; label: string; caution?: string }>;
+  onChange: (key: string, value: boolean) => void;
+  onSave: () => void;
+  saving: boolean;
+}) {
+  return (
+    <div className="rounded-md border border-border/60 bg-muted/20 px-3 py-3 space-y-2">
+      <div className="text-xs font-medium text-muted-foreground">{title}</div>
+      <div className="space-y-1.5">
+        {rows.map((row) => (
+          <label key={row.key} className="flex items-start gap-2 text-xs cursor-pointer">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-3.5 w-3.5 accent-primary"
+              checked={caps[row.key] ?? false}
+              onChange={(event) => onChange(row.key, event.target.checked)}
+            />
+            <span>
+              {row.label}
+              {row.caution && caps[row.key] && (
+                <span className="block text-[11px] text-yellow-600 dark:text-yellow-400">{row.caution}</span>
+              )}
+            </span>
+          </label>
+        ))}
+      </div>
+      <div className="flex justify-end">
+        <Button size="xs" variant="secondary" onClick={onSave} disabled={saving}>
+          {saving && <Loader2 className="h-3 w-3 animate-spin" />}
+          Save capabilities
+        </Button>
+      </div>
+    </div>
+  );
+}
 
 function AgentCapability({ icon: Icon, text }: { icon: React.ComponentType<{ className?: string }>; text: string }) {
   return (

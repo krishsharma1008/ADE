@@ -13,6 +13,10 @@ import {
   githubCreateCommentSchema,
   sonarqubeListIssuesSchema,
   sonarqubeGetMetricsSchema,
+  resolveGithubAgentCapabilities,
+  resolveJiraAgentCapabilities,
+  type GithubAgentCapabilities,
+  type JiraAgentCapabilities,
   type JiraConfig,
   type ConfluentConfig,
   type GitHubConfig,
@@ -32,6 +36,7 @@ import { createJiraClient } from "../services/jira.js";
 import { createConfluentClient } from "../services/confluent.js";
 import { createGitHubClient } from "../services/github.js";
 import { createSonarQubeClient } from "../services/sonarqube.js";
+import { testGhCli } from "../services/github-cli.js";
 import { badRequest, forbidden, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
@@ -43,15 +48,16 @@ import { logger } from "../middleware/logger.js";
  * actors are unaffected — the user themselves can still edit the board through
  * the dashboard. The `operation` is the bare op name the policy classifies.
  */
-function assertJiraWriteAllowed(req: Request, operation: string) {
-  if (req.actor.type !== "agent") return; // only agents are read-only-restricted
-  if (!isJiraReadOnlyEnabled()) return; // operator opt-out
-  if (isJiraWriteOperation(operation)) {
-    throw forbidden(
-      `Jira is read-only for agents (COMBYNE_JIRA_AGENT_READONLY): '${operation}' is a board mutation. ` +
-        "Agents may read issues but must not edit the board directly.",
-    );
-  }
+// Capability-aware (WS-B): per-company config.agentCapabilities overrides the env
+// default in either direction; absent config preserves the env-driven behavior.
+const JIRA_OPERATION_CAPABILITY: Record<string, keyof JiraAgentCapabilities> = {
+  createJiraIssue: "canCreateIssue",
+  transitionJiraIssue: "canTransition",
+  addCommentToJiraIssue: "canComment",
+};
+
+function jiraCapabilityForOperation(operation: string): keyof JiraAgentCapabilities | null {
+  return JIRA_OPERATION_CAPABILITY[operation] ?? (isJiraWriteOperation(operation) ? "canCreateIssue" : null);
 }
 
 export function integrationRoutes(db: Db) {
@@ -60,6 +66,48 @@ export function integrationRoutes(db: Db) {
   const acceptedWork = acceptedWorkService(db);
   const issuePrs = issuePullRequestService(db);
   const heartbeat = heartbeatService(db);
+
+  /**
+   * Jira agent gate, capability-aware (WS-B). Defense-in-depth mirror of the
+   * adapter's MCP `--disallowedTools` gate. Board/user actors are unaffected.
+   * Effective capability = config.agentCapabilities override, else the env
+   * read-only default (COMBYNE_JIRA_AGENT_READONLY ⇒ writes off).
+   */
+  async function assertJiraWriteAllowed(req: Request, companyId: string, operation: string) {
+    if (req.actor.type !== "agent") return;
+    const capability = jiraCapabilityForOperation(operation);
+    if (!capability) return; // read operation
+    const row = await svc.getByProvider(companyId, "jira");
+    const caps = resolveJiraAgentCapabilities(
+      (row?.config as Record<string, unknown> | null) ?? null,
+      { envReadOnly: isJiraReadOnlyEnabled() },
+    );
+    if (!caps[capability]) {
+      throw forbidden(
+        `Jira capability '${capability}' is disabled for agents by company policy: ` +
+          `'${operation}' is a board mutation. Ask a board user or adjust Agent Capabilities in Integrations.`,
+      );
+    }
+  }
+
+  /** GitHub agent capability gate (WS-B). Board/user actors are unaffected. */
+  async function assertGithubAgentCapability(
+    req: Request,
+    companyId: string,
+    capability: keyof GithubAgentCapabilities,
+  ) {
+    if (req.actor.type !== "agent") return;
+    const row = await svc.getByProvider(companyId, "github");
+    const caps = resolveGithubAgentCapabilities(
+      (row?.config as Record<string, unknown> | null) ?? null,
+    );
+    if (!caps[capability]) {
+      throw forbidden(
+        `GitHub capability '${capability}' is disabled for agents by company policy. ` +
+          "Ask a board user or adjust Agent Capabilities in Integrations.",
+      );
+    }
+  }
 
   async function wakeAcceptedWorkManager(event: { id: string; managerAgentId: string | null }) {
     if (!event.managerAgentId) return;
@@ -159,6 +207,16 @@ export function integrationRoutes(db: Db) {
       if (req.body.config) {
         patch.config = req.body.config as Record<string, unknown>;
       }
+      // Capability toggles ride their own field so flipping a switch never
+      // requires re-entering secrets (the config union demands tokens) nor
+      // risks wiping the stored config.
+      if (req.body.agentCapabilities !== undefined) {
+        const baseConfig = patch.config ?? ((existing.config as Record<string, unknown>) ?? {});
+        patch.config = {
+          ...baseConfig,
+          agentCapabilities: req.body.agentCapabilities as Record<string, unknown>,
+        };
+      }
       const row = await svc.update(existing.id, patch);
 
       await logActivity(db, {
@@ -223,7 +281,11 @@ export function integrationRoutes(db: Db) {
     } else if (provider === "github") {
       const client = createGitHubClient(existing.config as unknown as GitHubConfig);
       const result = await client.testConnection();
-      res.json(result);
+      // Agents drive GitHub through the gh CLI on this host — report its state
+      // alongside the REST check so a valid token with a dead CLI isn't a
+      // false "all good". CLI problems are informational, never a test failure.
+      const cli = await testGhCli();
+      res.json({ ...result, cli });
     } else if (provider === "sonarqube") {
       const client = createSonarQubeClient(existing.config as unknown as SonarQubeConfig);
       const result = await client.testConnection();
@@ -279,9 +341,9 @@ export function integrationRoutes(db: Db) {
 
   router.post("/companies/:companyId/integrations/jira/issues", async (req, res) => {
     assertBoard(req);
-    assertJiraWriteAllowed(req, "createJiraIssue");
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    await assertJiraWriteAllowed(req, companyId, "createJiraIssue");
     const config = await requireJiraConfig(companyId);
     const client = createJiraClient(config);
     const { summary, description, issueType } = req.body;
@@ -305,10 +367,10 @@ export function integrationRoutes(db: Db) {
     "/companies/:companyId/integrations/jira/issues/:issueKey/transition",
     async (req, res) => {
       assertBoard(req);
-      assertJiraWriteAllowed(req, "transitionJiraIssue");
       const companyId = req.params.companyId as string;
       const issueKey = req.params.issueKey as string;
       assertCompanyAccess(req, companyId);
+      await assertJiraWriteAllowed(req, companyId, "transitionJiraIssue");
       const config = await requireJiraConfig(companyId);
       const client = createJiraClient(config);
       const { status } = req.body;
@@ -322,10 +384,10 @@ export function integrationRoutes(db: Db) {
     "/companies/:companyId/integrations/jira/issues/:issueKey/comment",
     async (req, res) => {
       assertBoard(req);
-      assertJiraWriteAllowed(req, "addCommentToJiraIssue");
       const companyId = req.params.companyId as string;
       const issueKey = req.params.issueKey as string;
       assertCompanyAccess(req, companyId);
+      await assertJiraWriteAllowed(req, companyId, "addCommentToJiraIssue");
       const config = await requireJiraConfig(companyId);
       const client = createJiraClient(config);
       const { body } = req.body;
@@ -448,6 +510,7 @@ export function integrationRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const repo = req.params.repo as string;
       assertCompanyAccess(req, companyId);
+      await assertGithubAgentCapability(req, companyId, "canPush");
       const parsed = githubCreateBranchSchema.parse({ ...req.body, repo });
       const config = await requireGitHubConfig(companyId);
       const client = createGitHubClient(config);
@@ -504,6 +567,7 @@ export function integrationRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const repo = req.params.repo as string;
       assertCompanyAccess(req, companyId);
+      await assertGithubAgentCapability(req, companyId, "canRaisePr");
       const parsed = githubCreatePRSchema.parse({ ...req.body, repo });
       const config = await requireGitHubConfig(companyId);
       const client = createGitHubClient(config);
@@ -549,6 +613,8 @@ export function integrationRoutes(db: Db) {
       const repo = req.params.repo as string;
       const pullNumber = Number(req.params.pullNumber);
       assertCompanyAccess(req, companyId);
+      // Capability gate on top of (never instead of) the tracked-PR + approval gate.
+      await assertGithubAgentCapability(req, companyId, "canMergePr");
       const parsed = githubMergePRSchema.parse({ ...req.body, repo, pullNumber });
       if (!parsed.issueId) {
         throw unprocessable("Use the PR panel merge flow with a linked issue and merge_pr approval");
@@ -812,5 +878,17 @@ function redactSecrets(row: Record<string, unknown>) {
       redacted[key] = val.length > 4 ? `${"*".repeat(val.length - 4)}${val.slice(-4)}` : "****";
     }
   }
-  return { ...row, config: redacted };
+  // WS-B: hand the UI the RESOLVED capability set (config overrides + defaults)
+  // so the toggles render the policy actually in force, not just stored bits.
+  let effectiveAgentCapabilities: Record<string, boolean> | undefined;
+  if (row.provider === "github") {
+    effectiveAgentCapabilities = { ...resolveGithubAgentCapabilities(config) };
+  } else if (row.provider === "jira") {
+    effectiveAgentCapabilities = {
+      ...resolveJiraAgentCapabilities(config, { envReadOnly: isJiraReadOnlyEnabled() }),
+    };
+  }
+  return effectiveAgentCapabilities
+    ? { ...row, config: redacted, effectiveAgentCapabilities }
+    : { ...row, config: redacted };
 }

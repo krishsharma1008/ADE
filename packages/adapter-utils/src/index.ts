@@ -29,3 +29,12 @@ export type {
   CLIAdapterModule,
   CreateConfigValues,
 } from "./types.js";
+
+export {
+  buildCommandGuardDir,
+  readCommandGuardCapabilitiesFromEnv,
+  commandGuardEnvFromCapabilities,
+  renderCommandGuardScript,
+  COMMAND_GUARD_ENV_KEYS,
+  type CommandGuardCapabilities,
+} from "./command-guard.js";

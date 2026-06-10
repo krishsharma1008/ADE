@@ -26,7 +26,11 @@ export const integrationsApi = {
   update: (
     companyId: string,
     provider: IntegrationProvider,
-    data: { enabled?: boolean; config?: Record<string, unknown> },
+    data: {
+      enabled?: boolean;
+      config?: Record<string, unknown>;
+      agentCapabilities?: Record<string, boolean>;
+    },
   ) =>
     api.patch<IntegrationRecord>(
       `/companies/${companyId}/integrations/${provider}`,
@@ -49,8 +53,14 @@ export const integrationsApi = {
   },
 
   test: (companyId: string, provider: IntegrationProvider) =>
-    api.post<{ ok: boolean; error?: string }>(
-      `/companies/${companyId}/integrations/${provider}/test`,
-      {},
-    ),
+    api.post<{
+      ok: boolean;
+      error?: string;
+      cli?: {
+        available: boolean;
+        authenticated: boolean;
+        login: string | null;
+        error: string | null;
+      };
+    }>(`/companies/${companyId}/integrations/${provider}/test`, {}),
 };
