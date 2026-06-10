@@ -33,7 +33,7 @@ import { contextTrace } from "./services/context-trace.js"; // CONTEXT-TRACE
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { setupTerminalWebSocketServer } from "./realtime/terminal-ws.js";
-import { heartbeatService, issueService, routineService } from "./services/index.js";
+import { heartbeatService, issuePullRequestService, issueService, routineService } from "./services/index.js";
 import { SummarizerQueue, setSummarizerQueue } from "./services/summarizer-queue.js";
 import { makeAnthropicSummarizerDriver } from "./services/summarizer-driver-anthropic.js";
 import { createPersonasRouter } from "./routes/personas.js";
@@ -905,6 +905,12 @@ export async function startServer(): Promise<StartedServer> {
     let contextOutboxDrainInFlight = false;
     let attachmentDrainInFlight = false;
 
+    // F13 external-merge sweep state (see the tick block below).
+    const PR_SWEEP_INTERVAL_MS = Number(process.env.COMBYNE_PR_SWEEP_INTERVAL_MS) || 5 * 60 * 1000;
+    let lastPrSweepAt = 0;
+    let prSweepInFlight = false;
+    const issuePullRequestsSvc = issuePullRequestService(db);
+
     // Context-rail keepalive: when a SEPARATE context DB is configured, ping it on a
     // short cadence to keep at least one pooled connection WARM. A Cloud SQL public
     // IP across a high-latency/lossy link can take many seconds to TLS-handshake, so
@@ -1016,6 +1022,44 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "awaiting_user sweeper tick failed");
+          });
+      }
+
+      // F13 (e2e-run-2026-06-10 #13): detect EXTERNAL (GitHub-direct) merges. PR
+      // reconciliation used to run only inside wake dispatch, so with no agent wakes
+      // an out-of-band merge left tracking open/pending and the issue in_review
+      // forever. Sweep open tracked PRs per active company on a slow cadence;
+      // reconcile() performs the full close-out (tracking row -> issue done ->
+      // approvals resolved -> pr-approval memory -> EM wake). In-flight guarded so a
+      // slow GitHub round-trip never overlaps the next tick.
+      if (!prSweepInFlight && now - lastPrSweepAt >= PR_SWEEP_INTERVAL_MS) {
+        lastPrSweepAt = now;
+        prSweepInFlight = true;
+        void (async () => {
+          const activeCompanies = await db
+            .select({ id: companies.id })
+            .from(companies)
+            .where(eq(companies.status, "active"));
+          for (const company of activeCompanies) {
+            try {
+              const result = await issuePullRequestsSvc.reconcileOpenTrackedPrs(company.id);
+              if (result.merged > 0) {
+                logger.info(
+                  { companyId: company.id, ...result },
+                  "pr sweep detected externally merged PRs",
+                );
+              }
+              await issuePullRequestsSvc.maybeDispatchFeedbackForCompany(company.id);
+            } catch (err) {
+              logger.debug({ err, companyId: company.id }, "pr sweep failed for company");
+            }
+          }
+        })()
+          .catch((err) => {
+            logger.error({ err }, "pr sweep tick failed");
+          })
+          .finally(() => {
+            prSweepInFlight = false;
           });
       }
 

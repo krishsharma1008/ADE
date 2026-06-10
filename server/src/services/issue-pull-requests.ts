@@ -183,7 +183,14 @@ function blockersFor(input: {
   if (input.expectedHeadSha && input.headSha && input.expectedHeadSha !== input.headSha) {
     blockers.push("PR head changed since merge approval was prepared");
   }
-  if (input.ciStatus !== "passed") blockers.push(`CI checks are ${input.ciStatus}`);
+  // "unknown" means the repo reported ZERO check runs (statusFromChecks) — i.e. no CI
+  // is configured at all, common on mirrors/small repos. By default that still blocks;
+  // operators can opt out so CI-less repos remain dashboard-mergeable.
+  const allowUnknownCi =
+    String(process.env.COMBYNE_GITHUB_MERGE_ALLOW_UNKNOWN_CI ?? "").trim().toLowerCase() === "true";
+  if (input.ciStatus !== "passed" && !(allowUnknownCi && input.ciStatus === "unknown")) {
+    blockers.push(`CI checks are ${input.ciStatus}`);
+  }
   if (input.reviewStatus === "changes_requested") blockers.push("Review changes are still requested");
   if (input.qualityStatus !== "not_configured" && input.qualityStatus !== "passed") {
     blockers.push(`Quality gate is ${input.qualityStatus}`);
@@ -281,6 +288,33 @@ export function issuePullRequestService(db: Db) {
         .catch((err) =>
           logger.debug({ err, approvalId: row.approvalId }, "issue_pr.external_merge_approval_resolve_skipped"),
         );
+    }
+    // F14 (e2e-run-2026-06-10 #14): older tracking rows (or re-tracked PRs) can have
+    // dangling merge_pr approvals that are NOT row.approvalId — batch-resolve every
+    // still-actionable merge_pr approval linked to this issue so the "PR ready —
+    // open & merge" cards can't outlive the merge. Idempotent: approve() rejects
+    // already-terminal approvals and we swallow per-row.
+    await resolveDanglingMergeApprovalsForIssue(row.companyId, row.issueId);
+  }
+
+  async function resolveDanglingMergeApprovalsForIssue(companyId: string, issueId: string) {
+    try {
+      const linked = await db
+        .select({ id: approvals.id, status: approvals.status, type: approvals.type })
+        .from(issueApprovals)
+        .innerJoin(approvals, eq(approvals.id, issueApprovals.approvalId))
+        .where(and(eq(issueApprovals.issueId, issueId), eq(issueApprovals.companyId, companyId)));
+      for (const approval of linked) {
+        if (approval.type !== "merge_pr") continue;
+        if (approval.status !== "pending" && approval.status !== "revision_requested") continue;
+        await approvalsSvc
+          .approve(approval.id, "issue-pr-reconcile", "Auto-resolved: PR merged")
+          .catch((err) =>
+            logger.debug({ err, approvalId: approval.id }, "issue_pr.dangling_merge_approval_resolve_skipped"),
+          );
+      }
+    } catch (err) {
+      logger.debug({ err, issueId }, "issue_pr.dangling_merge_approval_scan_failed");
     }
   }
 
@@ -818,6 +852,70 @@ export function issuePullRequestService(db: Db) {
     return { scanned, sent, woken, sweptMerged: swept.scanned, closedMerged: swept.closed };
   }
 
+  // F13/F1 (e2e-run-2026-06-10 #13, #1): PR reconciliation previously ran only inside
+  // wake dispatch, so with no agent wakes an external (GitHub-direct) merge was never
+  // detected — tracking stayed open/pending, the issue sat in_review forever, and no
+  // pr-approval memory was captured. This sweep reconciles open tracked PRs from the
+  // scheduler tick. reconcile() already performs the full merge close-out chain.
+  // Cost cap: reconcile() is ~3 GitHub calls per PR — bounded by `limit`, oldest
+  // lastReconciledAt first; per-row soft-fail so one bad PR can't stall the rest.
+  async function reconcileOpenTrackedPrs(
+    companyId: string,
+    opts: { limit?: number } = {},
+  ): Promise<{ scanned: number; merged: number }> {
+    const limit = Math.min(Math.max(opts.limit ?? 20, 1), 50);
+    const rows = await db
+      .select({ id: issuePullRequests.id, issueId: issuePullRequests.issueId })
+      .from(issuePullRequests)
+      .innerJoin(issues, eq(issues.id, issuePullRequests.issueId))
+      .where(
+        and(
+          eq(issuePullRequests.companyId, companyId),
+          ne(issuePullRequests.mergeStatus, "merged"),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(asc(issuePullRequests.lastReconciledAt))
+      .limit(limit);
+
+    let merged = 0;
+    for (const row of rows) {
+      try {
+        const status = await reconcile(row.id);
+        const reconciled = status.pullRequest as unknown as typeof issuePullRequests.$inferSelect;
+        if (reconciled.mergeStatus === "merged") merged += 1;
+      } catch (err) {
+        logger.debug({ err, issuePullRequestId: row.id }, "issue_pr.sweep_reconcile_failed");
+      }
+    }
+
+    // Backfill (one-time per row, cheap): merged tracking rows from BEFORE the
+    // batch-resolve existed can still have actionable merge_pr approval cards.
+    try {
+      const mergedRows = await db
+        .select({ issueId: issuePullRequests.issueId })
+        .from(issuePullRequests)
+        .innerJoin(issueApprovals, eq(issueApprovals.issueId, issuePullRequests.issueId))
+        .innerJoin(approvals, eq(approvals.id, issueApprovals.approvalId))
+        .where(
+          and(
+            eq(issuePullRequests.companyId, companyId),
+            eq(issuePullRequests.mergeStatus, "merged"),
+            eq(approvals.type, "merge_pr"),
+            notInArray(approvals.status, ["approved", "rejected"]),
+          ),
+        )
+        .limit(20);
+      for (const row of new Set(mergedRows.map((r) => r.issueId))) {
+        await resolveDanglingMergeApprovalsForIssue(companyId, row);
+      }
+    } catch (err) {
+      logger.debug({ err, companyId }, "issue_pr.stale_merge_approval_backfill_failed");
+    }
+
+    return { scanned: rows.length, merged };
+  }
+
   async function maybeDispatchFeedbackForCompany(companyId: string) {
     const last = prFeedbackReconcileThrottle.get(companyId) ?? 0;
     if (Date.now() - last < PR_FEEDBACK_RECONCILE_INTERVAL_MS) {
@@ -1048,6 +1146,7 @@ export function issuePullRequestService(db: Db) {
     setFeedbackOptIn,
     dispatchFeedbackForCompany,
     maybeDispatchFeedbackForCompany,
+    reconcileOpenTrackedPrs,
     sweepMergedOpenIssues,
     merge,
   };
