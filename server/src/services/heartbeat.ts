@@ -44,6 +44,9 @@ import {
   type SufficiencyResult,
 } from "./memory-sufficiency.js";
 import { evaluateAskBudget } from "./sufficiency-budget.js";
+import { createGitHubClient } from "./github.js";
+import { integrationService } from "./integrations.js";
+import { parseRemoteSlug } from "./push-remote-allowlist.js";
 import { routeAgentQuestionsToManager } from "./agent-question-routing.js";
 import type { IssueComplexity, MemoryEntry, MemoryQueryResult } from "@combyne/shared";
 import { buildBootstrapPreamble, detectBootstrapAnalysis } from "./agent-bootstrap.js";
@@ -892,6 +895,52 @@ export async function pauseIssueForIntegrationAuth(
   };
 }
 
+/**
+ * F9 cross-check: look for an OPEN GitHub PR whose head branch carries the issue
+ * identifier (branch convention `feat/<identifier>/<desc>`), excluding PRs already
+ * tracked for the company. Returns null on any miss/misconfiguration — callers
+ * fall back to the no-artifact advisory.
+ */
+async function findUntrackedOpenPullRequest(
+  db: Db,
+  input: { companyId: string; repoUrl: string; issueIdentifier: string },
+) {
+  const slug = parseRemoteSlug(input.repoUrl);
+  if (!slug) return null;
+  const repo = `${slug.owner}/${slug.repo}`;
+  const integration = await integrationService(db).getByProvider(input.companyId, "github");
+  if (!integration || integration.enabled !== "true") return null;
+  const github = createGitHubClient(integration.config as never);
+  const openPrs = await github.listPullRequests(repo, "open");
+  const needle = input.issueIdentifier.toLowerCase();
+  const pr = openPrs.find((candidate) => candidate.headBranch?.toLowerCase().includes(needle));
+  if (!pr) {
+    // Branch pushed but no PR opened yet: not an artifact we can track, but worth a
+    // sharper advisory than "nothing found" so the re-run knows to just open the PR.
+    try {
+      const branches = await github.listBranches(repo);
+      const branch = branches.find((candidate) => candidate.name.toLowerCase().includes(needle));
+      if (branch) return { repo, pr: null, branch: branch.name };
+    } catch {
+      // best-effort only
+    }
+    return null;
+  }
+  const [alreadyTracked] = await db
+    .select({ id: issuePullRequests.id })
+    .from(issuePullRequests)
+    .where(
+      and(
+        eq(issuePullRequests.companyId, input.companyId),
+        eq(issuePullRequests.repo, repo),
+        eq(issuePullRequests.pullNumber, pr.number),
+      ),
+    )
+    .limit(1);
+  if (alreadyTracked) return null;
+  return { repo, pr };
+}
+
 export async function autoCloseIssueAfterSuccessfulRun(
   db: Db,
   input: {
@@ -905,6 +954,8 @@ export async function autoCloseIssueAfterSuccessfulRun(
     summary?: string | null;
     changedFiles?: string[];
     checks?: string[];
+    /** Workspace repo URL — enables the F9 GitHub cross-check for untracked PRs. */
+    repoUrl?: string | null;
   },
 ): Promise<{ closed: boolean; reason: string }> {
   const issue = await db
@@ -912,6 +963,7 @@ export async function autoCloseIssueAfterSuccessfulRun(
       id: issues.id,
       companyId: issues.companyId,
       title: issues.title,
+      identifier: issues.identifier,
       status: issues.status,
       complexity: issues.complexity,
       originKind: issues.originKind,
@@ -1027,12 +1079,67 @@ export async function autoCloseIssueAfterSuccessfulRun(
           )
           .limit(1)
           .then((rows) => rows[0] ?? null);
-    const artifactPresent = hasChangedFiles || Boolean(trackedPullRequest);
+    let artifactPresent = hasChangedFiles || Boolean(trackedPullRequest);
+    // F9 (e2e-run-2026-06-10 #9): self-reported signals miss real work — Backend-1's
+    // first run pushed a branch AND opened a PR but exited before tracking it, and
+    // this gate flagged the run as artifact-less, triggering a wasteful re-run loop.
+    // Cross-check GitHub for an open PR whose head branch carries the issue
+    // identifier; when found, auto-track it through the normal upsert (creating the
+    // merge-approval flow) and treat the artifact as present. Best-effort: any
+    // failure falls through to the existing awaiting_user advisory.
+    let pushedBranchAdvisory: string | null = null;
+    if (!artifactPresent && issue.identifier && input.repoUrl) {
+      try {
+        const untracked = await findUntrackedOpenPullRequest(db, {
+          companyId: issue.companyId,
+          repoUrl: input.repoUrl,
+          issueIdentifier: issue.identifier,
+        });
+        if (untracked && !untracked.pr && untracked.branch) {
+          pushedBranchAdvisory =
+            ` Note: branch \`${untracked.branch}\` exists on ${untracked.repo} — ` +
+            `open a PR for it (and track it) instead of re-implementing.`;
+        }
+        if (untracked?.pr) {
+          const { issuePullRequestService } = await import("./issue-pull-requests.js");
+          await issuePullRequestService(db).upsertForIssue({
+            companyId: issue.companyId,
+            issueId: issue.id,
+            requestedByAgentId: input.agentId,
+            repo: untracked.repo,
+            pullNumber: untracked.pr.number,
+            pullUrl: untracked.pr.htmlUrl,
+            title: untracked.pr.title,
+            baseBranch: untracked.pr.baseBranch,
+            headBranch: untracked.pr.headBranch,
+            headSha: untracked.pr.headSha,
+            mergeMethod: "squash",
+          });
+          await db.insert(issueComments).values({
+            companyId: issue.companyId,
+            issueId: issue.id,
+            authorAgentId: null,
+            authorUserId: null,
+            body:
+              `Found untracked open PR ${untracked.repo}#${untracked.pr.number} ` +
+              `(head \`${untracked.pr.headBranch}\`) for this issue — auto-tracked it.`,
+            kind: "system",
+          });
+          artifactPresent = true;
+        }
+      } catch (err) {
+        logger.debug(
+          { err, issueId: issue.id },
+          "artifact cross-check failed; falling back to no-artifact advisory",
+        );
+      }
+    }
     if (!artifactPresent) {
       const advisory =
         "Run completed but produced no verifiable artifact — no pull request was opened and no changed " +
         "files were reported for this code ticket. Re-run with the work committed (a PR or a non-empty " +
-        "change set) or close this issue manually if no code change is expected.";
+        "change set) or close this issue manually if no code change is expected." +
+        (pushedBranchAdvisory ?? "");
       await db.insert(issueComments).values({
         companyId: issue.companyId,
         issueId: issue.id,
@@ -6535,6 +6642,7 @@ export function heartbeatService(db: Db) {
               summary: completion.summary,
               changedFiles: completion.changedFiles,
               checks: completion.checks,
+              repoUrl: resolvedWorkspace.repoUrl ?? null,
             }).catch((err) => {
               logger.debug(
                 { err, runId: finalizedRun.id, issueId: runIssueId },
