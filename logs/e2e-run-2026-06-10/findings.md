@@ -65,3 +65,6 @@ The deployment uses one PAT for both agent pushes and board actions, and GitHub 
 
 ## Finding #20 — Stale "error" status badge during an actively-running agent (user-reported, round 2)
 Backend-1's status stayed "error" (set when the hot-reload orphaned its runs) for minutes while a new run was visibly executing — run-start does not clear a stale error status; a later checkpoint eventually flips it to running. Operator-facing confusion: the header badge says error while Live Run shows running. Fix (queued for the post-round batch with #15): clear/replace agent.status=error when a run actually starts executing for that agent.
+
+## Finding #21 — Merge allowed while the agent is actively revising the PR (user-designed probe, round 2)
+User merged PR #4 mid-fix (agent woken by review feedback, fix run in flight). Result: the merge shipped WITHOUT the requested fix — staging lacks the restored global handlers; the agent's subsequent push dangles on a merged branch. Fix (user's rule, queued): while the tracked issue is in_progress with an active assignee run post-feedback, reconcile adds an "agent actively revising" blocker (mergeStatus leaves ready, dashboard button disables); cleared when the issue returns to in_review via an updated push OR an explicit no-change-needed comment.
