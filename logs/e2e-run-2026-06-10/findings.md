@@ -71,3 +71,9 @@ User merged PR #4 mid-fix (agent woken by review feedback, fix run in flight). R
 
 ## Finding #22 — Dashboard agents strip showed "No recent agent runs" during a live run (user-reported, round 2)
 ActiveAgentsPanel's live-runs query had no refetchInterval and depended solely on websocket invalidation; after navigation the WS can be mid-reconnect, leaving stale "no runs" while the sidebar showed 1 live. Fixed: 5s poll (issue-page tier).
+
+## Finding #23 — Issue auto-closed while its follow-up fix PR was still open (round 2)
+PINB405-20 flipped in_review→done at 16:51 while tracked PR #5 (the stranded-fix follow-up) was OPEN and ready. The B3 open-sibling guard protects closeMergedTrackedIssue, but at least one close path bypassed it — and the status transition wrote NO activity-log entry, making attribution impossible. Fix batch items: (a) move the open-sibling guard into issuesSvc.update for system-actor done-transitions on issues with open tracked PRs (single chokepoint instead of per-path), (b) log an activity entry for every system-driven status transition.
+
+## Finding #24 — Cross-DB FK violation: accepted_work_events.memory_entry_id references local memory_entries while entries live on the central DB (round 2)
+PostgresError 23503 at ~16:51: insert on accepted_work_events failed because memory_entry_id (created on the SHARED context DB) is not present in the LOCAL ops-DB memory_entries table the FK points to. In split-DB mode this FK can never hold for centrally-stored entries. Fix: drop the FK (keep the column as a soft reference) or validate existence app-side against the active memory rail.
