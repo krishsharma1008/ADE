@@ -204,6 +204,10 @@ export function ActiveAgentsPanel({ companyId }: ActiveAgentsPanelProps) {
   const { data: liveRuns } = useQuery({
     queryKey: [...queryKeys.liveRuns(companyId), "dashboard"],
     queryFn: () => heartbeatsApi.liveRunsForCompany(companyId, MIN_DASHBOARD_RUNS),
+    // Poll: websocket invalidation alone left the strip showing "No recent agent
+    // runs" while an agent was visibly live (round-2 finding #22) — the WS can be
+    // mid-reconnect after navigation. 5s matches the issue-page polling tier.
+    refetchInterval: 5000,
   });
 
   const runs = liveRuns ?? [];

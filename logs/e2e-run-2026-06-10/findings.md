@@ -68,3 +68,6 @@ Backend-1's status stayed "error" (set when the hot-reload orphaned its runs) fo
 
 ## Finding #21 — Merge allowed while the agent is actively revising the PR (user-designed probe, round 2)
 User merged PR #4 mid-fix (agent woken by review feedback, fix run in flight). Result: the merge shipped WITHOUT the requested fix — staging lacks the restored global handlers; the agent's subsequent push dangles on a merged branch. Fix (user's rule, queued): while the tracked issue is in_progress with an active assignee run post-feedback, reconcile adds an "agent actively revising" blocker (mergeStatus leaves ready, dashboard button disables); cleared when the issue returns to in_review via an updated push OR an explicit no-change-needed comment.
+
+## Finding #22 — Dashboard agents strip showed "No recent agent runs" during a live run (user-reported, round 2)
+ActiveAgentsPanel's live-runs query had no refetchInterval and depended solely on websocket invalidation; after navigation the WS can be mid-reconnect, leaving stale "no runs" while the sidebar showed 1 live. Fixed: 5s poll (issue-page tier).
