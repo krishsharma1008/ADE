@@ -1428,13 +1428,12 @@ export function IssueDetail() {
                 ? metadata.blockers.filter((value): value is string => typeof value === "string")
                 : [];
               const awaitingHuman = pr.feedbackStatus === "awaiting_human";
-              const canMerge =
-                pr.mergeStatus === "ready" &&
-                pr.ciStatus === "passed" &&
-                pr.reviewStatus !== "changes_requested" &&
-                (pr.qualityStatus === "passed" || pr.qualityStatus === "not_configured") &&
-                !!pr.approvalId &&
-                !!pr.headSha;
+              // mergeStatus === "ready" IS the server's full blocker verdict (base-branch
+              // allowlist, CI policy incl. the unknown-CI opt-out, reviews, quality gate).
+              // Re-deriving gates here permanently disabled the button on CI-less repos
+              // (ciStatus stays "unknown" forever) and forced out-of-band GitHub merges.
+              // The merge endpoint re-validates server-side regardless (422 on blockers).
+              const canMerge = pr.mergeStatus === "ready" && !!pr.approvalId && !!pr.headSha;
               const isWorking =
                 reconcilePr.variables === pr.id ||
                 feedbackOptIn.variables?.id === pr.id ||

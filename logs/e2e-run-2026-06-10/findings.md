@@ -47,3 +47,6 @@ Screenshot 12:06: "Approvals needing action" still shows "PR ready — open & me
 
 ## Finding #15 — Server restart orphans queued/in-flight agent runs without auto-requeue (round 2)
 A tsx-watch hot reload mid-round marked both in-flight Backend-1 runs interrupted_recoverable ("Process lost — server may have restarted"); the QUEUED run (T2) never started and nothing requeued it — the issue sat in_progress with no run until a manual wake. Fix candidate: on boot (or in the orphan reaper), requeue interrupted_recoverable runs / re-wake their agents. Operational lesson recorded: don't hot-edit server code while agent runs are in flight.
+
+## Finding #16 — Dashboard merge button permanently disabled on CI-less repos (user-reported, round 2)
+IssueDetail's canMerge re-derived the merge gates client-side and required ciStatus==="passed" — on repos with no CI, ciStatus is forever "unknown", so the Merge button never enabled even when the server's mergeStatus was "ready" (zero blockers). This is what forced the human to merge on GitHub in BOTH rounds (compounding F13). Fixed: the UI now trusts the server verdict (mergeStatus==="ready" + approvalId + headSha); merge() re-validates server-side regardless.
