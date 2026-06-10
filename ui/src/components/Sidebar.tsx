@@ -96,7 +96,14 @@ export function Sidebar() {
         </div>
 
         <SidebarSection label="Work">
-          <SidebarNavItem to="/issues" label="Issues" icon={CircleDot} />
+          <SidebarNavItem
+            to="/issues"
+            label="Issues"
+            icon={CircleDot}
+            badge={sidebarBadges?.awaitingUser || undefined}
+            badgeTone={(sidebarBadges?.awaitingUser ?? 0) > 0 ? "danger" : "default"}
+            alert={(sidebarBadges?.awaitingUser ?? 0) > 0}
+          />
           <SidebarNavItem to="/qa" label="QA" icon={FlaskConical} />
           <SidebarNavItem to="/goals" label="Goals" icon={Target} />
           <SidebarNavItem to="/routines" label="Routines" icon={RefreshCw} />

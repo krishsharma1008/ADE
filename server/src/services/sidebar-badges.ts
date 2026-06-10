@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
-import { agents, approvals, heartbeatRuns } from "@combyne/db";
+import { agents, approvals, heartbeatRuns, issues } from "@combyne/db";
 import type { SidebarBadges } from "@combyne/shared";
 
 const ACTIONABLE_APPROVAL_STATUSES = ["pending", "revision_requested"];
@@ -42,14 +42,23 @@ export function sidebarBadgeService(db: Db) {
         FAILED_HEARTBEAT_STATUSES.includes(row.runStatus),
       ).length;
 
+      // F10 (e2e-run-2026-06-10 #10): issues waiting on a human answer were invisible
+      // at the notification level — surface them as their own badge and in the inbox sum.
+      const awaitingUser = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.status, "awaiting_user")))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+
       const joinRequests = extra?.joinRequests ?? 0;
       const unreadTouchedIssues = extra?.unreadTouchedIssues ?? 0;
       const memory = extra?.memory ?? 0;
       return {
-        inbox: actionableApprovals + failedRuns + joinRequests + unreadTouchedIssues,
+        inbox: actionableApprovals + failedRuns + joinRequests + unreadTouchedIssues + awaitingUser,
         approvals: actionableApprovals,
         failedRuns,
         joinRequests,
+        awaitingUser,
         memory,
       };
     },
