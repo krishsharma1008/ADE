@@ -35,3 +35,12 @@ Tests added: pr-merge-sweep.test.ts +3 (closed-unmerged, multi-PR guard, durable
 7. **Direct human unblock doesn't wake assignee** (A10): PATCH status blocked→in_progress by a user relies on the agent's next scheduled wake.
 8. **Re-embed backlog warning** (C7): warn before enabling ANN if >10% of entries await re-embedding.
 9. **Live cleanup**: correct/retract stale verified memory entry `d3ac602c` (and the PINB405-9-era notes citing "staging not merge-allowed") via the board memory edit API — scheduled for the round-2 live session.
+
+## WS-D QA sweep (2026-06-10 afternoon, post-WS-A/B/C build)
+
+Swept 17 app pages + all 9 memory tabs on :3100 via the browse daemon.
+- **Console**: zero errors at rest on every page. Only artifact: benign "WebSocket closed before connection established" warnings during rapid page-to-page navigation (teardown of the in-flight live-updates socket; zero recurrence during 20s dwell). Cosmetic.
+- **Integrations (WS-B live)**: capability checkboxes seed from effective values (read/push/raise ✓, merge ✗), Test shows "REST API verified" + "gh CLI authenticated as krish-buku", save round-trip persists toggles with the stored token untouched, defaults restorable.
+- **Model catalog (WS-A live)**: claude_local dropdown serves the new lineup, Fable 5 first.
+- **Memory live eval (WS-C checklist)**: all tabs load clean; Confirm→verified→leaves-inbox cross-tab consistency verified; **corrected all 4 stale verified pr-approval entries** (frozen blocker text from the since-fixed capture bug; bodies now record only the durable decision with a correction note); drained the capture inbox (5 confirms); resolved the 4 pending accepted-work events as "ignored" (their pr-approval memory already exists — creating more would duplicate).
+- **Ops finding during sweep**: an orphaned older server held :3100 while the fresh stack silently bound :3101 — the UI was serving STALE code (looked like the new features were broken). Killed the orphan, restarted one stack. Lesson for the setup guide: the server logs "Requested port is busy; using next free port" — check for it after restarts.
