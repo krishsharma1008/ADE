@@ -22,6 +22,19 @@ describe("adapter model listing", () => {
     expect(models).toEqual([]);
   });
 
+  it("claude_local exposes the current model lineup (CLI-verified ids)", async () => {
+    const models = await listAdapterModels("claude_local");
+    const ids = models.map((m) => m.id);
+    expect(ids).toContain("claude-fable-5");
+    expect(ids).toContain("claude-opus-4-8");
+    expect(ids).toContain("claude-sonnet-4-6");
+    expect(ids).toContain("claude-haiku-4-5-20251001");
+    // claude-haiku-4-6 never existed — the claude CLI rejects it.
+    expect(ids).not.toContain("claude-haiku-4-6");
+    // Newest first so the dropdown leads with the current generation.
+    expect(ids[0]).toBe("claude-fable-5");
+  });
+
   it("returns codex fallback models when no OpenAI key is available", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     const models = await listAdapterModels("codex_local");
