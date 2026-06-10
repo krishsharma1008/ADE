@@ -53,3 +53,9 @@ IssueDetail's canMerge re-derived the merge gates client-side and required ciSta
 
 ## Finding #17 — "Run needs review" banner without an actionable question (user-reported, round 2)
 When a child hits in_review, the EM's parent follow-up can park the parent in awaiting_user with a SYSTEM digest (no structured question). The UI banner then reads "No clear question was captured…" — technically true, but it gives the operator nothing to act on and reads as if the agent is stuck. Fix candidates: (a) don't park the parent in awaiting_user for the child-in-review checkpoint when there is no question (keep in_progress + comment); (b) banner copy should say what actually happens next ("agent will resume automatically after the child resolves").
+
+## Finding #18 — Delegation is not idempotent: EM retry created duplicate subtasks (round 2)
+T3 delegation produced PINB405-19 AND PINB405-20 — identical title/assignee/parent ~20s apart (a retried delegate call after a slow/ambiguous first response). Both woke the engineer; board cancelled one manually. Fix: idempotency on the delegate endpoint (e.g. reject/return-existing when an open subtask with the same parentId+title+assignee exists, or accept an Idempotency-Key from the EM skill flow).
+
+## Round-2 recall observation (T3)
+The PINB405-20 packet carried Pefindo + the two bnpl pattern entries but NOT the repayment-intent human answer — the EM's subtask rewrite dropped the repayment-intent vocabulary, so ranking was fair on the actual query text. The curated-pin path (EM pinning a known-critical entry) is the designed remedy; noted as corpus/usage guidance rather than a logic bug. Both earlier probes (T1 post-fix, T2) recalled their target entries correctly.
