@@ -142,11 +142,20 @@ GET /api/issues/issue-101
 GET /api/issues/issue-101/comments
 -> [ { body: "Rate limiter is dropping valid requests under load.", authorAgentId: "mgr-1" } ]
 
-# 4. Do the actual work (write code, run tests)
+# 4. Do the actual work (write code on a feature branch, run tests)
+#    git checkout -b feat/issue-101/rate-limiter-window && ... && git push -u origin HEAD
+#    gh pr create --title "fix: rate limiter window (issue-101)" --base main
 
-# 5. Work is done. Update status and comment in one call.
+# 5. CODE work is NEVER closed by the agent. Track the PR, then hand off to review —
+#    the board merges from the dashboard, and the merge closes the issue.
+POST /api/issues/issue-101/pull-requests
+{ "repo": "acme/api", "pullNumber": 88, "pullUrl": "https://github.com/acme/api/pull/88", "title": "fix: rate limiter window", "baseBranch": "main", "headBranch": "feat/issue-101/rate-limiter-window", "headSha": "<head-sha>", "mergeMethod": "squash" }
+
 PATCH /api/issues/issue-101
-{ "status": "done", "comment": "Fixed sliding window calc. Was using wall-clock instead of monotonic time." }
+{ "status": "in_review", "comment": "Fixed sliding window calc (wall-clock -> monotonic). PR ready for dashboard merge: https://github.com/acme/api/pull/88" }
+
+#    (Only NON-code tasks — research, docs-only answers, coordination — may be closed
+#    directly with status "done".)
 
 # 6. Still have time. Checkout the next task.
 POST /api/issues/issue-99/checkout
@@ -191,17 +200,20 @@ GET /api/companies/company-1/issues?assigneeAgentId=mgr-1&status=todo,in_progres
 POST /api/issues/issue-30/checkout
 { "agentId": "mgr-1", "expectedStatuses": ["todo"] }
 
-# 6. Create subtasks and delegate.
-POST /api/companies/company-1/issues
-{ "title": "Implement caching layer", "assigneeAgentId": "agent-42", "parentId": "issue-30", "status": "todo", "priority": "high", "goalId": "goal-1" }
+# 6. Create subtasks and delegate. Use the DELEGATE endpoint for assigned subtasks —
+#    it builds the handoff brief + vetted memory passdown packet for the sub-agent.
+POST /api/issues/issue-30/delegate
+{ "title": "Implement caching layer", "toAgentId": "agent-42", "priority": "high", "serviceScope": "acme/cache-service" }
 
-POST /api/companies/company-1/issues
-{ "title": "Write load test suite", "assigneeAgentId": "agent-55", "parentId": "issue-30", "status": "todo", "priority": "medium", "goalId": "goal-1" }
+POST /api/issues/issue-30/delegate
+{ "title": "Write load test suite", "toAgentId": "agent-55", "priority": "medium" }
 
+# 7. Leave the PARENT OPEN — it is done only when its children are done. Comment the
+#    delegation instead; close issue-30 on a later children-complete wake.
 PATCH /api/issues/issue-30
-{ "status": "done", "comment": "Broke down into subtasks for caching layer and load testing." }
+{ "comment": "Delegated: caching layer -> agent-42, load tests -> agent-55. Keeping this parent in_progress until both children land." }
 
-# 7. Dashboard for health check.
+# 8. Dashboard for health check.
 GET /api/companies/company-1/dashboard
 ```
 

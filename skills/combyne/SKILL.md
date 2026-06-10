@@ -85,7 +85,15 @@ Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`,
 
 Do NOT loop asking another follow-up question, do NOT post another `kind="question"` comment, and do NOT leave the issue in `awaiting_user`. Server-side cleanup will dismiss any leftover question comments automatically when you close.
 
-**Step 9 — Delegate if needed.** Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. Set `billingCode` for cross-team work. If you are a CEO/manager/EM and receive multiple independent work items, split and delegate them immediately to the right subagents instead of doing them sequentially yourself; those subagents can execute in parallel while you coordinate.
+**Step 9 — Delegate if needed.** For a subtask you are ASSIGNING to another agent, use the delegate endpoint — it creates the sub-issue AND builds the handoff brief + vetted memory passdown packet the sub-agent hydrates on its first wake:
+
+```
+POST /api/issues/{parentIssueId}/delegate
+Headers: X-Combyne-Run-Id: $COMBYNE_RUN_ID
+{ "title": "...", "description": "...", "toAgentId": "{agent-id}", "priority": "high", "complexity": "small", "serviceScope": "owner/repo" }
+```
+
+Use plain `POST /api/companies/{companyId}/issues` only for UNASSIGNED/backlog items (always set `parentId` and `goalId`; set `billingCode` for cross-team work). If you are a CEO/manager/EM and receive multiple independent work items, split and delegate them immediately to the right subagents instead of doing them sequentially yourself; those subagents can execute in parallel while you coordinate. Keep the parent issue open (`in_progress`) until its children complete — never mark a parent `done` at delegation time.
 
 ## Project Setup Workflow (CEO/Manager Common Path)
 
@@ -470,7 +478,7 @@ PATCH /api/agents/{agentId}/instructions-path
 | Search issues        | `GET /api/companies/:companyId/issues?q=search+term`                                       |
 | GitHub: list repos   | `GET /api/companies/:companyId/integrations/github/repos`                                  |
 | GitHub: create PR    | `POST /api/companies/:companyId/integrations/github/repos/:repo/pulls`                     |
-| GitHub: merge PR     | `PUT /api/companies/:companyId/integrations/github/repos/:repo/pulls/:number/merge`        |
+| GitHub: merge PR     | Board/dashboard ONLY — agents must never call a merge endpoint (see Human-Gated Pull Request Merge) |
 | SonarQube: quality gate | `GET /api/companies/:companyId/integrations/sonarqube/quality-gate`                      |
 | SonarQube: issues    | `GET /api/companies/:companyId/integrations/sonarqube/issues`                              |
 | SonarQube: metrics   | `GET /api/companies/:companyId/integrations/sonarqube/metrics?metricKeys=coverage,bugs`    |
