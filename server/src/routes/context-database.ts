@@ -7,7 +7,7 @@ import { validate } from "../middleware/validate.js";
 import { assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { writeConfigFile, readConfigFileContextDatabaseUrl } from "../config-file.js";
 import { loadConfig } from "../config.js";
-import { resolveContextDb, resolveContextDbUrl } from "../services/context-db.js";
+import { getContextDbHealth, resolveContextDb, resolveContextDbUrl } from "../services/context-db.js";
 import { accessService, logActivity } from "../services/index.js";
 import { adoptPinnedCompany } from "../services/company-pin-adopt.js";
 
@@ -231,6 +231,22 @@ export function contextDatabaseRoutes(db: Db) {
       memorySchemaPresent,
       memoryEntryCount,
       configuredVia,
+    });
+  });
+
+  // (1b) Cached rail health — cheap (NO DB call; reads the in-process health
+  // surface stamped by the keepalive / deadline / retry paths). Any
+  // authenticated principal may read it: the UI shows a global "shared rail
+  // unreachable" banner from this, and it carries no secrets (the lastError is
+  // a connectivity message, never a URL/credential).
+  router.get("/instance/context-database/health", (req, res) => {
+    getActorInfo(req); // 401 for unauthenticated principals; no admin gate.
+    const health = getContextDbHealth();
+    res.json({
+      usingSeparateContextDb: resolveContextDbUrl().length > 0,
+      status: health.status,
+      at: health.at,
+      lastError: health.lastError ? String(health.lastError).slice(0, 200) : null,
     });
   });
 

@@ -6,6 +6,7 @@ import { CompanyRail } from "./CompanyRail";
 import { Sidebar } from "./Sidebar";
 import { SidebarNavItem } from "./SidebarNavItem";
 import { BreadcrumbBar } from "./BreadcrumbBar";
+import { ContextRailBanner } from "./ContextRailBanner";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { CommandPalette } from "./CommandPalette";
 import { NewIssueDialog } from "./NewIssueDialog";
@@ -283,6 +284,7 @@ export function Layout() {
       {/* Main content */}
       <div className="flex-1 flex flex-col min-w-0 h-full">
         <BreadcrumbBar />
+        <ContextRailBanner />
         <div className="flex flex-1 min-h-0">
           <main
             id="main-content"

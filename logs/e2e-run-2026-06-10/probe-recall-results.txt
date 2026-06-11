@@ -1,0 +1,18 @@
+TOP1  [brick-jdk17] "gradle test fails to start locally, what java version does t"
+TOP1  [brick-staging-base] "which branch do I cut my feature branch from and target the "
+TOP1  [brick-global-handlers] "[BE] [Brick] move BmuLoan exception handling out of the glob"
+TOP1  [brick-error-envelope] "what error response body format should a new BmuLoan endpoin"
+TOP1  [brick-url-encode] "construct the request URL with the customer id as a path seg"
+TOP1  [brick-veefin-provider] "add a method to VeefinLosProvider calling the LOS applicatio"
+TOP1  [brick-pefindo-adapter] "extend PefindoAdapter with a new credit score lookup endpoin"
+TOP1  [brick-mockmvc] "controller unit test throws NestedServletException instead o"
+TOP1  [bnpl-jdk17] "./gradlew test errors with unsupported java runtime version "
+TOP1  [bnpl-staging-base] "what is the merge base branch for bnpl pull requests"
+TOP3  [bnpl-2fa-controller] "add an OTP resend endpoint to the two factor authentication "
+TOP1  [bnpl-pin-reset] "implement a forgot PIN flow with an initiate and confirm ste"
+TOP1  [bnpl-2fa-audit] "track failed PIN attempts and expose the lock status to the "
+TOP1  [bnpl-repayment-intent-deprecated] "create a repayment intent when the user tops up credit"
+TOP1  [team-merge-gate] "can the agent merge the pull request itself once checks pass"
+TOP1  [human-answer-repayment] "is the frontend still calling the repayment intent endpoints"
+
+top-1: 15/16  top-3: 16/16
