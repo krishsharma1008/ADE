@@ -55,6 +55,11 @@ Earlier findings F1–F14 were all fixed with tests in the post-round-1 batch (s
   attribution gap that made finding #23 undiagnosable is closed.
 - Central context rail recovered (265 entries, health probe OK); EM resumed — the
   resume rescan immediately redelivered the missed accepted-work wake (F5 fix working).
+- **Autonomous parent close-out (06-11 10:27):** the resumed EM processed the
+  accepted-work brief and closed parent PINB405-18 itself, posting a "## Done"
+  verification comment (acceptance criteria + final staging SHA) that satisfies the
+  delegation policy — run succeeded (exit 0), no human input. T3's whole family is
+  terminal: -18 done, -19 cancelled (dedup), -20 done.
 
 ## Goal-set verdict
 
