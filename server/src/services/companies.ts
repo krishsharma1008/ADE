@@ -1,28 +1,6 @@
-import { and, eq, count, notInArray } from "drizzle-orm";
+import { and, eq, count, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
-import {
-  companies,
-  agents,
-  agentApiKeys,
-  agentRuntimeState,
-  agentTaskSessions,
-  agentWakeupRequests,
-  issues,
-  issueComments,
-  projects,
-  goals,
-  heartbeatRuns,
-  heartbeatRunEvents,
-  costEvents,
-  approvalComments,
-  approvals,
-  activityLog,
-  companySecrets,
-  joinRequests,
-  invites,
-  principalPermissionGrants,
-  companyMemberships,
-} from "@combyne/db";
+import { companies, agents, issues } from "@combyne/db";
 
 export function companyService(db: Db) {
   const ISSUE_PREFIX_FALLBACK = "CMP";
@@ -164,28 +142,48 @@ export function companyService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
-        // Delete from child tables in dependency order
-        // activity_log must come before heartbeat_runs (activity_log.run_id -> heartbeat_runs.id)
-        await tx.delete(activityLog).where(eq(activityLog.companyId, id));
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, id));
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.companyId, id));
-        await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, id));
-        await tx.delete(issueComments).where(eq(issueComments.companyId, id));
-        await tx.delete(costEvents).where(eq(costEvents.companyId, id));
-        await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
-        await tx.delete(approvals).where(eq(approvals.companyId, id));
-        await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
-        await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));
-        await tx.delete(invites).where(eq(invites.companyId, id));
-        await tx.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, id));
-        await tx.delete(companyMemberships).where(eq(companyMemberships.companyId, id));
-        await tx.delete(issues).where(eq(issues.companyId, id));
-        await tx.delete(goals).where(eq(goals.companyId, id));
-        await tx.delete(projects).where(eq(projects.companyId, id));
-        await tx.delete(agents).where(eq(agents.companyId, id));
+        // A hand-maintained dependency-ordered delete list rotted every time a
+        // company-scoped table was added (live 2026-06-11: agent_transcripts and
+        // issue_read_states 500'd the delete). Instead, discover every public
+        // table carrying a company_id column and delete multi-pass: a table
+        // whose delete is blocked by an inter-child FK simply succeeds on a
+        // later pass once its dependents are gone. New company-scoped tables
+        // are covered automatically.
+        const discovered = await tx.execute<{ table_name: string }>(sql`
+          SELECT DISTINCT table_name
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND column_name = 'company_id'
+            AND table_name <> 'companies'
+        `);
+        const discoveredRows =
+          (discovered as unknown as { rows?: Array<{ table_name: string }> }).rows ??
+          (discovered as unknown as Array<{ table_name: string }>);
+        let remaining = discoveredRows.map((row) => row.table_name);
+        for (let pass = 0; pass < 10 && remaining.length > 0; pass++) {
+          const blocked: string[] = [];
+          for (const tableName of remaining) {
+            try {
+              // Nested transaction = SAVEPOINT: a blocked DELETE must not abort
+              // the outer transaction (Postgres poisons a tx after any error).
+              await tx.transaction(async (sp) => {
+                await sp.execute(
+                  sql`DELETE FROM ${sql.identifier(tableName)} WHERE company_id = ${id}`,
+                );
+              });
+            } catch {
+              blocked.push(tableName);
+            }
+          }
+          if (blocked.length === remaining.length) {
+            // No progress — a cycle or a non-company-scoped dependent. Surface
+            // the blockers instead of failing with a bare FK error.
+            throw new Error(
+              `Company delete blocked by foreign keys on: ${blocked.join(", ")}`,
+            );
+          }
+          remaining = blocked;
+        }
         const rows = await tx
           .delete(companies)
           .where(eq(companies.id, id))

@@ -33,6 +33,8 @@ To run a **second instance** on one machine (e.g. validation), isolate it with s
 | `PORT` | Server port (default 3100) |
 | `COMBYNE_EMBEDDED_POSTGRES_PORT` | Embedded operational DB port (default 54329) |
 | `COMBYNE_ALLOWED_PUSH_REMOTE_PATTERNS` | Agent push allowlist (globs/regex of `owner/repo`); empty ⇒ derived from project repo URLs, strict by default |
+| `COMBYNE_USAGE_PAUSE_ENABLED` | **Set `true`.** On a Claude usage/subscription limit the run parks (lock held, session preserved) and auto-resumes the exact conversation when the window resets — instead of failing the ticket |
+| `COMBYNE_MAX_TURNS_CONTINUATION_ENABLED` | **Set `true`.** A run that exhausts its turn budget mid-task re-enqueues a warm continuation (if it made git-measured progress) instead of blocking the issue |
 | `COMBYNE_JIRA_AGENT_READONLY` | Default ON — agents read Jira but never mutate the board (per-company overrides: Integrations → Agent Capabilities) |
 | `COMBYNE_GITHUB_MERGE_ALLOW_UNKNOWN_CI` | `true` to keep CI-less repos dashboard-mergeable |
 | `COMBYNE_PR_SWEEP_INTERVAL_MS` | External-merge detection sweep cadence (default 5 min) |
