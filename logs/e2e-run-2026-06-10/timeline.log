@@ -1,0 +1,113 @@
+[11:33:52] RUN f2327315 started agent=EM status=queued issue=002e4830 reason=assignment
+[11:33:52] RUN d23b2313 started agent=EM status=running issue=3d13ce6e reason=assignment
+[11:35:52] RUN f2327315 finished (left live list)
+[11:35:52] RUN d23b2313 finished (left live list)
+[11:36:52] ISSUE PINB405-11: in_progress/EM -> cancelled/EM
+[11:36:52] ISSUE PINB405-10: in_progress/EM -> cancelled/EM
+[11:38:12] NEW ISSUE PINB405-12 '[BE] [Brick] PR-423 Updates Based on AI Review' status=todo assignee=EM parent=none
+[11:43:12] RUN 589bca44 started agent=EM status=running issue= reason=on_demand
+[11:43:32] ISSUE PINB405-12: todo/EM -> in_progress/EM
+[11:44:12] NEW ISSUE PINB405-13 '[BE] [Brick] Refactor VeefinLosProvider — constants, generic' status=in_progress assignee=Backend-1 parent=721afdb8
+[11:44:12] RUN 87af846d started agent=Backend-1 status=running issue=0f7835b5 reason=assignment
+[11:44:32] RUN 589bca44 finished (left live list)
+[11:52:52] ISSUE PINB405-13: in_progress/Backend-1 -> awaiting_user/Backend-1
+[11:52:52] RUN b061d512 started agent=EM status=running issue=721afdb8 reason=automation
+[11:52:52] RUN 87af846d finished (left live list)
+[11:54:12] ISSUE PINB405-13: awaiting_user/Backend-1 -> todo/Backend-1
+[11:54:12] RUN ce5ef2bb started agent=Backend-1 status=running issue=0f7835b5 reason=automation
+[11:54:32] RUN b061d512 finished (left live list)
+[11:54:52] ISSUE PINB405-13: todo/Backend-1 -> in_review/Backend-1
+[11:55:12] RUN 68347d48 started agent=EM status=running issue=721afdb8 reason=automation
+[11:55:33] RUN ce5ef2bb finished (left live list)
+[11:56:53] RUN 68347d48 finished (left live list)
+[12:04:13] RUN e78e2dfe started agent=Backend-1 status=running issue=0f7835b5 reason=automation
+[12:04:33] RUN e78e2dfe finished (left live list)
+[12:06:53] ISSUE PINB405-13: in_review/Backend-1 -> done/Backend-1
+[12:06:53] RUN d418031f started agent=EM status=queued issue= reason=automation
+[12:06:53] RUN 024376d5 started agent=EM status=running issue=721afdb8 reason=automation
+[12:07:33] ISSUE PINB405-12: in_progress/EM -> done/EM
+[12:07:53] RUN d418031f EM: queued -> running
+[12:07:53] RUN 024376d5 finished (left live list)
+[12:08:53] RUN d418031f finished (left live list)
+[15:18:28] NEW ISSUE PINB405-15 '[BNPL Service] 2FA audit trail + detailed PIN status endpoin' status=in_progress assignee=EM parent=none
+[15:18:28] NEW ISSUE PINB405-14 '[BE] [Brick] PefindoAdapter cleanup — AI review follow-ups (' status=in_progress assignee=EM parent=none
+[15:18:28] RUN 6352d036 started agent=EM status=queued issue=c55b4ae5 reason=assignment
+[15:18:28] RUN 94e2fa73 started agent=EM status=running issue=9d702b58 reason=assignment
+[15:19:48] NEW ISSUE PINB405-16 '[BE] [Brick] PefindoAdapter cleanup — headers, URLs, error h' status=in_progress assignee=Backend-1 parent=9d702b58
+[15:19:48] RUN 6c33b68e started agent=Backend-1 status=running issue=43a435bc reason=assignment
+[15:20:08] RUN 6352d036 EM: queued -> running
+[15:20:08] RUN 94e2fa73 finished (left live list)
+[15:21:28] NEW ISSUE PINB405-17 '[BNPL Service] 2FA audit trail + detailed PIN status endpoin' status=in_progress assignee=Backend-1 parent=c55b4ae5
+[15:21:28] RUN 13391a61 started agent=Backend-1 status=queued issue=44a2b650 reason=assignment
+[15:21:48] RUN 6352d036 finished (left live list)
+[15:26:28] RUN 13391a61 finished (left live list)
+[15:27:08] RUN 6c33b68e finished (left live list)
+[15:28:08] ISSUE PINB405-16: in_progress/Backend-1 -> in_review/Backend-1
+[15:28:28] RUN 28abeeee started agent=EM status=running issue=9d702b58 reason=automation
+[15:29:48] ISSUE PINB405-14: in_progress/EM -> in_review/EM
+[15:30:08] RUN 0a67fd2f started agent=EM status=running issue=9d702b58 reason=automation
+[15:30:08] RUN 28abeeee finished (left live list)
+[15:30:28] RUN 0a67fd2f finished (left live list)
+[15:31:08] ISSUE PINB405-16: in_review/Backend-1 -> done/Backend-1
+[15:31:08] RUN e99f5a3f started agent=EM status=queued issue= reason=automation
+[15:31:08] RUN 6eb356fa started agent=EM status=running issue=9d702b58 reason=automation
+[15:31:48] ISSUE PINB405-14: in_review/EM -> done/EM
+[15:31:48] RUN e99f5a3f EM: queued -> running
+[15:31:48] RUN 6eb356fa finished (left live list)
+[15:33:48] RUN e99f5a3f finished (left live list)
+[15:35:08] RUN 8f3a0284 started agent=Backend-1 status=running issue= reason=on_demand
+[15:47:29] ISSUE PINB405-17: in_progress/Backend-1 -> in_review/Backend-1
+[15:47:29] RUN 6be24bf4 started agent=EM status=running issue=c55b4ae5 reason=automation
+[15:47:29] RUN 8f3a0284 finished (left live list)
+[15:48:49] ISSUE PINB405-17: in_review/Backend-1 -> done/Backend-1
+[15:48:49] RUN f10934cb started agent=EM status=queued issue= reason=automation
+[15:49:09] ISSUE PINB405-15: in_progress/EM -> awaiting_user/EM
+[15:49:09] RUN 791b4fcb started agent=EM status=queued issue=c55b4ae5 reason=automation
+[15:49:09] RUN f10934cb EM: queued -> running
+[15:49:09] RUN 6be24bf4 finished (left live list)
+[15:50:29] RUN f10934cb finished (left live list)
+[15:50:29] RUN 791b4fcb finished (left live list)
+[15:50:49] ISSUE PINB405-15: awaiting_user/EM -> in_review/EM
+[15:50:49] RUN ec839b10 started agent=EM status=running issue=c55b4ae5 reason=automation
+[15:51:09] ISSUE PINB405-15: in_review/EM -> done/EM
+[15:51:09] RUN ec839b10 finished (left live list)
+[15:52:09] NEW ISSUE PINB405-18 '[BE] [Brick] Unified error envelope for BmuLoan endpoints' status=in_progress assignee=EM parent=none
+[15:52:09] RUN 65064fca started agent=EM status=running issue=cd2569b8 reason=assignment
+[15:53:49] NEW ISSUE PINB405-19 '[BE] [Brick] BmuLoanExceptionHandler + BmuLoanErrorResponse ' status=in_progress assignee=Backend-1 parent=cd2569b8
+[15:54:09] NEW ISSUE PINB405-20 '[BE] [Brick] BmuLoanExceptionHandler + BmuLoanErrorResponse ' status=in_progress assignee=Backend-1 parent=cd2569b8
+[15:54:09] RUN 43ce4925 started agent=Backend-1 status=running issue=4cb3ad20 reason=assignment
+[15:54:29] RUN 8cb5cdf6 started agent=Backend-1 status=queued issue=ce13b770 reason=assignment
+[15:54:29] RUN 65064fca finished (left live list)
+[15:55:09] ISSUE PINB405-19: in_progress/Backend-1 -> cancelled/Backend-1
+[15:55:09] RUN 8cb5cdf6 Backend-1: queued -> running
+[15:55:09] RUN 43ce4925 finished (left live list)
+[16:02:49] ISSUE PINB405-20: in_progress/Backend-1 -> in_review/Backend-1
+[16:28:53] RUN 8cb5cdf6 finished (left live list)
+[16:34:05] RUN 5bb8b777 started agent=Backend-1 status=running issue=ce13b770 reason=automation
+[16:39:05] ISSUE PINB405-20: in_review/Backend-1 -> in_progress/Backend-1
+[16:42:26] ISSUE PINB405-20: in_progress/Backend-1 -> in_review/Backend-1
+[16:43:26] RUN ffcb4b59 started agent=EM status=running issue=cd2569b8 reason=automation
+[16:44:06] RUN 0cbcc4a9 started agent=Backend-1 status=running issue=ce13b770 reason=automation
+[16:44:06] RUN 5bb8b777 finished (left live list)
+[16:48:26] RUN d6a56395 started agent=EM status=running issue=cd2569b8 reason=automation
+[16:48:26] RUN ffcb4b59 finished (left live list)
+[16:49:26] RUN 0cbcc4a9 finished (left live list)
+[16:51:06] ISSUE PINB405-20: in_review/Backend-1 -> done/Backend-1
+[16:51:06] RUN 7c56b14b started agent=EM status=queued issue= reason=automation
+[16:54:06] RUN 98a285fe started agent=EM status=queued issue=cd2569b8 reason=automation
+[16:54:06] RUN 7c56b14b EM: queued -> running
+[16:54:06] RUN d6a56395 finished (left live list)
+[16:54:26] ISSUE PINB405-20: done/Backend-1 -> in_review/Backend-1
+[16:54:26] RUN 308df634 started agent=Backend-1 status=running issue=ce13b770 reason=automation
+[16:55:46] ISSUE PINB405-20: in_review/Backend-1 -> in_progress/Backend-1
+[16:57:26] ISSUE PINB405-20: in_progress/Backend-1 -> in_review/Backend-1
+[16:58:06] RUN 7c56b14b finished (left live list)
+[16:58:06] RUN 98a285fe finished (left live list)
+[16:59:26] ISSUE PINB405-20: in_review/Backend-1 -> done/Backend-1
+[16:59:26] RUN e2fdc0e9 started agent=Backend-1 status=running issue=ce13b770 reason=automation
+[16:59:26] RUN 308df634 finished (left live list)
+[17:04:47] RUN e2fdc0e9 finished (left live list)
+[17:12:47] ISSUE PINB405-20: done/Backend-1 -> in_progress/Backend-1
+[17:13:07] ISSUE PINB405-20: in_progress/Backend-1 -> in_review/Backend-1
+[19:22:17] ISSUE PINB405-20: in_review/Backend-1 -> done/Backend-1
+[10:25:18] RUN bc655d58 started agent=EM status=running issue= reason=on_demand

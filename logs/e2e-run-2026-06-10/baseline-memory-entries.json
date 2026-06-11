@@ -1,0 +1,72 @@
+[
+ {
+  "id": "c2192588-1351-4329-b58e-3ca4faf91579",
+  "layer": "workspace",
+  "subject": "EM approved PR krish-buku/fs-bnpl-service-test#2: feat(PINB405-9): add LendingPinResetController with DTOs, service, and unit tests",
+  "kind": "note",
+  "provenance": "pr-approval",
+  "verificationState": "verified",
+  "confidence": 0.8,
+  "serviceScope": "krish-buku/fs-bnpl-service-test",
+  "source": "pr-approval:github:krish-buku/fs-bnpl-service-test@67232d06ed206f9bc78ef6a2b2277ddb819e9f93",
+  "createdAt": "2026-06-10T04:30:43.178Z",
+  "usageCount": 0,
+  "lastUsedAt": null
+ },
+ {
+  "id": "d3ac602c-552e-472d-a5dd-81cfa8fd796e",
+  "layer": "workspace",
+  "subject": "EM approved PR krish-buku/fs-bnpl-service-test#1: feat(PINB405-7): add LendingTwoFAController with DTOs and OTP service methods",
+  "kind": "note",
+  "provenance": "pr-approval",
+  "verificationState": "verified",
+  "confidence": 0.8,
+  "serviceScope": "krish-buku/fs-bnpl-service-test",
+  "source": "pr-approval:github:krish-buku/fs-bnpl-service-test@3fcdc146ffc33e368a2af531ee7b90efe6b64069",
+  "createdAt": "2026-06-09T08:22:40.997Z",
+  "usageCount": 2,
+  "lastUsedAt": "2026-06-09T09:03:22.046Z"
+ },
+ {
+  "id": "6f06a21d-1d9a-42da-b3f6-4d18dbcb82ec",
+  "layer": "workspace",
+  "subject": "Has FE confirmed they are no longer calling the repayment intent endpoints (`POST /fs/brick/service/bmu/repayment/intent`, `GET /virtual-account`, `GET /intent`)? Phase 2 removal is blocked on this confirmation.",
+  "kind": "fact",
+  "provenance": "human-answer",
+  "verificationState": "verified",
+  "confidence": 0.95,
+  "serviceScope": null,
+  "source": "human-answer:3d0fb79dce30a435b8ee8886a5909f023a0622a4a96179082b7649a24105bd22",
+  "createdAt": "2026-06-09T06:45:39.854Z",
+  "usageCount": 9,
+  "lastUsedAt": "2026-06-09T09:03:22.305Z"
+ },
+ {
+  "id": "bcdfe6aa-0728-4f3e-b52f-32f8ff2e0a9a",
+  "layer": "workspace",
+  "subject": "Lending smoke test",
+  "kind": "fact",
+  "provenance": null,
+  "verificationState": "unverified",
+  "confidence": 0.5,
+  "serviceScope": null,
+  "source": null,
+  "createdAt": "2026-06-09T04:04:18.103Z",
+  "usageCount": 0,
+  "lastUsedAt": null
+ },
+ {
+  "id": "5fe2164b-6b8a-4cc4-ab13-eea1cbcde68f",
+  "layer": "workspace",
+  "subject": "EM approved PR krish-buku/fs-brick-service-test#1: feat(PINB405-4): remove repayment intent from add-credit path",
+  "kind": "note",
+  "provenance": "pr-approval",
+  "verificationState": "verified",
+  "confidence": 0.8,
+  "serviceScope": "krish-buku/fs-brick-service-test",
+  "source": "pr-approval:github:krish-buku/fs-brick-service-test@621bab4f2cafb756685a4d85a95a0a3de81574a8",
+  "createdAt": "2026-06-09T05:40:24.450Z",
+  "usageCount": 12,
+  "lastUsedAt": "2026-06-09T09:03:22.314Z"
+ }
+]

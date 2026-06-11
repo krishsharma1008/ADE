@@ -1,0 +1,4 @@
+   3fcdc14..67232d0  staging    -> origin/staging
+fs-bnpl-service origin/staging: 67232d06ed206f9bc78ef6a2b2277ddb819e9f93
+   57b68a6..621bab4  staging    -> origin/staging
+fs-brick-service origin/staging: 621bab4f2cafb756685a4d85a95a0a3de81574a8

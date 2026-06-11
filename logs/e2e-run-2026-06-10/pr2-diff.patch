@@ -1,0 +1,210 @@
+diff --git a/src/main/java/com/bukuwarung/fsbrickservice/constants/ProviderConstants.java b/src/main/java/com/bukuwarung/fsbrickservice/constants/ProviderConstants.java
+index 78128524..901bceef 100644
+--- a/src/main/java/com/bukuwarung/fsbrickservice/constants/ProviderConstants.java
++++ b/src/main/java/com/bukuwarung/fsbrickservice/constants/ProviderConstants.java
+@@ -258,6 +258,10 @@ private VeefinLos() {
+     public static final String HEADER_SOURCE = "source";
+     public static final String SOURCE_WEB = "WEB";
+     public static final String QUERY_PARAM_MOBILE = "mobile";
++    public static final String ACTIVE_APPLICATIONS_ACTION = "Veefin LOS active applications";
++    public static final String REJECTED_APPLICATIONS_ACTION = "Veefin LOS rejected applications";
++    public static final String CREATE_LEAD_ACTION = "Veefin LOS create lead";
++    public static final String SIZE_FORMAT = "%s(size=%d)";
+   }
+ 
+   public static final class VidaInlineSign {
+diff --git a/src/main/java/com/bukuwarung/fsbrickservice/provider/capability/impl/VeefinLosProvider.java b/src/main/java/com/bukuwarung/fsbrickservice/provider/capability/impl/VeefinLosProvider.java
+index 33a3a687..35bb381c 100644
+--- a/src/main/java/com/bukuwarung/fsbrickservice/provider/capability/impl/VeefinLosProvider.java
++++ b/src/main/java/com/bukuwarung/fsbrickservice/provider/capability/impl/VeefinLosProvider.java
+@@ -1,5 +1,7 @@
+ package com.bukuwarung.fsbrickservice.provider.capability.impl;
+ 
++import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.ACTIVE_APPLICATIONS_ACTION;
++import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.CREATE_LEAD_ACTION;
+ import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.CREATE_LEAD_PATH;
+ import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.CUSTOM_PROP_CLIENT_ID;
+ import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.CUSTOM_PROP_ENTITY_ID;
+@@ -15,6 +17,8 @@
+ import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.PROVIDER_NAME;
+ import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.PROVIDER_TYPE;
+ import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.QUERY_PARAM_MOBILE;
++import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.REJECTED_APPLICATIONS_ACTION;
++import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.SIZE_FORMAT;
+ import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.SOURCE_WEB;
+ import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.SUBMIT_APPLICATION_PATH;
+ import static com.bukuwarung.fsbrickservice.constants.ProviderConstants.VeefinLos.UPDATE_APPLICATION_PATH;
+@@ -41,6 +45,7 @@
+ import java.util.Map;
+ import java.util.stream.Collectors;
+ import lombok.extern.slf4j.Slf4j;
++import org.springframework.core.ParameterizedTypeReference;
+ import org.springframework.core.io.ByteArrayResource;
+ import org.springframework.http.HttpEntity;
+ import org.springframework.http.HttpHeaders;
+@@ -52,6 +57,7 @@
+ import org.springframework.util.MultiValueMap;
+ import org.springframework.web.client.RestClientException;
+ import org.springframework.web.client.RestClientResponseException;
++import org.springframework.web.util.UriComponentsBuilder;
+ 
+ @Component
+ @Slf4j
+@@ -73,9 +79,6 @@ public class VeefinLosProvider extends AbstractCapabilityProvider {
+       "VEEFIN_LOS clientId" + REQUIRED_CONFIGURATION_SUFFIX;
+   private static final String PROVIDER_CONFIG_NOT_FOUND = "VEEFIN_LOS configuration not found";
+   private static final String PROVIDER_CONFIGURED = "Veefin LOS provider configured";
+-  private static final String ACTIVE_APPLICATIONS_ACTION = "Veefin LOS active applications";
+-  private static final String REJECTED_APPLICATIONS_ACTION = "Veefin LOS rejected applications";
+-  private static final String CREATE_LEAD_ACTION = "Veefin LOS create lead";
+   private static final String DOCUMENT_UPLOAD_ACTION = "Veefin LOS document upload";
+   private static final String UPDATE_APPLICATION_ACTION = "Veefin LOS update application";
+   private static final String SUBMIT_APPLICATION_ACTION = "Veefin LOS submit application";
+@@ -145,11 +148,13 @@ public LosApplicationResponse getActiveApplication(String phoneNumber) {
+     validateRequiredText(phoneNumber, PHONE_NUMBER_FIELD);
+ 
+     String requestUrl =
+-        String.format(
+-            "%s?%s=%s",
+-            buildRequestUrl(baseUrl, product, GET_ACTIVE_APPLICATION_PATH, ONBOARDING_PATH_SEGMENT),
+-            QUERY_PARAM_MOBILE,
+-            phoneNumber);
++        UriComponentsBuilder.fromUriString(
++                buildRequestUrl(
++                    baseUrl, product, GET_ACTIVE_APPLICATION_PATH, ONBOARDING_PATH_SEGMENT))
++            .queryParam(QUERY_PARAM_MOBILE, phoneNumber)
++            .build()
++            .encode()
++            .toUriString();
+     HttpEntity<Void> entity = new HttpEntity<>(buildGetActiveApplicationHeaders());
+ 
+     log.info("{} Calling Veefin LOS active applications. mobile={}", LOG_PREFIX, phoneNumber);
+@@ -176,12 +181,13 @@ public LosApplicationResponse getRejectedApplication(String phoneNumber) {
+     validateRequiredText(phoneNumber, PHONE_NUMBER_FIELD);
+ 
+     String requestUrl =
+-        String.format(
+-            "%s?%s=%s",
+-            buildRequestUrl(
+-                baseUrl, product, GET_REJECTED_APPLICATION_PATH, ONBOARDING_PATH_SEGMENT),
+-            QUERY_PARAM_MOBILE,
+-            phoneNumber);
++        UriComponentsBuilder.fromUriString(
++                buildRequestUrl(
++                    baseUrl, product, GET_REJECTED_APPLICATION_PATH, ONBOARDING_PATH_SEGMENT))
++            .queryParam(QUERY_PARAM_MOBILE, phoneNumber)
++            .build()
++            .encode()
++            .toUriString();
+     HttpEntity<Void> entity = new HttpEntity<>(buildGetActiveApplicationHeaders());
+ 
+     log.info("{} Calling Veefin LOS rejected applications. mobile={}", LOG_PREFIX, phoneNumber);
+@@ -249,8 +255,10 @@ public CreateLeadResponseLos createLead(CreateLeadRequest request) {
+   public UploadDocumentResponseLos uploadDocument(
+       String applicationId, String documentId, byte[] fileBytes, String fileName) {
+     String requestUrl =
+-        String.format(
+-            "%s%s/%s/%s", buildProviderBaseUrl(), UPLOAD_DOCUMENT_PATH, applicationId, documentId);
++        UriComponentsBuilder.fromUriString(buildProviderBaseUrl() + UPLOAD_DOCUMENT_PATH)
++            .pathSegment("{applicationId}", "{documentId}")
++            .buildAndExpand(applicationId, documentId)
++            .toUriString();
+ 
+     HttpHeaders headers = buildDocumentUploadHeaders();
+     headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+@@ -291,7 +299,10 @@ public String getFilename() {
+   public VeefinLosApiResponse<Void> updateApplication(
+       String applicationId, UpdateVeefinLosApplicationRequest request) {
+     String requestUrl =
+-        String.format("%s%s/%s", buildProviderBaseUrl(), UPDATE_APPLICATION_PATH, applicationId);
++        UriComponentsBuilder.fromUriString(buildProviderBaseUrl() + UPDATE_APPLICATION_PATH)
++            .pathSegment("{applicationId}")
++            .buildAndExpand(applicationId)
++            .toUriString();
+     HttpHeaders headers = buildUpdateApplicationHeaders();
+     headers.setContentType(MediaType.APPLICATION_JSON);
+     HttpEntity<UpdateVeefinLosApplicationRequest> entity = new HttpEntity<>(request, headers);
+@@ -299,8 +310,12 @@ public VeefinLosApiResponse<Void> updateApplication(
+     log.info("{} Updating Veefin LOS application. applicationId={}", LOG_PREFIX, applicationId);
+ 
+     try {
+-      ResponseEntity<VeefinLosApiResponse> responseEntity =
+-          restTemplate.postForEntity(requestUrl, entity, VeefinLosApiResponse.class);
++      ResponseEntity<VeefinLosApiResponse<Void>> responseEntity =
++          restTemplate.exchange(
++              requestUrl,
++              HttpMethod.POST,
++              entity,
++              new ParameterizedTypeReference<VeefinLosApiResponse<Void>>() {});
+       return responseEntity.getBody();
+     } catch (RestClientResponseException e) {
+       logRequestFailure(UPDATE_APPLICATION_ACTION, requestUrl, entity, e);
+@@ -313,7 +328,10 @@ public VeefinLosApiResponse<Void> updateApplication(
+ 
+   public VeefinLosApiResponse<Void> submitApplication(String applicationId) {
+     String requestUrl =
+-        String.format("%s%s/%s", buildProviderBaseUrl(), SUBMIT_APPLICATION_PATH, applicationId);
++        UriComponentsBuilder.fromUriString(buildProviderBaseUrl() + SUBMIT_APPLICATION_PATH)
++            .pathSegment("{applicationId}")
++            .buildAndExpand(applicationId)
++            .toUriString();
+     HttpHeaders headers = buildSubmitApplicationHeaders();
+     headers.setContentType(MediaType.APPLICATION_JSON);
+     HttpEntity<Map<String, Object>> entity =
+@@ -322,8 +340,12 @@ public VeefinLosApiResponse<Void> submitApplication(String applicationId) {
+     log.info("{} Submitting Veefin LOS application. applicationId={}", LOG_PREFIX, applicationId);
+ 
+     try {
+-      ResponseEntity<VeefinLosApiResponse> responseEntity =
+-          restTemplate.postForEntity(requestUrl, entity, VeefinLosApiResponse.class);
++      ResponseEntity<VeefinLosApiResponse<Void>> responseEntity =
++          restTemplate.exchange(
++              requestUrl,
++              HttpMethod.POST,
++              entity,
++              new ParameterizedTypeReference<VeefinLosApiResponse<Void>>() {});
+       return responseEntity.getBody();
+     } catch (RestClientResponseException e) {
+       logRequestFailure(SUBMIT_APPLICATION_ACTION, requestUrl, entity, e);
+@@ -449,7 +471,7 @@ private String summarizePayloadValue(Object value) {
+     String payloadType = getPayloadType(value);
+ 
+     if (value instanceof ByteArrayResource) {
+-      return String.format("%s(size=%d)", payloadType, ((ByteArrayResource) value).contentLength());
++      return String.format(SIZE_FORMAT, payloadType, ((ByteArrayResource) value).contentLength());
+     }
+ 
+     if (value instanceof CharSequence) {
+@@ -457,11 +479,11 @@ private String summarizePayloadValue(Object value) {
+     }
+ 
+     if (value instanceof Map) {
+-      return String.format("%s(size=%d)", payloadType, ((Map<?, ?>) value).size());
++      return String.format(SIZE_FORMAT, payloadType, ((Map<?, ?>) value).size());
+     }
+ 
+     if (value instanceof Collection) {
+-      return String.format("%s(size=%d)", payloadType, ((Collection<?>) value).size());
++      return String.format(SIZE_FORMAT, payloadType, ((Collection<?>) value).size());
+     }
+ 
+     if (value.getClass().isArray()) {
+@@ -532,13 +554,12 @@ private String buildPath(String... segments) {
+ 
+       if (builder.length() == 0) {
+         builder.append(stripTrailingSlash(sanitized));
+-        continue;
+-      }
+-
+-      if (builder.charAt(builder.length() - 1) != '/') {
+-        builder.append('/');
++      } else {
++        if (builder.charAt(builder.length() - 1) != '/') {
++          builder.append('/');
++        }
++        builder.append(stripLeadingSlash(stripTrailingSlash(sanitized)));
+       }
+-      builder.append(stripLeadingSlash(stripTrailingSlash(sanitized)));
+     }
+ 
+     return builder.toString();
