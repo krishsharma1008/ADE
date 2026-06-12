@@ -1107,6 +1107,26 @@ export function issueService(db: Db) {
               kind: "system",
             });
           });
+          // Audit + LIVE UI refresh: this sweeper bypasses issueService.update,
+          // so without an activity event the Inbox/Issues pages kept showing
+          // swept issues until a manual reload (found live 2026-06-12).
+          // logActivity also publishes the live event the UI invalidates on.
+          await logActivity(db, {
+            companyId: row.companyId,
+            actorType: "system",
+            actorId: "awaiting-user-sweeper",
+            action: "issue.auto_closed",
+            entityType: "issue",
+            entityId: row.id,
+            details: {
+              reason:
+                row.originKind === "terminal_session"
+                  ? "terminal_session_expired"
+                  : "stale_awaiting_user",
+              previousStatus: "awaiting_user",
+              nextStatus: "done",
+            },
+          }).catch(() => undefined);
           closed++;
         } catch (_err) {
           // Soft-fail per row so one bad issue doesn't kill the sweep.

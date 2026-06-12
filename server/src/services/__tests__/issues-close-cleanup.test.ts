@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, isNull } from "drizzle-orm";
-import { agents, companies, issueComments, issues } from "@combyne/db";
+import { activityLog, agents, companies, issueComments, issues } from "@combyne/db";
 import { issueService } from "../issues.js";
 import { startTestDb, stopTestDb, type TestDbHandle } from "./_test-db.js";
 
@@ -303,6 +303,16 @@ describe("issueService.autoCloseStaleAwaitingUserIssues — backstop sweeper", (
       .from(issueComments)
       .where(eq(issueComments.issueId, staleTerminal.id));
     expect(expiredComment.some((c) => c.body.includes("Terminal session expired"))).toBe(true);
+
+    // The sweep must emit an activity event (it bypasses issueService.update) —
+    // this is what live-refreshes the Inbox/Issues pages and gives attribution.
+    const sweepActivity = await handle.db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, staleTerminal.id));
+    const autoClosed = sweepActivity.find((row) => row.action === "issue.auto_closed");
+    expect(autoClosed).toBeTruthy();
+    expect((autoClosed?.details as { reason?: string }).reason).toBe("terminal_session_expired");
 
     const [keptTerminal] = await handle.db
       .select()
