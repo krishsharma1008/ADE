@@ -419,6 +419,8 @@ ADE/
 
 ## Development
 
+> **New here (human or AI agent)?** Read **[`docs/HANDOFF.md`](docs/HANDOFF.md)** first — current state, code map, and the operational hard rules — then **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** (system reference with diagrams) and **[`docs/DEVELOPER_SETUP.md`](docs/DEVELOPER_SETUP.md)** (one-page setup). Claude Code sessions auto-load the same pointers from [`CLAUDE.md`](CLAUDE.md).
+
 ### Commands
 
 | Command | Description |

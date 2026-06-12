@@ -11,11 +11,11 @@ The current implementation target is V1 and is defined in `doc/SPEC-implementati
 
 Before making changes, read in this order:
 
-1. `doc/GOAL.md`
-2. `doc/PRODUCT.md`
-3. `doc/SPEC-implementation.md`
-4. `doc/DEVELOPING.md`
-5. `doc/DATABASE.md`
+1. `docs/HANDOFF.md` — current state, code map, operational hard rules (start here)
+2. `docs/ARCHITECTURE.md` — system reference with diagrams
+3. `docs/DEVELOPER_SETUP.md` — environment + commands
+4. `doc/SPEC-implementation.md` — the V1 build contract (background: `doc/GOAL.md`, `doc/PRODUCT.md`)
+5. `doc/DEVELOPING.md` and `doc/DATABASE.md`
 
 `doc/SPEC.md` is long-horizon product context.
 `doc/SPEC-implementation.md` is the concrete V1 build contract.
