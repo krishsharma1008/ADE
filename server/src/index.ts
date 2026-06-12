@@ -838,6 +838,13 @@ export async function startServer(): Promise<StartedServer> {
     );
     const AWAITING_USER_AUTOCLOSE_MS =
       AWAITING_USER_AUTOCLOSE_DAYS * 24 * 60 * 60 * 1000;
+    // Idle-parked terminal-session issues expire on their own shorter window
+    // (default 8h) — an abandoned REPL must not sit in the Inbox for days.
+    const TERMINAL_AWAITING_AUTOCLOSE_MS =
+      Math.max(1, Number(process.env.TERMINAL_AWAITING_AUTOCLOSE_HOURS ?? "8") || 8) *
+      60 *
+      60 *
+      1000;
     const AWAITING_USER_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
     let lastAwaitingUserSweepAt = 0;
 
@@ -1029,7 +1036,11 @@ export async function startServer(): Promise<StartedServer> {
       ) {
         lastAwaitingUserSweepAt = now;
         void issuesSvc
-          .autoCloseStaleAwaitingUserIssues(new Date(now), AWAITING_USER_AUTOCLOSE_MS)
+          .autoCloseStaleAwaitingUserIssues(
+            new Date(now),
+            AWAITING_USER_AUTOCLOSE_MS,
+            TERMINAL_AWAITING_AUTOCLOSE_MS,
+          )
           .then((result) => {
             if (result.closed > 0) {
               logger.info(

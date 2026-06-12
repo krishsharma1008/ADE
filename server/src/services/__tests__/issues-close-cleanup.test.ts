@@ -240,17 +240,35 @@ describe("issueService.autoCloseStaleAwaitingUserIssues — backstop sweeper", (
     expect(lingering).toHaveLength(0);
   });
 
-  it("excludes terminal_session and routine_execution origins", async () => {
-    const stale = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const [terminal] = await handle.db
+  // Found live 2026-06-12: idle-reaped terminal sessions park their issue in
+  // awaiting_user for the Continue button, but abandoned ones lingered FOREVER
+  // (three day-old terminal issues cluttering Issues + the Inbox awaiting
+  // badge). Terminal origins now expire on their own SHORTER window; routine
+  // origins keep their dedicated path and stay excluded.
+  it("terminal_session origins expire on the terminal window; routine_execution stays excluded", async () => {
+    const dayOld = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const twoHoursOld = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const [staleTerminal] = await handle.db
       .insert(issues)
       .values({
         companyId,
-        title: "Terminal session ticket",
+        title: "Abandoned terminal session",
         status: "awaiting_user",
         priority: "low",
         assigneeAgentId: agentId,
-        awaitingUserSince: stale,
+        awaitingUserSince: dayOld,
+        originKind: "terminal_session",
+      })
+      .returning();
+    const [freshTerminal] = await handle.db
+      .insert(issues)
+      .values({
+        companyId,
+        title: "Recently idle terminal session",
+        status: "awaiting_user",
+        priority: "low",
+        assigneeAgentId: agentId,
+        awaitingUserSince: twoHoursOld,
         originKind: "terminal_session",
       })
       .returning();
@@ -262,7 +280,7 @@ describe("issueService.autoCloseStaleAwaitingUserIssues — backstop sweeper", (
         status: "awaiting_user",
         priority: "low",
         assigneeAgentId: agentId,
-        awaitingUserSince: stale,
+        awaitingUserSince: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
         originKind: "routine_execution",
       })
       .returning();
@@ -271,13 +289,26 @@ describe("issueService.autoCloseStaleAwaitingUserIssues — backstop sweeper", (
     await svc.autoCloseStaleAwaitingUserIssues(
       new Date(),
       7 * 24 * 60 * 60 * 1000,
+      8 * 60 * 60 * 1000, // terminal window: 8h
     );
 
-    const [refreshedTerminal] = await handle.db
+    const [closedTerminal] = await handle.db
       .select()
       .from(issues)
-      .where(eq(issues.id, terminal.id));
-    expect(refreshedTerminal.status).toBe("awaiting_user");
+      .where(eq(issues.id, staleTerminal.id));
+    expect(closedTerminal.status).toBe("done");
+
+    const expiredComment = await handle.db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, staleTerminal.id));
+    expect(expiredComment.some((c) => c.body.includes("Terminal session expired"))).toBe(true);
+
+    const [keptTerminal] = await handle.db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, freshTerminal.id));
+    expect(keptTerminal.status).toBe("awaiting_user"); // inside the 8h window — Continue still expected
 
     const [refreshedRoutine] = await handle.db
       .select()

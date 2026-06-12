@@ -1022,31 +1022,48 @@ export function issueService(db: Db) {
      * Backstop sweeper for tickets that get stuck in awaiting_user with no
      * user reply. Closes them to "done" after `staleAfterMs`, dismisses any
      * leftover question comments, and posts a system note. Skips
-     * routine_execution and terminal_session origins — those have their own
-     * dedicated auto-close paths.
+     * routine_execution origins (those have their own auto-close path).
+     *
+     * Terminal-session origins get their own SHORTER window
+     * (`terminalStaleAfterMs`): an idle-reaped REPL parks its issue in
+     * awaiting_user so the Continue button works, but an abandoned session
+     * used to linger there FOREVER (found live 2026-06-12 — three day-old
+     * terminal issues cluttering Issues + the Inbox awaiting badge). The
+     * transcript stays on the issue; closing it loses nothing.
      */
     autoCloseStaleAwaitingUserIssues: async (
       now: Date,
       staleAfterMs: number,
+      terminalStaleAfterMs: number = 8 * 60 * 60 * 1000,
     ): Promise<{ closed: number }> => {
       const cutoff = new Date(now.getTime() - staleAfterMs);
+      const terminalCutoff = new Date(now.getTime() - terminalStaleAfterMs);
       const stale = await db
         .select({
           id: issues.id,
           companyId: issues.companyId,
           executionRunId: issues.executionRunId,
+          originKind: issues.originKind,
         })
         .from(issues)
         .where(
           and(
             eq(issues.status, "awaiting_user"),
             isNotNull(issues.awaitingUserSince),
-            lt(issues.awaitingUserSince, cutoff),
             or(
-              isNull(issues.originKind),
               and(
-                ne(issues.originKind, "terminal_session"),
-                ne(issues.originKind, "routine_execution"),
+                lt(issues.awaitingUserSince, cutoff),
+                or(
+                  isNull(issues.originKind),
+                  and(
+                    ne(issues.originKind, "terminal_session"),
+                    ne(issues.originKind, "routine_execution"),
+                  ),
+                ),
+              ),
+              and(
+                eq(issues.originKind, "terminal_session"),
+                lt(issues.awaitingUserSince, terminalCutoff),
               ),
             ),
           ),
@@ -1083,7 +1100,10 @@ export function issueService(db: Db) {
               issueId: row.id,
               authorAgentId: null,
               authorUserId: null,
-              body: "Auto-closed: no user response after extended wait. Reopen any time.",
+              body:
+                row.originKind === "terminal_session"
+                  ? "Terminal session expired — closed automatically after inactivity. The transcript stays on this issue; open a new terminal (or use the resume instructions above) to continue."
+                  : "Auto-closed: no user response after extended wait. Reopen any time.",
               kind: "system",
             });
           });
