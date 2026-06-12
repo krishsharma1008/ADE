@@ -15,6 +15,9 @@ One page from clone to a running instance joined to your team's shared context D
 
 ```bash
 git clone <repo-url> ade && cd ade
+git checkout central-db                          # the validated team branch
+mkdir -p ~/.combyne/instances/default
+cp docs/instance.env.example ~/.combyne/instances/default/.env   # then fill in the team secrets
 pnpm install
 pnpm dev          # server + UI on http://127.0.0.1:3100 (embedded Postgres auto-starts on 54329)
 ```
@@ -23,7 +26,7 @@ First boot bootstraps the embedded DB and prints a startup banner. **Gotcha:** i
 
 ## Environment
 
-**The server reads `~/.combyne/instances/<id>/.env`** (instance dir, default id `default`) — created on first boot. A repo-root `.env` is NOT loaded; shell-exported vars also work (process env wins). Edit the instance file and restart `pnpm dev` for changes to apply.
+**The server reads `~/.combyne/instances/<id>/.env`** (instance dir, default id `default`) — created on first boot. A repo-root `.env` is NOT loaded; shell-exported vars also work (process env wins). Edit the instance file and restart `pnpm dev` for changes to apply. **Template: `docs/instance.env.example`** — copy it as shown above and fill in the team secrets (context-DB URL + embedding key, shared securely, never committed).
 
 To run a **second instance** on one machine (e.g. validation), isolate it with shell env: `COMBYNE_HOME=/tmp/ade2-home PORT=3200 COMBYNE_EMBEDDED_POSTGRES_PORT=54330 pnpm dev`.
 
