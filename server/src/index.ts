@@ -34,7 +34,7 @@ import { contextTrace } from "./services/context-trace.js"; // CONTEXT-TRACE
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { setupTerminalWebSocketServer } from "./realtime/terminal-ws.js";
-import { heartbeatService, issuePullRequestService, issueService, routineService } from "./services/index.js";
+import { acceptedWorkService, heartbeatService, issuePullRequestService, issueService, routineService } from "./services/index.js";
 import { SummarizerQueue, setSummarizerQueue } from "./services/summarizer-queue.js";
 import { makeAnthropicSummarizerDriver } from "./services/summarizer-driver-anthropic.js";
 import { createPersonasRouter } from "./routes/personas.js";
@@ -1079,6 +1079,9 @@ export async function startServer(): Promise<StartedServer> {
                 );
               }
               await issuePullRequestsSvc.maybeDispatchFeedbackForCompany(company.id);
+              // Backstop: pending accepted-work items whose pr-approval capture
+              // already exists resolve themselves (Memory page "Pending" hygiene).
+              await acceptedWorkService(db).autoResolveCapturedEvents(company.id);
             } catch (err) {
               logger.debug({ err, companyId: company.id }, "pr sweep failed for company");
             }

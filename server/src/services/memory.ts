@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, like, or, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   memoryEntries,
@@ -775,6 +775,58 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
 
   async function getEntry(id: string): Promise<MemoryEntry | null> {
     const rows = await cdb.select().from(memoryEntries).where(eq(memoryEntries.id, id)).limit(1);
+    return rows[0] ? rowToEntry(rows[0]) : null;
+  }
+
+  /**
+   * Look up an ACTIVE entry by its stable source key (e.g. the pr-approval
+   * natural key). Used to reconcile parallel capture tracks — the accepted-work
+   * inbox auto-resolves once the HOOK-2 pr-approval capture exists.
+   */
+  async function findEntryBySource(
+    companyId: string | null,
+    source: string,
+  ): Promise<MemoryEntry | null> {
+    const rows = await cdb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          companyId === null
+            ? isNull(memoryEntries.companyId)
+            : eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.source, source),
+          eq(memoryEntries.status, "active"),
+        ),
+      )
+      .limit(1);
+    return rows[0] ? rowToEntry(rows[0]) : null;
+  }
+
+  /**
+   * Find the pr-approval capture for a specific PR regardless of which SHA the
+   * source key used. GitHub's merge_commit_sha on an OPEN PR is a test-merge
+   * commit that differs from the final squash/merge commit, so sha-keyed
+   * sources can drift from post-merge records. The capture SUBJECT is built
+   * deterministically ("EM approved PR <repo>#<pull>: …") — match on that.
+   */
+  async function findPrApprovalEntryForPull(
+    companyId: string,
+    repo: string,
+    pullNumber: number,
+  ): Promise<MemoryEntry | null> {
+    const rows = await cdb
+      .select()
+      .from(memoryEntries)
+      .where(
+        and(
+          eq(memoryEntries.companyId, companyId),
+          eq(memoryEntries.provenance, "pr-approval"),
+          eq(memoryEntries.status, "active"),
+          like(memoryEntries.subject, `EM approved PR ${repo}#${pullNumber}:%`),
+        ),
+      )
+      .limit(1);
     return rows[0] ? rowToEntry(rows[0]) : null;
   }
 
@@ -2153,6 +2205,8 @@ export function memoryService(db: Db, embedder: MemoryEmbedder = getMemoryEmbedd
   return {
     createEntry,
     getEntry,
+    findEntryBySource,
+    findPrApprovalEntryForPull,
     updateEntry,
     archiveEntry,
     listEntries,

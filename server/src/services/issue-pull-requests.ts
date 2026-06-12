@@ -1165,8 +1165,13 @@ export function issuePullRequestService(db: Db) {
     // agent-claim/unverified (source key accepted_work:<eventId>, distinct from
     // pr-approval:<approvalId> — no collision, no double-capture). Idempotent via
     // (companyId, source). Best-effort: a capture failure MUST NOT fail the merge.
+    // Capture from the POST-merge row: `row` still carries GitHub's pre-merge
+    // test-merge sha (merge_commit_sha on an OPEN PR is a trial commit), which
+    // made the pr-approval source key drift from every post-merge record
+    // (found 2026-06-12 reconciling the accepted-work inbox). `updated` holds
+    // the final merge commit from the merge result.
     const approvalMemoryEntryId = await captureApprovalMemory({
-      row,
+      row: updated,
       status,
       approvalId: row.approvalId,
       decisionNote: input.decisionNote ?? null,

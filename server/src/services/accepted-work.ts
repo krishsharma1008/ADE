@@ -1,4 +1,4 @@
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, lt, sql } from "drizzle-orm";
 import type { Db } from "@combyne/db";
 import {
   acceptedWorkEvents,
@@ -467,6 +467,80 @@ export function acceptedWorkService(db: Db) {
     }
   }
 
+  /**
+   * Reconcile the two capture tracks (found live 2026-06-12): every dashboard/
+   * external merge ALREADY writes the verified pr-approval entry (HOOK 2), but
+   * the accepted-work inbox row stayed `pending` forever unless the EM or a
+   * human resolved it by hand — five "accepted" merges sat as Pending on the
+   * Memory page. A pending event whose pr-approval capture exists is done:
+   * flip it to memory_written pointing at that entry. Events younger than
+   * `olderThanMs` (default 1h) are left to the EM's accepted-work brief flow
+   * first — this is a backstop, not a replacement for it.
+   */
+  async function autoResolveCapturedEvents(
+    companyId: string,
+    opts?: { olderThanMs?: number },
+  ): Promise<{ resolved: number }> {
+    const olderThanMs = opts?.olderThanMs ?? 60 * 60 * 1000;
+    const cutoff = new Date(Date.now() - olderThanMs);
+    const pending = await db
+      .select()
+      .from(acceptedWorkEvents)
+      .where(
+        and(
+          eq(acceptedWorkEvents.companyId, companyId),
+          eq(acceptedWorkEvents.memoryStatus, "pending"),
+          lt(acceptedWorkEvents.detectedAt, cutoff),
+        ),
+      )
+      .limit(25);
+    if (pending.length === 0) return { resolved: 0 };
+
+    const memorySvc = memoryService(db);
+    let resolved = 0;
+    for (const event of pending) {
+      try {
+        // The same natural keys HOOK 2 writes with (memory-capture
+        // prApprovalSource): sha-keyed when the merge SHA is known, else
+        // pull-number-keyed. Single-DB instances key by approvalId instead —
+        // there the EM/human flow remains the only resolver, which is fine.
+        const sources = [
+          event.mergedSha
+            ? `pr-approval:${event.provider}:${event.repo}@${event.mergedSha}`
+            : null,
+          `pr-approval:${event.provider}:${event.repo}#${event.pullNumber}`,
+        ].filter((value): value is string => !!value);
+        let entry: Awaited<ReturnType<typeof memorySvc.findEntryBySource>> = null;
+        for (const source of sources) {
+          entry = await memorySvc.findEntryBySource(event.companyId, source);
+          if (entry) break;
+        }
+        if (!entry) {
+          // SHA keys can drift (GitHub's pre-merge test-merge sha vs the final
+          // squash commit) — fall back to the deterministic capture subject.
+          entry = await memorySvc.findPrApprovalEntryForPull(
+            event.companyId,
+            event.repo,
+            event.pullNumber,
+          );
+        }
+        if (entry) {
+          await resolveEvent(event.id, "memory_written", entry.id);
+          resolved += 1;
+        }
+      } catch (err) {
+        logger.debug(
+          { err, acceptedWorkEventId: event.id },
+          "accepted_work.auto_resolve_failed",
+        );
+      }
+    }
+    if (resolved > 0) {
+      logger.info({ companyId, resolved }, "accepted_work.auto_resolved_captured_events");
+    }
+    return { resolved };
+  }
+
   return {
     getById,
     list,
@@ -478,6 +552,7 @@ export function acceptedWorkService(db: Db) {
     resolveEvent,
     reconcileGitHubCompany,
     maybeReconcileGitHubCompany,
+    autoResolveCapturedEvents,
   };
 }
 

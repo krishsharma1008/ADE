@@ -248,4 +248,101 @@ describe("accepted work service", () => {
       .where(eq(memoryEntries.source, `accepted_work:${event.event.id}`));
     expect(rows).toHaveLength(1);
   });
+
+  // Found live 2026-06-12: merged PRs whose HOOK-2 pr-approval capture already
+  // existed still sat "Pending" on the Memory page forever. The auto-resolver
+  // flips a pending event to memory_written once the capture exists (after a
+  // grace window that leaves fresh merges to the EM brief flow first).
+  it("auto-resolves a pending event whose pr-approval capture already exists", async () => {
+    const svc = acceptedWorkService(handle.db);
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const [event] = await handle.db
+      .insert(acceptedWorkEvents)
+      .values({
+        companyId,
+        provider: "github",
+        repo: "acme/widgets",
+        pullNumber: 71,
+        title: "feat: captured work",
+        mergedSha: "sha-71",
+        detectionSource: "github_reconcile",
+        detectedAt: twoHoursAgo,
+      })
+      .returning();
+    // The HOOK-2 capture, keyed by the same natural sha key.
+    const [entry] = await handle.db
+      .insert(memoryEntries)
+      .values({
+        companyId,
+        layer: "workspace",
+        subject: "EM approved PR acme/widgets#71",
+        body: "Accepted pattern: merged from the PR panel.",
+        source: "pr-approval:github:acme/widgets@sha-71",
+        verificationState: "verified",
+      })
+      .returning();
+
+    const result = await svc.autoResolveCapturedEvents(companyId);
+    expect(result.resolved).toBeGreaterThanOrEqual(1);
+
+    const [after] = await handle.db
+      .select()
+      .from(acceptedWorkEvents)
+      .where(eq(acceptedWorkEvents.id, event.id));
+    expect(after.memoryStatus).toBe("memory_written");
+    expect(after.memoryEntryId).toBe(entry.id);
+  });
+
+  it("leaves pending events alone when no capture exists or the event is fresh", async () => {
+    const svc = acceptedWorkService(handle.db);
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const [uncaptured] = await handle.db
+      .insert(acceptedWorkEvents)
+      .values({
+        companyId,
+        provider: "github",
+        repo: "acme/widgets",
+        pullNumber: 72,
+        title: "feat: never captured",
+        mergedSha: "sha-72",
+        detectionSource: "github_reconcile",
+        detectedAt: twoHoursAgo,
+      })
+      .returning();
+    const [fresh] = await handle.db
+      .insert(acceptedWorkEvents)
+      .values({
+        companyId,
+        provider: "github",
+        repo: "acme/widgets",
+        pullNumber: 73,
+        title: "feat: fresh merge, EM's turn first",
+        mergedSha: "sha-73",
+        detectionSource: "github_reconcile",
+      })
+      .returning();
+    // A capture exists for the FRESH one — but it's inside the EM grace window.
+    await handle.db.insert(memoryEntries).values({
+      companyId,
+      layer: "workspace",
+      subject: "EM approved PR acme/widgets#73",
+      body: "Accepted pattern.",
+      source: "pr-approval:github:acme/widgets@sha-73",
+      verificationState: "verified",
+    });
+
+    await svc.autoResolveCapturedEvents(companyId);
+
+    const [uncapturedAfter] = await handle.db
+      .select()
+      .from(acceptedWorkEvents)
+      .where(eq(acceptedWorkEvents.id, uncaptured.id));
+    expect(uncapturedAfter.memoryStatus).toBe("pending");
+
+    const [freshAfter] = await handle.db
+      .select()
+      .from(acceptedWorkEvents)
+      .where(eq(acceptedWorkEvents.id, fresh.id));
+    expect(freshAfter.memoryStatus).toBe("pending");
+  });
 });
